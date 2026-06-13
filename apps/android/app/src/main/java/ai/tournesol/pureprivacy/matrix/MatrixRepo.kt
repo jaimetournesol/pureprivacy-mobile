@@ -7,6 +7,9 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import org.matrix.rustcomponents.sdk.Client
 import org.matrix.rustcomponents.sdk.ClientBuilder
+import org.matrix.rustcomponents.sdk.CreateRoomParameters
+import org.matrix.rustcomponents.sdk.RoomPreset
+import org.matrix.rustcomponents.sdk.RoomVisibility
 import org.matrix.rustcomponents.sdk.MsgLikeKind
 import org.matrix.rustcomponents.sdk.Room
 import org.matrix.rustcomponents.sdk.RoomListEntriesDynamicFilterKind
@@ -43,6 +46,11 @@ object MatrixRepo {
 
     var userId: String = ""
         private set
+    var deviceId: String = ""
+        private set
+    var currentRoom: Room? = null
+        private set
+    fun client(): Client? = client
 
     val rooms = MutableStateFlow<List<RoomSummary>>(emptyList())
     val messages = MutableStateFlow<List<ChatMsg>>(emptyList())
@@ -75,8 +83,12 @@ object MatrixRepo {
         status.value = "Signing in…"
         c.login(user, pass, "PurePrivacy Android", null)
         userId = runCatching { c.userId() }.getOrDefault("@$user")
-        runCatching { persist(ctx, c.session()) }
-        Log.i(TAG, "logged in as $userId")
+        runCatching {
+            val s = c.session()
+            deviceId = s.deviceId
+            persist(ctx, s)
+        }
+        Log.i(TAG, "logged in as $userId (device $deviceId)")
         status.value = "Syncing…"
     }
 
@@ -98,7 +110,8 @@ object MatrixRepo {
         c.restoreSession(s)
         client = c
         userId = s.userId
-        Log.i(TAG, "restored session for $userId")
+        deviceId = s.deviceId
+        Log.i(TAG, "restored session for $userId (device $deviceId)")
         return true
     }
 
@@ -169,6 +182,7 @@ object MatrixRepo {
         messages.value = emptyList()
         val room = runCatching { rls.room(roomId) }.getOrNull()
             ?: roomHandles[roomId] ?: error("room not found")
+        currentRoom = room
         val tl = room.timeline()
         timeline = tl
         tl.addListener(object : TimelineListener {
@@ -219,5 +233,27 @@ object MatrixRepo {
     suspend fun send(text: String) {
         val tl = timeline ?: return
         tl.send(messageEventContentFromMarkdown(text))
+    }
+
+    /** Start a direct, end-to-end-encrypted chat with another user (@user:onion),
+     *  inviting them. Returns the new room id. Federates the invite over Tor. */
+    suspend fun startChat(userId: String): String {
+        val c = client ?: error("not logged in")
+        val params = CreateRoomParameters(
+            name = null,
+            topic = null,
+            isEncrypted = true,          // E2EE on — the SDK manages keys
+            isDirect = true,
+            visibility = RoomVisibility.Private,
+            preset = RoomPreset.TRUSTED_PRIVATE_CHAT,
+            invite = listOf(userId),
+            avatar = null,
+            powerLevelContentOverride = null,
+            joinRuleOverride = null,
+            historyVisibilityOverride = null,
+            canonicalAlias = null,
+            isSpace = false,
+        )
+        return c.createRoom(params)
     }
 }

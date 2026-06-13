@@ -72,11 +72,35 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun normalizeHomeserver(raw: String): String {
         var s = raw.trim()
-        if (!s.startsWith("http://") && !s.startsWith("https://")) s = "http://$s"
-        // default the box client-API onion port if none given
+        // HTTPS so the embedded WebView (Element Call) reaches the box via Tor's
+        // CONNECT tunnel with no mixed content; the SDK trusts the onion's
+        // self-signed cert via disableSslVerification().
+        if (!s.startsWith("http://") && !s.startsWith("https://")) s = "https://$s"
         val afterScheme = s.substringAfter("://")
-        if (!afterScheme.contains(":")) s = "$s:8008"
+        if (!afterScheme.contains(":")) s = "$s:8009"
         return s
+    }
+
+    fun startChat(rawUserId: String) {
+        val uid = rawUserId.trim()
+        if (!uid.startsWith("@") || !uid.contains(":")) {
+            error.value = "Enter a full address, e.g. @bob:xxxx.onion"
+            return
+        }
+        error.value = null
+        busy.value = true
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val roomId = MatrixRepo.startChat(uid)
+                kotlinx.coroutines.delay(1500)   // let the new room land in sync
+                MatrixRepo.openRoom(roomId)
+                screen.value = Screen.Chat(roomId, uid.removePrefix("@").substringBefore(":"))
+            } catch (t: Throwable) {
+                error.value = t.message ?: t.toString()
+            } finally {
+                busy.value = false
+            }
+        }
     }
 
     fun openRoom(id: String, name: String) {
@@ -96,4 +120,5 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun back() { screen.value = Screen.Rooms }
+    fun clearError() { error.value = null }
 }

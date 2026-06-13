@@ -65,6 +65,8 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
     debugImplementation("androidx.compose.ui:ui-tooling")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+    // WebView proxy override (route the Element Call WebView through embedded Tor)
+    implementation("androidx.webkit:webkit:1.11.0")
 
     // The real thing: Element X's matrix-rust-sdk (E2EE, sliding sync) + JNA (UniFFI).
     implementation("org.matrix.rustcomponents:sdk-android:26.06.11")

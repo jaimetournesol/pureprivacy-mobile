@@ -19,6 +19,8 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Call
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -150,10 +152,51 @@ private fun PpField(value: String, onChange: (String) -> Unit, label: String, pa
 @Composable
 fun RoomsScreen(vm: AppViewModel) {
     val rooms by vm.rooms.collectAsState()
+    val busy by vm.busy.collectAsState()
+    val err by vm.error.collectAsState()
     val ctx = LocalContext.current
+    var showNew by remember { mutableStateOf(false) }
+    var peer by remember { mutableStateOf("") }
     BackHandler { (ctx as? android.app.Activity)?.moveTaskToBack(true) }
+
+    if (showNew) {
+        AlertDialog(
+            onDismissRequest = { if (!busy) showNew = false },
+            containerColor = InkCard,
+            title = { Text("New chat", color = Paper) },
+            text = {
+                Column {
+                    Text("Enter your contact's address.", color = PaperDim, fontSize = 13.sp)
+                    Spacer(Modifier.height(10.dp))
+                    OutlinedTextField(
+                        value = peer, onValueChange = { peer = it },
+                        singleLine = true,
+                        placeholder = { Text("@bob:xxxx.onion", color = PaperDim) },
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = Sunflower, unfocusedBorderColor = Color(0xFF2D3742),
+                            focusedTextColor = Paper, unfocusedTextColor = Paper, cursorColor = Sunflower
+                        )
+                    )
+                    if (err != null) { Spacer(Modifier.height(8.dp)); Text(err!!, color = Color(0xFFE5534B), fontSize = 12.sp) }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { vm.startChat(peer); showNew = false }, enabled = !busy && peer.isNotBlank()) {
+                    Text("Start chat", color = Sunflower)
+                }
+            },
+            dismissButton = { TextButton(onClick = { showNew = false }, enabled = !busy) { Text("Cancel", color = PaperDim) } }
+        )
+    }
+
     Scaffold(
         containerColor = Ink,
+        floatingActionButton = {
+            FloatingActionButton(onClick = { peer = ""; vm.clearError(); showNew = true },
+                containerColor = Sunflower, contentColor = Ink) {
+                Icon(Icons.Filled.Add, "new chat")
+            }
+        },
         topBar = {
             TopAppBar(
                 title = { Column { Text("Chats", color = Paper, fontWeight = FontWeight.Bold); TorBadge() } },
@@ -192,6 +235,7 @@ private fun RoomRow(r: RoomSummary, onClick: () -> Unit) {
 @Composable
 fun ChatScreen(vm: AppViewModel, roomId: String, roomName: String) {
     BackHandler { vm.back() }
+    val ctx = LocalContext.current
     val messages by vm.messages.collectAsState()
     var draft by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
@@ -205,6 +249,11 @@ fun ChatScreen(vm: AppViewModel, roomId: String, roomName: String) {
                     IconButton(onClick = { vm.back() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, null, tint = Paper) }
                 },
                 title = { Column { Text(roomName, color = Paper, fontWeight = FontWeight.Bold, maxLines = 1); TorBadge() } },
+                actions = {
+                    IconButton(onClick = {
+                        ctx.startActivity(android.content.Intent(ctx, ElementCallActivity::class.java))
+                    }) { Icon(Icons.Filled.Call, "call", tint = Sunflower) }
+                },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = InkSoft)
             )
         },
