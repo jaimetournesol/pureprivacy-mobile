@@ -17,6 +17,7 @@ import androidx.webkit.ProxyConfig
 import androidx.webkit.ProxyController
 import androidx.webkit.WebViewFeature
 import ai.tournesol.pureprivacy.matrix.MatrixRepo
+import ai.tournesol.pureprivacy.net.TorNet
 import ai.tournesol.pureprivacy.tor.TorManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.isActive
@@ -46,6 +47,15 @@ import uniffi.matrix_sdk.VirtualElementCallWidgetProperties
 class ElementCallActivity : ComponentActivity() {
     private val TAG = "PpCall"
     private lateinit var web: WebView
+    private var ecOnion = ""
+    private var ecRewrites: Map<String, String> = emptyMap()
+
+    companion object {
+        const val EC_LOCAL = 11080   // -> call.element.io (Element Call app, over Tor)
+        const val HS_LOCAL = 18009   // -> onion:8009 homeserver client API
+        const val JWT_LOCAL = 18443  // -> onion:8443 lk-jwt
+        const val SFU_LOCAL = 17443  // -> onion:7443 LiveKit SFU (wss, raw forward)
+    }
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -53,16 +63,36 @@ class ElementCallActivity : ComponentActivity() {
         val room = MatrixRepo.currentRoom
         if (room == null) { finish(); return }
 
-        // 1) Route ALL WebView traffic through embedded Tor. SOCKS5 so Tor does the
-        //    DNS — required for .onion (Chromium won't resolve .onion locally, and an
-        //    HTTP proxy makes it resolve client-side). Fall back to the HTTP tunnel.
-        if (WebViewFeature.isFeatureSupported(WebViewFeature.PROXY_OVERRIDE)) {
-            val cfg = ProxyConfig.Builder()
-                .addProxyRule("socks5://127.0.0.1:${TorManager.SOCKS_PORT}")
-                .addProxyRule("127.0.0.1:${TorManager.HTTP_PORT}")
-                .build()
-            ProxyController.getInstance().setProxyOverride(cfg, { it.run() }, {})
-        }
+        val onion = MatrixRepo.userId.substringAfter(":")  // box homeserver onion
+        ecOnion = onion
+
+        // Local bridges: the WebView only ever talks to 127.0.0.1; we tunnel to the
+        // onion over Tor (Chromium refuses .onion directly) and rewrite .onion URLs
+        // in responses (well-known rtc_foci, lk-jwt's SFU url) to localhost.
+        // Rewrite the onion URLs that appear in responses to our plain-http/ws
+        // localhost bridges (scheme downgraded; TLS happens only on the onion side).
+        val rewrites = mapOf(
+            "https://$onion:8443" to "http://127.0.0.1:$JWT_LOCAL",  // lk-jwt (well-known)
+            "wss://$onion:7443" to "ws://127.0.0.1:$SFU_LOCAL",      // SFU (lk-jwt response)
+            "https://$onion:8009" to "http://127.0.0.1:$HS_LOCAL",   // homeserver (well-known)
+            "https://$onion:8008" to "http://127.0.0.1:$HS_LOCAL",
+            "http://$onion:8008" to "http://127.0.0.1:$HS_LOCAL",
+        )
+        ecRewrites = rewrites
+        // Serve Element Call itself from localhost (over Tor) so its origin is
+        // 127.0.0.1 — a secure, PRIVATE origin in Chromium. Then all its calls to
+        // our other 127.0.0.1 bridges are private->private (no Private Network
+        // Access block) and localhost is a secure context (getUserMedia works).
+        TorNet.startHttpProxy(EC_LOCAL, "https://call.element.io", TorManager.HTTP_PORT, rewrites)
+        TorNet.startHttpProxy(HS_LOCAL, "https://$onion:8009", TorManager.HTTP_PORT, rewrites)
+        TorNet.startHttpProxy(JWT_LOCAL, "https://$onion:8443", TorManager.HTTP_PORT, rewrites)
+        TorNet.startTlsForwarder(SFU_LOCAL, onion, 7443, TorManager.SOCKS_PORT)
+
+        // NO global WebView proxy: a WebView proxy routes even 127.0.0.1 through Tor,
+        // and Tor can't CONNECT to loopback (so the bridges were never hit). Instead
+        // the WebView reaches our bridges directly on 127.0.0.1, and the bridges
+        // tunnel the box's onion services over Tor. The only clearnet load is the
+        // generic Element Call app bundle (call.element.io) — no peer/box metadata.
 
         web = WebView(this).apply {
             settings.apply {
@@ -91,9 +121,9 @@ class ElementCallActivity : ComponentActivity() {
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 val props = VirtualElementCallWidgetProperties(
-                    elementCallUrl = "https://call.element.io",
+                    elementCallUrl = "http://127.0.0.1:$EC_LOCAL",
                     widgetId = "pp-call",
-                    parentUrl = null,
+                    parentUrl = "http://127.0.0.1:$EC_LOCAL",
                     fontScale = null,
                     font = null,
                     // Match the room: the shared room is unencrypted for this first
@@ -119,10 +149,18 @@ class ElementCallActivity : ComponentActivity() {
                     sendNotificationType = null,
                 )
                 val settings = newVirtualElementCallWidget(props, config)
-                val url = generateWebviewUrl(
+                val rawUrl = generateWebviewUrl(
                     settings, room,
                     ClientProperties("ai.tournesol.pureprivacy", null, "dark")
                 )
+                // point the homeserver baseUrl at our local bridge (leave the onion
+                // in user/room IDs untouched — only the host:port is rewritten).
+                val url = rawUrl
+                    .replace("https%3A%2F%2F$onion%3A8009", "http%3A%2F%2F127.0.0.1%3A$HS_LOCAL")
+                    .replace("https://$onion:8009", "http://127.0.0.1:$HS_LOCAL")
+                    // Element Call's in-room widget view is under /room (root '/' is the
+                    // standalone "start new call" home).
+                    .replace("127.0.0.1:$EC_LOCAL/#?", "127.0.0.1:$EC_LOCAL/room/#?")
                 Log.i(TAG, "EC url: $url")
 
                 val driverAndHandle = makeWidgetDriver(settings)
@@ -145,16 +183,37 @@ class ElementCallActivity : ComponentActivity() {
                         val msg = runCatching { handle.recv() }.getOrNull() ?: break
                         Log.i(TAG, "toWidget: ${msg.take(220)}")
                         withContext(Dispatchers.Main) {
-                            web.evaluateJavascript("window.postMessage($msg, '*');", null)
+                            web.evaluateJavascript("window.__ec && window.__ec().postMessage($msg, '*');", null)
                         }
                     }
                     Log.w(TAG, "recv loop ended")
                 }
 
+                // Element Call only enters widget/room mode when embedded in an iframe
+                // (it checks window.parent !== window). Load a same-origin wrapper page
+                // that hosts EC in an iframe + relays the widget postMessage bridge.
+                val wrapper = """
+                    <!doctype html><html><head>
+                    <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+                    </head><body style="margin:0;background:#0E1116">
+                    <iframe id="ec" src="$url"
+                      allow="camera;microphone;autoplay;display-capture;clipboard-write;fullscreen"
+                      style="position:fixed;inset:0;width:100%;height:100%;border:0"></iframe>
+                    <script>
+                      window.__ec = function(){ return document.getElementById('ec').contentWindow; };
+                      window.addEventListener('message', function(e){
+                        try { var d = e.data; if (!d || !d.api) return;
+                          var isReq  = (d.api === 'fromWidget' && !('response' in d));
+                          var isResp = (d.api === 'toWidget'   &&  ('response' in d));
+                          if (isReq || isResp) ppAndroid.fromWidget(JSON.stringify(d));
+                        } catch(err){}
+                      });
+                    </script></body></html>
+                """.trimIndent()
                 withContext(Dispatchers.Main) {
                     web.addJavascriptInterface(Bridge(handle), "ppAndroid")
                     web.webViewClientInjectOnLoad()
-                    web.loadUrl(url)
+                    web.loadDataWithBaseURL("http://127.0.0.1:$EC_LOCAL/", wrapper, "text/html", "utf-8", "http://127.0.0.1:$EC_LOCAL/")
                 }
             } catch (t: Throwable) {
                 Log.e(TAG, "EC setup failed", t)
@@ -179,28 +238,27 @@ class ElementCallActivity : ComponentActivity() {
             override fun onReceivedSslError(view: WebView, handler: SslErrorHandler, error: SslError) {
                 handler.proceed()
             }
-            override fun onPageFinished(view: WebView, url: String?) {
-                // forward fromWidget messages to Android (filter to avoid echoing toWidget)
-                view.evaluateJavascript(
-                    """
-                    (function(){
-                      if (window.__ppHooked) return; window.__ppHooked = true;
-                      window.addEventListener('message', function(e){
-                        try {
-                          var d = e.data; if (!d || !d.api) return;
-                          // Only forward genuine widget -> client traffic to the SDK:
-                          //  - fromWidget REQUESTS (no 'response' yet)
-                          //  - toWidget RESPONSES (widget answering a client request)
-                          // NEVER re-forward the messages we inject (fromWidget+response,
-                          // toWidget request) — that caused an echo loop.
-                          var isReq  = (d.api === 'fromWidget' && !('response' in d));
-                          var isResp = (d.api === 'toWidget'   &&  ('response' in d));
-                          if (isReq || isResp) { ppAndroid.fromWidget(JSON.stringify(d)); }
-                        } catch(err){}
-                      });
-                    })();
-                    """.trimIndent(), null
-                )
+            override fun shouldInterceptRequest(view: WebView, request: android.webkit.WebResourceRequest): android.webkit.WebResourceResponse? {
+                val host = request.url.host ?: return null
+                // Intercept Element Call's direct .onion requests (e.g. server-name
+                // /.well-known discovery) — Chromium would block them; serve over Tor.
+                if (host == ecOnion && request.method == "GET") {
+                    return try {
+                        val path = request.url.encodedPath + (request.url.encodedQuery?.let { "?$it" } ?: "")
+                        val (ct, code, bytes) = TorNet.fetchRewritten(
+                            "https://$ecOnion:8009$path", TorManager.HTTP_PORT, ecRewrites
+                        )
+                        val hdrs = linkedMapOf(
+                            "Access-Control-Allow-Origin" to "*",
+                            "Access-Control-Allow-Headers" to "*",
+                        )
+                        Log.i(TAG, "intercepted onion GET $path -> $code")
+                        android.webkit.WebResourceResponse(ct, "utf-8", code, "OK", hdrs, java.io.ByteArrayInputStream(bytes))
+                    } catch (t: Throwable) {
+                        Log.e(TAG, "intercept failed", t); null
+                    }
+                }
+                return null
             }
         }
     }

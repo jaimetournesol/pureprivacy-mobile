@@ -67,6 +67,9 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     // WebView proxy override (route the Element Call WebView through embedded Tor)
     implementation("androidx.webkit:webkit:1.11.0")
+    // local TLS-terminating proxy -> onion (over Tor) for the Element Call WebView
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("org.nanohttpd:nanohttpd:2.3.1")
 
     // The real thing: Element X's matrix-rust-sdk (E2EE, sliding sync) + JNA (UniFFI).
     implementation("org.matrix.rustcomponents:sdk-android:26.06.11")
