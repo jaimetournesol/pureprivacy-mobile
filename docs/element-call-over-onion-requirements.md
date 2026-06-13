@@ -110,16 +110,34 @@ The architecture that made it work (the WebView only ever sees 127.0.0.1):
    `onReceivedSslError` proceed; mixed-content allowed.
 Box side: homeserver client API + lk-jwt now served HTTPS on the onion.
 
-### Remaining refinements (call connects; these harden it)
+## ✅ SOLVED 2026-06-14 — TWO-WAY cross-install call over Tor (alice ↔ bob)
+
+Verified live on two emulators: alice (box1) starts the call; bob (box2) joins from a
+different box and both land in the **same SFU room** entirely over Tor. Proof:
+`box1-lk` logged `participant active @alice…` AND `participant active @bob…` in room
+`RM_tfNDUZ2k2bkt` with neither closing; `box1-lkjwt` validated **@bob's** OpenID token
+(box1 calling box2's openid endpoint over Tor — cross-box auth). Bob's EC console:
+`matrixLivekitMembers$ … [@alice|…, @bob|…]`, `livekitRoom.connect SUCCESS
+ws://127.0.0.1:17444`, `connected to Livekit Server`. Bob's screen shows alice's tile.
+
+How the joiner bridging works (`ElementCallActivity.kt`):
+1. **Discover the focus onion.** The call lives on the creator's box. Scan every
+   `toWidget` message with `(?:wss://|https://)([a-z2-7]{56}\.onion):(?:7443|8443)`;
+   any onion ≠ ours is the call FOCUS (the peer's box).
+2. **Dynamically bridge to it.** On first sight, start `JWT_PEER`(18444→focus:8443) +
+   `SFU_PEER`(17444→focus:7443) over Tor and register focus→localhost rewrites into the
+   SAME mutable map the proxies already hold (so they take effect with no restart).
+3. **Rewrite both directions.** `toWidget` (SDK→EC): onion→localhost so the WebView can
+   reach the focus via 127.0.0.1. `fromWidget` (EC→SDK): localhost→onion (reverse) so the
+   call membership we PUBLISH carries the real onion — otherwise the peer reads a bare
+   `127.0.0.1` and points at its own box.
+
+### Remaining refinement (call connects both ways; this hardens it)
 - **Media RTP over Tor.** WebRTC negotiated direct-UDP (it can't use a `turn:<onion>`
   server — same `.onion` block). For onion-pure media add a `turn:127.0.0.1:<port>`
   localhost bridge → onion coturn, and get the client to use it (rewrite the SFU's
   advertised TURN URI, which needs a TLS-terminating WS proxy on the SFU bridge, or a
   client-injected ICE server).
-- **Two-way cross-install.** The joiner must bridge to the call's FOCUS onion (the peer's
-  box, where the SFU+lk-jwt live), not its own — discover the focus onion from the
-  `wss://<onion>:7443`/`https://<onion>:8443` URLs in the widget-API call-state messages,
-  start bridges to it dynamically, and rewrite those URLs → localhost in the bridge.
 
 ## Stock-client escape hatch (no branded client needed)
 

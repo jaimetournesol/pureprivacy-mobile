@@ -48,13 +48,24 @@ class ElementCallActivity : ComponentActivity() {
     private val TAG = "PpCall"
     private lateinit var web: WebView
     private var ecOnion = ""
-    private var ecRewrites: Map<String, String> = emptyMap()
+    // onion -> localhost  (applied to proxy bodies, toWidget messages, intercepts).
+    private val ecRewrites: MutableMap<String, String> = java.util.concurrent.ConcurrentHashMap()
+    // localhost -> onion  (applied to fromWidget messages so the call membership we
+    // PUBLISH to the room carries the real onion focus, not our private bridge URL —
+    // otherwise the peer reads "127.0.0.1" and points at its own box).
+    private val ecReverse: MutableMap<String, String> = java.util.concurrent.ConcurrentHashMap()
+    // call focus onions we've already started peer bridges for (the joiner connects
+    // to the CALL's focus box, which for a cross-install call is the peer's box).
+    private val peerFocusStarted = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val focusRe = Regex("(?:wss://|https://)([a-z2-7]{56}\\.onion):(?:7443|8443)")
 
     companion object {
         const val EC_LOCAL = 11080   // -> call.element.io (Element Call app, over Tor)
-        const val HS_LOCAL = 18009   // -> onion:8009 homeserver client API
-        const val JWT_LOCAL = 18443  // -> onion:8443 lk-jwt
-        const val SFU_LOCAL = 17443  // -> onion:7443 LiveKit SFU (wss, raw forward)
+        const val HS_LOCAL = 18009   // -> own homeserver client API (onion:8009)
+        const val JWT_LOCAL = 18443  // -> own lk-jwt (onion:8443)
+        const val SFU_LOCAL = 17443  // -> own LiveKit SFU (onion:7443, wss)
+        const val JWT_PEER = 18444   // -> FOCUS (peer) lk-jwt, discovered from call state
+        const val SFU_PEER = 17444   // -> FOCUS (peer) SFU
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -71,21 +82,28 @@ class ElementCallActivity : ComponentActivity() {
         // in responses (well-known rtc_foci, lk-jwt's SFU url) to localhost.
         // Rewrite the onion URLs that appear in responses to our plain-http/ws
         // localhost bridges (scheme downgraded; TLS happens only on the onion side).
-        val rewrites = mapOf(
+        // The proxies hold a reference to this SAME mutable map, so peer-focus
+        // entries added later (when the joiner discovers the call's focus box)
+        // take effect immediately without restarting them.
+        ecRewrites.putAll(mapOf(
             "https://$onion:8443" to "http://127.0.0.1:$JWT_LOCAL",  // lk-jwt (well-known)
             "wss://$onion:7443" to "ws://127.0.0.1:$SFU_LOCAL",      // SFU (lk-jwt response)
             "https://$onion:8009" to "http://127.0.0.1:$HS_LOCAL",   // homeserver (well-known)
             "https://$onion:8008" to "http://127.0.0.1:$HS_LOCAL",
             "http://$onion:8008" to "http://127.0.0.1:$HS_LOCAL",
-        )
-        ecRewrites = rewrites
+        ))
+        ecReverse.putAll(mapOf(
+            "http://127.0.0.1:$JWT_LOCAL" to "https://$onion:8443",
+            "ws://127.0.0.1:$SFU_LOCAL" to "wss://$onion:7443",
+            "http://127.0.0.1:$HS_LOCAL" to "https://$onion:8009",
+        ))
         // Serve Element Call itself from localhost (over Tor) so its origin is
         // 127.0.0.1 — a secure, PRIVATE origin in Chromium. Then all its calls to
         // our other 127.0.0.1 bridges are private->private (no Private Network
         // Access block) and localhost is a secure context (getUserMedia works).
-        TorNet.startHttpProxy(EC_LOCAL, "https://call.element.io", TorManager.HTTP_PORT, rewrites)
-        TorNet.startHttpProxy(HS_LOCAL, "https://$onion:8009", TorManager.HTTP_PORT, rewrites)
-        TorNet.startHttpProxy(JWT_LOCAL, "https://$onion:8443", TorManager.HTTP_PORT, rewrites)
+        TorNet.startHttpProxy(EC_LOCAL, "https://call.element.io", TorManager.HTTP_PORT, ecRewrites)
+        TorNet.startHttpProxy(HS_LOCAL, "https://$onion:8009", TorManager.HTTP_PORT, ecRewrites)
+        TorNet.startHttpProxy(JWT_LOCAL, "https://$onion:8443", TorManager.HTTP_PORT, ecRewrites)
         TorNet.startTlsForwarder(SFU_LOCAL, onion, 7443, TorManager.SOCKS_PORT)
 
         // NO global WebView proxy: a WebView proxy routes even 127.0.0.1 through Tor,
@@ -180,7 +198,14 @@ class ElementCallActivity : ComponentActivity() {
                 // pump: SDK -> widget (toWidget messages)
                 launch(Dispatchers.IO) {
                     while (isActive) {
-                        val msg = runCatching { handle.recv() }.getOrNull() ?: break
+                        var msg = runCatching { handle.recv() }.getOrNull() ?: break
+                        // A cross-install call lives on the creator's box (the focus).
+                        // Discover that focus onion from the call membership flowing
+                        // down, spin up bridges to it, then rewrite every onion URL
+                        // (own + peer) to the matching localhost bridge before the
+                        // WebView sees it — Chromium would block the raw .onion.
+                        maybeStartPeerFocus(msg)
+                        for ((a, b) in ecRewrites) msg = msg.replace(a, b)
                         Log.i(TAG, "toWidget: ${msg.take(220)}")
                         withContext(Dispatchers.Main) {
                             web.evaluateJavascript("window.__ec && window.__ec().postMessage($msg, '*');", null)
@@ -225,11 +250,36 @@ class ElementCallActivity : ComponentActivity() {
     inner class Bridge(private val handle: org.matrix.rustcomponents.sdk.WidgetDriverHandle) {
         @JavascriptInterface
         fun fromWidget(json: String) {
-            Log.i(TAG, "fromWidget: ${json.take(220)}")
+            // Reverse the localhost rewrite: anything EC publishes (its call
+            // membership / preferred focus) must carry the real onion so the peer's
+            // box can resolve it — a bare 127.0.0.1 would point at the peer's own box.
+            var out = json
+            for ((a, b) in ecReverse) out = out.replace(a, b)
+            Log.i(TAG, "fromWidget: ${out.take(220)}")
             lifecycleScope.launch(Dispatchers.IO) {
-                val ok = runCatching { handle.send(json) }.getOrElse { Log.e(TAG, "send failed", it); false }
+                val ok = runCatching { handle.send(out) }.getOrElse { Log.e(TAG, "send failed", it); false }
                 if (!ok) Log.w(TAG, "handle.send returned false")
             }
+        }
+    }
+
+    /** When the call's focus onion (the box hosting the SFU+lk-jwt) isn't ours — the
+     *  cross-install join case — stand up bridges to it and register its rewrites so
+     *  the WebView reaches it via 127.0.0.1 like it does our own box. */
+    private fun maybeStartPeerFocus(msg: String) {
+        for (m in focusRe.findAll(msg)) {
+            val host = m.groupValues[1]
+            if (host == ecOnion) continue
+            if (!peerFocusStarted.add(host)) continue
+            Log.i(TAG, "discovered peer focus onion $host -> starting peer bridges")
+            runCatching {
+                TorNet.startHttpProxy(JWT_PEER, "https://$host:8443", TorManager.HTTP_PORT, ecRewrites)
+                TorNet.startTlsForwarder(SFU_PEER, host, 7443, TorManager.SOCKS_PORT)
+            }.onFailure { Log.e(TAG, "peer bridge start failed", it) }
+            ecRewrites["https://$host:8443"] = "http://127.0.0.1:$JWT_PEER"
+            ecRewrites["wss://$host:7443"] = "ws://127.0.0.1:$SFU_PEER"
+            ecReverse["http://127.0.0.1:$JWT_PEER"] = "https://$host:8443"
+            ecReverse["ws://127.0.0.1:$SFU_PEER"] = "wss://$host:7443"
         }
     }
 
