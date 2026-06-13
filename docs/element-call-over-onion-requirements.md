@@ -54,6 +54,38 @@ box's call endpoints because:
   SFU is already `wss://<onion>:7443` via Caddy. Then a cert-trusting client has a
   clean all-https call path with no mixed content.
 
+## UPDATE 2026-06-13 — branded client built; the REAL wall found + measured
+
+The branded client now drives Element Call itself (`ElementCallActivity`): SDK
+widget driver (`newVirtualElementCallWidget` + `generateWebviewUrl` +
+`makeWidgetDriver` + `getElementCallRequiredPermissions`) in a Tor-proxied,
+cert-trusting, mic/cam-granting WebView with a postMessage bridge. **Proven live:**
+EC v0.20.1 loads over Tor, the widget handshake completes (after fixing an
+echo-loop: only forward `fromWidget` *requests* and `toWidget` *responses* to the
+driver — never re-forward what we inject), the embedded ("matryoshka") client
+**finishes initial sync** through the bridge, and **MatrixRTCSession runs**. Box
+side: lk-jwt + client API now served HTTPS on the onion (no mixed content).
+
+**The wall (measured):** Chromium **WebView won't reach `.onion` hostnames**
+directly — RFC 7686 special-use handling (exactly what Tor Browser patches).
+EC's direct fetch to `https://<onion>:8009/_matrix/client/versions` (and it'd be
+the same for the SFU `wss://<onion>:7443` and lk-jwt) just hangs; `call.element.io`
+(clearnet) loads fine through the same Tor proxy. Switching the WebView proxy from
+HTTP-tunnel to SOCKS5 (remote DNS) did **not** help — the block is above the proxy.
+
+**The fix (scoped next step): local TLS-terminating Tor forwarders.** Make the
+WebView only ever see `127.0.0.1:<port>` (allowed) while the app tunnels each to
+the onion over Tor:
+- raw TCP forwarder `127.0.0.1:P → onion:port` via the app's Tor SOCKS (handles the
+  SFU `wss` too, which `shouldInterceptRequest` can't);
+- string-replace the onion baseUrl → `https://127.0.0.1:P` in the generated EC URL;
+- rewrite the focus/SFU URLs `.onion → 127.0.0.1` in the `/.well-known` and lk-jwt
+  responses (needs a TLS-terminating rewriting proxy, since `shouldInterceptRequest`
+  can't read POST bodies and the traffic is end-to-end TLS to the onion);
+- `onReceivedSslError` proceed covers the CN-vs-127.0.0.1 mismatch.
+This is ~150 lines + cert handling. Until then, calls reach "Loading…" (EC up over
+Tor) but don't connect media.
+
 ## Stock-client escape hatch (no branded client needed)
 
 Element **Web in Tor Browser** treats `http://<onion>` as a secure context, so it
