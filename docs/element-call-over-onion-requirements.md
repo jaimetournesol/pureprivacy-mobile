@@ -86,6 +86,41 @@ the onion over Tor:
 This is ~150 lines + cert handling. Until then, calls reach "Loading…" (EC up over
 Tor) but don't connect media.
 
+## ✅ SOLVED 2026-06-14 — Element Call CONNECTS over Tor in the branded client
+
+Verified live on the emulator: alice joined the "alice & bob" call entirely over
+Tor. LiveKit logged `participant active @alice:<onion>`; lk-jwt logged `Got user
+info for @alice:<onion>` (token validated over Tor). The whole chain — EC app,
+widget bridge, homeserver `/versions`, lk-jwt `/sfu/get`+`/get_token`, SFU join —
+ran over Tor. Implementation: `apps/android/.../net/TorNet.kt` + `ElementCallActivity.kt`.
+
+The architecture that made it work (the WebView only ever sees 127.0.0.1):
+1. **Serve Element Call ITSELF from `127.0.0.1`** (local NanoHTTPD proxy → call.element.io
+   over Tor). This is the crux — Chromium WebView refuses `.onion` (RFC 7686) AND blocks
+   Private Network Access from a *public* origin (call.element.io → 127.0.0.1). With EC at
+   `http://127.0.0.1`, its origin is **private + secure** (Chromium special-cases localhost),
+   so all its calls to our other 127.0.0.1 bridges are private→private and getUserMedia works.
+2. **Local proxies** for the homeserver client API + lk-jwt (NanoHTTPD → onion over Tor),
+   rewriting `.onion`→`127.0.0.1` in TEXT responses (binary passes byte-exact).
+3. **TLS forwarder** for the SFU WebSocket (ws://127.0.0.1 → wss://onion over Tor SOCKS5).
+4. **shouldInterceptRequest** serves EC's direct `.onion` server-name `/.well-known` over Tor.
+5. **EC in an iframe at the `/room` route** — EC only enters widget/room mode when embedded
+   (`window.parent !== window`); root `/` is its standalone "start new call" home.
+6. CSP/X-Frame/CORP stripped; CORS + `Access-Control-Allow-Private-Network: true` added;
+   `onReceivedSslError` proceed; mixed-content allowed.
+Box side: homeserver client API + lk-jwt now served HTTPS on the onion.
+
+### Remaining refinements (call connects; these harden it)
+- **Media RTP over Tor.** WebRTC negotiated direct-UDP (it can't use a `turn:<onion>`
+  server — same `.onion` block). For onion-pure media add a `turn:127.0.0.1:<port>`
+  localhost bridge → onion coturn, and get the client to use it (rewrite the SFU's
+  advertised TURN URI, which needs a TLS-terminating WS proxy on the SFU bridge, or a
+  client-injected ICE server).
+- **Two-way cross-install.** The joiner must bridge to the call's FOCUS onion (the peer's
+  box, where the SFU+lk-jwt live), not its own — discover the focus onion from the
+  `wss://<onion>:7443`/`https://<onion>:8443` URLs in the widget-API call-state messages,
+  start bridges to it dynamically, and rewrite those URLs → localhost in the bridge.
+
 ## Stock-client escape hatch (no branded client needed)
 
 Element **Web in Tor Browser** treats `http://<onion>` as a secure context, so it
