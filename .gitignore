@@ -1,0 +1,7 @@
+/target
+**/*.rs.bk
+Cargo.lock
+# platform build outputs
+apps/ios/Generated/
+apps/android/**/build/
+.DS_Store

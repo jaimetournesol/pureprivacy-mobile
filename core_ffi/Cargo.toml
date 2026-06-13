@@ -1,0 +1,31 @@
+[package]
+name = "pureprivacy_core"
+version = "0.1.0"
+edition = "2021"
+description = "PurePrivacy mobile shared core — Matrix client over embedded Tor (arti), exposed to SwiftUI + Compose via UniFFI"
+
+[lib]
+# `cdylib`/`staticlib` for the iOS/Android FFI; `lib` so we can unit-test.
+crate-type = ["cdylib", "staticlib", "lib"]
+name = "pureprivacy_core"
+
+[dependencies]
+uniffi = { version = "0.28", features = ["tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+thiserror = "2"
+tracing = "0.1"
+
+# ── NEXT MILESTONE (see README "Wiring the real client") ──────────────────
+# The heavy core deps are intentionally NOT active in this foundation commit —
+# they're a large, version-sensitive compile that belongs in its own focused
+# pass. The FFI contract below is final and stable so the iOS/Android shells
+# can build against it today; these get wired behind it next:
+#
+#   matrix-sdk  = { version = "<pin>", features = ["e2e-encryption","sqlite","rustls-tls"] }
+#   arti-client = { version = "<pin>", features = ["tokio","rustls","onion-service-client","experimental-api"] }
+#
+# Tor routing: run arti as a local SOCKS proxy and point matrix-sdk's reqwest
+# at socks5h://127.0.0.1:<port> (socks5h so the .onion resolves at Tor), OR the
+# artiqwest-style custom hyper connector on TorClient::connect. Integration test
+# target: login to a local tuwunel over its .onion through arti; assert the
+# client CANNOT reach clearnet and CAN reach the onion.
