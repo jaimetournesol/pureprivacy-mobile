@@ -288,6 +288,14 @@ class ElementCallActivity : ComponentActivity() {
     inner class Bridge(private val handle: org.matrix.rustcomponents.sdk.WidgetDriverHandle) {
         @JavascriptInterface
         fun fromWidget(json: String) {
+            // Hang up / leave: Element Call posts `io.element.close`. Without this the
+            // WebView lingers on a blank call surface (the "stuck on black screen"),
+            // so close the activity and return to the chat.
+            if (json.contains("\"io.element.close\"")) {
+                Log.i(TAG, "EC requested close -> finishing call")
+                runOnUiThread { if (!isFinishing) finish() }
+                return
+            }
             // Reverse the localhost rewrite: anything EC publishes (its call
             // membership / preferred focus) must carry the real onion so the peer's
             // box can resolve it — a bare 127.0.0.1 would point at the peer's own box.
