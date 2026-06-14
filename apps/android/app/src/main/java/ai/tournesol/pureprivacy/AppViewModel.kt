@@ -78,12 +78,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun normalizeHomeserver(raw: String): String {
         var s = raw.trim()
-        // HTTPS so the embedded WebView (Element Call) reaches the box via Tor's
-        // CONNECT tunnel with no mixed content; the SDK trusts the onion's
-        // self-signed cert via disableSslVerification().
-        if (!s.startsWith("http://") && !s.startsWith("https://")) s = "https://$s"
+        // The PurePrivacy box (pureprivacy-desktop) serves the Matrix client API as
+        // plain http on onion:8008 — the .onion IS the encryption layer, so no TLS
+        // is needed (and the Element Call bridge serves localhost-http to the WebView
+        // regardless). The user just enters their box's .onion; we form the URL.
+        if (!s.startsWith("http://") && !s.startsWith("https://")) s = "http://$s"
         val afterScheme = s.substringAfter("://")
-        if (!afterScheme.contains(":")) s = "$s:8009"
+        if (!afterScheme.contains(":")) s = "$s:8008"
         return s
     }
 
