@@ -3,9 +3,10 @@ package ai.tournesol.pureprivacy
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.viewModels
-import androidx.compose.ui.platform.LocalContext
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -13,21 +14,32 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.automirrored.filled.Send
-import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.Call
+import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.QrCode
+import androidx.compose.material.icons.filled.QrCode2
+import androidx.compose.material.icons.filled.QrCodeScanner
+import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
@@ -37,6 +49,9 @@ import ai.tournesol.pureprivacy.matrix.ChatMsg
 import ai.tournesol.pureprivacy.matrix.RoomSummary
 import ai.tournesol.pureprivacy.tor.TorManager
 import ai.tournesol.pureprivacy.ui.theme.*
+import ai.tournesol.pureprivacy.util.Qr
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
 
 class MainActivity : ComponentActivity() {
     private val vm: AppViewModel by viewModels()
@@ -50,12 +65,26 @@ class MainActivity : ComponentActivity() {
                     when (val s = screen) {
                         is Screen.Login -> LoginScreen(vm)
                         is Screen.Rooms -> RoomsScreen(vm)
+                        is Screen.Profile -> ProfileScreen(vm)
                         is Screen.Chat -> ChatScreen(vm, s.roomId, s.roomName)
                     }
                 }
             }
         }
     }
+}
+
+/** A QR-scan launcher wired to the journeyapps scanner; calls [onResult] with the
+ *  decoded text. The CaptureActivity requests the camera permission itself. */
+@Composable
+private fun rememberScan(onResult: (String?) -> Unit) =
+    rememberLauncherForActivityResult(ScanContract()) { onResult(it?.contents) }
+
+private fun scanOptions() = ScanOptions().apply {
+    setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+    setPrompt("Point at a friend's PurePrivacy code")
+    setBeepEnabled(false)
+    setOrientationLocked(false)
 }
 
 @Composable
@@ -123,9 +152,9 @@ fun LoginScreen(vm: AppViewModel) {
 }
 
 @Composable
-private fun SunflowerMark() {
-    Box(Modifier.size(72.dp).clip(RoundedCornerShape(20.dp)).background(InkCard), contentAlignment = Alignment.Center) {
-        Text("✿", color = Sunflower, fontSize = 44.sp)
+private fun SunflowerMark(size: Int = 72) {
+    Box(Modifier.size(size.dp).clip(RoundedCornerShape((size / 3.6).dp)).background(InkCard), contentAlignment = Alignment.Center) {
+        Text("✿", color = Sunflower, fontSize = (size * 0.6).sp)
     }
 }
 
@@ -155,9 +184,30 @@ fun RoomsScreen(vm: AppViewModel) {
     val busy by vm.busy.collectAsState()
     val err by vm.error.collectAsState()
     val ctx = LocalContext.current
+    var showSheet by remember { mutableStateOf(false) }
     var showNew by remember { mutableStateOf(false) }
     var peer by remember { mutableStateOf("") }
     BackHandler { (ctx as? android.app.Activity)?.moveTaskToBack(true) }
+
+    val scan = rememberScan { contents -> if (contents != null) vm.addContact(contents) }
+
+    if (showSheet) {
+        ModalBottomSheet(onDismissRequest = { showSheet = false }, containerColor = InkSoft) {
+            Column(Modifier.fillMaxWidth().padding(bottom = 24.dp)) {
+                Text("New chat", color = Paper, fontWeight = FontWeight.Bold, fontSize = 18.sp,
+                    modifier = Modifier.padding(start = 22.dp, top = 4.dp, bottom = 8.dp))
+                SheetAction(Icons.Filled.QrCodeScanner, "Scan a code", "Point your camera at a friend's code") {
+                    showSheet = false; scan.launch(scanOptions())
+                }
+                SheetAction(Icons.Filled.QrCode2, "Show my code", "Let someone scan you to start a chat") {
+                    showSheet = false; vm.showProfile()
+                }
+                SheetAction(Icons.Filled.Edit, "Enter address", "Type a @name:onion address") {
+                    showSheet = false; peer = ""; vm.clearError(); showNew = true
+                }
+            }
+        }
+    }
 
     if (showNew) {
         AlertDialog(
@@ -192,26 +242,65 @@ fun RoomsScreen(vm: AppViewModel) {
     Scaffold(
         containerColor = Ink,
         floatingActionButton = {
-            FloatingActionButton(onClick = { peer = ""; vm.clearError(); showNew = true },
+            FloatingActionButton(onClick = { vm.clearError(); showSheet = true },
                 containerColor = Sunflower, contentColor = Ink) {
-                Icon(Icons.Filled.Add, "new chat")
+                Icon(Icons.Filled.QrCodeScanner, "new chat")
             }
         },
         topBar = {
             TopAppBar(
                 title = { Column { Text("Chats", color = Paper, fontWeight = FontWeight.Bold); TorBadge() } },
+                actions = {
+                    IconButton(onClick = { vm.showProfile() }) {
+                        Icon(Icons.Filled.QrCode, "my code", tint = Sunflower)
+                    }
+                },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = InkSoft)
             )
         }
     ) { pad ->
         if (rooms.isEmpty()) {
-            Box(Modifier.fillMaxSize().padding(pad), contentAlignment = Alignment.Center) {
-                Text("No chats yet — syncing over Tor…", color = PaperDim)
+            Column(
+                Modifier.fillMaxSize().padding(pad).padding(32.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center
+            ) {
+                Icon(Icons.Filled.QrCodeScanner, null, tint = Sunflower, modifier = Modifier.size(48.dp))
+                Spacer(Modifier.height(16.dp))
+                Text("No chats yet", color = Paper, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+                Spacer(Modifier.height(6.dp))
+                Text("Scan a friend's code, or show yours — that's all it takes to connect across boxes, over Tor.",
+                    color = PaperDim, fontSize = 13.sp, textAlign = TextAlign.Center)
+                Spacer(Modifier.height(20.dp))
+                Button(onClick = { scan.launch(scanOptions()) },
+                    colors = ButtonDefaults.buttonColors(containerColor = Sunflower, contentColor = Ink),
+                    shape = RoundedCornerShape(14.dp)) {
+                    Icon(Icons.Filled.QrCodeScanner, null); Spacer(Modifier.width(8.dp)); Text("Scan a code", fontWeight = FontWeight.SemiBold)
+                }
+                Spacer(Modifier.height(10.dp))
+                TextButton(onClick = { vm.showProfile() }) { Text("Show my code", color = Sunflower) }
             }
         } else {
             LazyColumn(Modifier.fillMaxSize().padding(pad)) {
                 items(rooms, key = { it.id }) { r -> RoomRow(r) { vm.openRoom(r.id, r.name) } }
             }
+        }
+    }
+}
+
+@Composable
+private fun SheetAction(icon: androidx.compose.ui.graphics.vector.ImageVector, title: String, subtitle: String, onClick: () -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 22.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(Modifier.size(40.dp).clip(CircleShape).background(InkCard), contentAlignment = Alignment.Center) {
+            Icon(icon, null, tint = Sunflower, modifier = Modifier.size(22.dp))
+        }
+        Spacer(Modifier.width(16.dp))
+        Column {
+            Text(title, color = Paper, fontSize = 16.sp, fontWeight = FontWeight.Medium)
+            Text(subtitle, color = PaperDim, fontSize = 12.sp)
         }
     }
 }
@@ -223,12 +312,93 @@ private fun RoomRow(r: RoomSummary, onClick: () -> Unit) {
         verticalAlignment = Alignment.CenterVertically
     ) {
         Box(Modifier.size(44.dp).clip(RoundedCornerShape(12.dp)).background(InkCard), contentAlignment = Alignment.Center) {
-            Text(r.name.firstOrNull()?.uppercase() ?: "#", color = Sunflower, fontWeight = FontWeight.Bold)
+            Text(r.name.firstOrNull { it.isLetterOrDigit() }?.uppercase() ?: "#", color = Sunflower, fontWeight = FontWeight.Bold)
         }
         Spacer(Modifier.width(14.dp))
-        Text(r.name, color = Paper, fontSize = 16.sp, maxLines = 1)
+        Column(Modifier.weight(1f)) {
+            Text(r.name, color = Paper, fontSize = 16.sp, maxLines = 1)
+            if (r.invited) Text("Invite · tap to join", color = Sunflower, fontSize = 12.sp)
+        }
+        if (r.invited) Box(Modifier.size(8.dp).clip(CircleShape).background(Sunflower))
     }
     HorizontalDivider(color = Color(0xFF1B222B))
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun ProfileScreen(vm: AppViewModel) {
+    BackHandler { vm.openRooms() }
+    val clip = LocalClipboardManager.current
+    val id = vm.myId
+    val name = id.removePrefix("@").substringBefore(":")
+    val qr = remember(id) { runCatching { Qr.bitmap(if (id.isBlank()) " " else id, 640) }.getOrNull() }
+
+    val scan = rememberScan { contents -> if (contents != null) vm.addContact(contents) }
+
+    Scaffold(
+        containerColor = Ink,
+        topBar = {
+            TopAppBar(
+                navigationIcon = { IconButton(onClick = { vm.openRooms() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, null, tint = Paper) } },
+                title = { Text("My code", color = Paper, fontWeight = FontWeight.Bold) },
+                actions = {
+                    IconButton(onClick = { vm.logout() }) { Icon(Icons.AutoMirrored.Filled.Logout, "sign out", tint = PaperDim) }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = InkSoft)
+            )
+        }
+    ) { pad ->
+        Column(
+            Modifier.fillMaxSize().padding(pad).padding(28.dp).verticalScroll(rememberScrollState()),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Spacer(Modifier.height(8.dp))
+            Box(Modifier.size(64.dp).clip(RoundedCornerShape(20.dp)).background(InkCard), contentAlignment = Alignment.Center) {
+                Text(name.firstOrNull()?.uppercase() ?: "✿", color = Sunflower, fontSize = 30.sp, fontWeight = FontWeight.Bold)
+            }
+            Spacer(Modifier.height(12.dp))
+            Text(name, color = Paper, fontSize = 22.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(20.dp))
+
+            // The QR — dark on white in a rounded card so it scans cleanly off-screen.
+            Box(Modifier.clip(RoundedCornerShape(20.dp)).background(Color.White).padding(18.dp)) {
+                if (qr != null) {
+                    Image(qr.asImageBitmap(), "your code", modifier = Modifier.size(240.dp))
+                } else {
+                    Box(Modifier.size(240.dp), contentAlignment = Alignment.Center) { CircularProgressIndicator(color = Ink) }
+                }
+            }
+            Spacer(Modifier.height(16.dp))
+            Text("Have a friend scan this to message you", color = PaperDim, fontSize = 13.sp, textAlign = TextAlign.Center)
+            Spacer(Modifier.height(12.dp))
+
+            // the raw address, copyable as a fallback to QR
+            Row(
+                Modifier.clip(RoundedCornerShape(12.dp)).background(InkCard)
+                    .clickable { clip.setText(AnnotatedString(id)) }
+                    .padding(horizontal = 14.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(id, color = PaperDim, fontSize = 12.sp, fontFamily = FontFamily.Monospace, maxLines = 1, modifier = Modifier.weight(1f, fill = false))
+                Spacer(Modifier.width(10.dp))
+                Icon(Icons.Filled.ContentCopy, "copy", tint = Sunflower, modifier = Modifier.size(18.dp))
+            }
+
+            Spacer(Modifier.height(28.dp))
+            Button(
+                onClick = { scan.launch(scanOptions()) },
+                colors = ButtonDefaults.buttonColors(containerColor = Sunflower, contentColor = Ink),
+                modifier = Modifier.fillMaxWidth().height(52.dp), shape = RoundedCornerShape(14.dp)
+            ) {
+                Icon(Icons.Filled.QrCodeScanner, null); Spacer(Modifier.width(8.dp))
+                Text("Scan a friend's code", fontWeight = FontWeight.SemiBold)
+            }
+            val busy by vm.busy.collectAsState()
+            val err by vm.error.collectAsState()
+            if (busy) { Spacer(Modifier.height(14.dp)); CircularProgressIndicator(color = Sunflower) }
+            if (err != null) { Spacer(Modifier.height(12.dp)); Text(err!!, color = Color(0xFFE5534B), fontSize = 13.sp, textAlign = TextAlign.Center) }
+        }
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -252,7 +422,7 @@ fun ChatScreen(vm: AppViewModel, roomId: String, roomName: String) {
                 actions = {
                     IconButton(onClick = {
                         ctx.startActivity(android.content.Intent(ctx, ElementCallActivity::class.java))
-                    }) { Icon(Icons.Filled.Call, "call", tint = Sunflower) }
+                    }) { Icon(Icons.Filled.Videocam, "call", tint = Sunflower) }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = InkSoft)
             )
@@ -280,11 +450,22 @@ fun ChatScreen(vm: AppViewModel, roomId: String, roomName: String) {
             }
         }
     ) { pad ->
-        LazyColumn(
-            Modifier.fillMaxSize().padding(pad).padding(horizontal = 12.dp),
-            state = listState
-        ) {
-            items(messages, key = { it.key }) { m -> Bubble(m) }
+        if (messages.isEmpty()) {
+            Box(Modifier.fillMaxSize().padding(pad), contentAlignment = Alignment.Center) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Icon(Icons.Filled.Lock, null, tint = Sunflower, modifier = Modifier.size(36.dp))
+                    Spacer(Modifier.height(10.dp))
+                    Text("End-to-end encrypted, over Tor", color = PaperDim, fontSize = 13.sp)
+                    Text("Say hi 👋", color = PaperDim, fontSize = 13.sp)
+                }
+            }
+        } else {
+            LazyColumn(
+                Modifier.fillMaxSize().padding(pad).padding(horizontal = 12.dp),
+                state = listState
+            ) {
+                items(messages, key = { it.key }) { m -> Bubble(m) }
+            }
         }
     }
 }

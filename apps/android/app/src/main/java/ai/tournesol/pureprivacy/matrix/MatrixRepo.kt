@@ -10,6 +10,7 @@ import org.matrix.rustcomponents.sdk.ClientBuilder
 import org.matrix.rustcomponents.sdk.CreateRoomParameters
 import org.matrix.rustcomponents.sdk.RoomPreset
 import org.matrix.rustcomponents.sdk.RoomVisibility
+import org.matrix.rustcomponents.sdk.Membership
 import org.matrix.rustcomponents.sdk.MsgLikeKind
 import org.matrix.rustcomponents.sdk.Room
 import org.matrix.rustcomponents.sdk.RoomListEntriesDynamicFilterKind
@@ -28,7 +29,7 @@ import org.matrix.rustcomponents.sdk.TimelineListener
 import org.matrix.rustcomponents.sdk.messageEventContentFromMarkdown
 import java.io.File
 
-data class RoomSummary(val id: String, val name: String)
+data class RoomSummary(val id: String, val name: String, val invited: Boolean = false)
 data class ChatMsg(val key: String, val sender: String, val body: String, val mine: Boolean)
 
 /**
@@ -76,8 +77,16 @@ object MatrixRepo {
         return b
     }
 
+    /** Delete the on-disk Matrix session + crypto store. A stale store from a
+     *  previous account/device causes the SDK's MismatchedAccount crypto error on a
+     *  fresh login, so we always start a sign-in from clean state. */
+    private fun wipeStore(ctx: Context) {
+        runCatching { File(ctx.filesDir, "matrix").deleteRecursively() }
+    }
+
     suspend fun login(ctx: Context, homeserverUrl: String, user: String, pass: String) {
         status.value = "Connecting over Tor…"
+        wipeStore(ctx)                                  // clean crypto store for this sign-in
         val c = builder(ctx, homeserverUrl).build()
         client = c
         status.value = "Signing in…"
@@ -169,11 +178,22 @@ object MatrixRepo {
             roomHandles.clear()
             list.forEach { r -> runCatching { roomHandles[r.id()] = r } }
             rooms.value = roomHandles.values.map { r ->
-                val name = runCatching { r.displayName() }.getOrNull()?.takeIf { it.isNotBlank() }
-                    ?: r.id()
-                RoomSummary(r.id(), name)
+                val raw = runCatching { r.displayName() }.getOrNull()
+                val invited = runCatching { r.membership() == Membership.INVITED }.getOrDefault(false)
+                RoomSummary(r.id(), prettyName(raw, r.id()), invited)
             }
         }
+    }
+
+    /** Turn whatever the SDK hands back into something a human wants to read.
+     *  Unnamed/system rooms otherwise leak a room id or a raw onion string. */
+    private fun prettyName(raw: String?, id: String): String {
+        val n = raw?.trim().orEmpty()
+        if (n.isBlank() || n.startsWith("!")) return "Encrypted chat"
+        if (n.startsWith("@")) return n.removePrefix("@").substringBefore(":")
+        // a bare onion / base32 blob is not a friendly name
+        if (n.contains(".onion") || Regex("^[a-z2-7]{40,}").containsMatchIn(n)) return "Encrypted chat"
+        return n
     }
 
     suspend fun openRoom(roomId: String) {
@@ -182,6 +202,12 @@ object MatrixRepo {
         messages.value = emptyList()
         val room = runCatching { rls.room(roomId) }.getOrNull()
             ?: roomHandles[roomId] ?: error("room not found")
+        // Accept an invite transparently: a contact who scanned your code invited
+        // you — tapping the chat should just join it (over Tor), no extra step.
+        if (runCatching { room.membership() == Membership.INVITED }.getOrDefault(false)) {
+            status.value = "Joining over Tor…"
+            runCatching { room.join() }
+        }
         currentRoom = room
         val tl = room.timeline()
         timeline = tl
@@ -236,9 +262,13 @@ object MatrixRepo {
     }
 
     /** Start a direct, end-to-end-encrypted chat with another user (@user:onion),
-     *  inviting them. Returns the new room id. Federates the invite over Tor. */
+     *  inviting them. Returns the room id. Reuses an existing DM with that user if
+     *  one already exists (no duplicate rooms from scanning twice). Federates the
+     *  invite over Tor. */
     suspend fun startChat(userId: String): String {
         val c = client ?: error("not logged in")
+        // dedup: if we already share a DM with this person, open it.
+        runCatching { c.getDmRoom(userId) }.getOrNull()?.let { return it.id() }
         val params = CreateRoomParameters(
             name = null,
             topic = null,
@@ -255,5 +285,19 @@ object MatrixRepo {
             isSpace = false,
         )
         return c.createRoom(params)
+    }
+
+    /** Sign out: best-effort server logout, then wipe the local session so the
+     *  next launch lands on Login. */
+    suspend fun logout(ctx: Context) {
+        runCatching { syncService?.stop() }
+        runCatching { client?.logout() }
+        ctx.getSharedPreferences("pp_session", Context.MODE_PRIVATE).edit().clear().apply()
+        client = null; syncService = null; roomListService = null; timeline = null
+        currentRoom = null; userId = ""; deviceId = ""
+        roomHandles.clear(); timelineItems.clear()
+        rooms.value = emptyList(); messages.value = emptyList()
+        wipeStore(ctx)                                  // remove crypto store too
+        status.value = ""
     }
 }

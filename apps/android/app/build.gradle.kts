@@ -71,6 +71,13 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.nanohttpd:nanohttpd:2.3.1")
 
+    // QR contact exchange — show my @user:onion as a code, scan a friend's to
+    // start an encrypted DM. zxing core generates; journeyapps wraps the camera
+    // scanner (ScanContract). Keeps the QR-pairing constraint, makes cross-box
+    // connect trivial.
+    implementation("com.google.zxing:core:3.5.3")
+    implementation("com.journeyapps:zxing-android-embedded:4.3.0")
+
     // The real thing: Element X's matrix-rust-sdk (E2EE, sliding sync) + JNA (UniFFI).
     implementation("org.matrix.rustcomponents:sdk-android:26.06.11")
     implementation("net.java.dev.jna:jna:5.14.0@aar")

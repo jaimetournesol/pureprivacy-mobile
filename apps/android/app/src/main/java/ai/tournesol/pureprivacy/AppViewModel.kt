@@ -12,6 +12,7 @@ import kotlinx.coroutines.launch
 sealed class Screen {
     data object Login : Screen()
     data object Rooms : Screen()
+    data object Profile : Screen()
     data class Chat(val roomId: String, val roomName: String) : Screen()
 }
 
@@ -24,6 +25,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     val screen = MutableStateFlow<Screen>(Screen.Login)
     val error = MutableStateFlow<String?>(null)
     val busy = MutableStateFlow(false)
+
+    /** This user's Matrix address (@name:onion) — the payload behind "my code". */
+    val myId: String get() = MatrixRepo.userId
 
     init {
         // Tor runs for the lifetime of the app; start() blocks reading its log.
@@ -100,6 +104,29 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             } finally {
                 busy.value = false
             }
+        }
+    }
+
+    /** A contact's code was scanned (or pasted). Normalize whatever the QR carried
+     *  into a Matrix id and open/create the encrypted DM. */
+    fun addContact(scanned: String?) {
+        val raw = scanned?.trim().orEmpty()
+        if (raw.isEmpty()) return
+        // accept "pureprivacy:@bob:onion", "matrix:u/bob:onion", or a bare "@bob:onion"
+        var id = raw.substringAfter("pureprivacy:", raw)
+            .substringAfter("matrix:u/", raw.substringAfter("pureprivacy:", raw))
+            .trim()
+        if (!id.startsWith("@") && id.contains(":") && id.contains(".")) id = "@$id"
+        startChat(id)
+    }
+
+    fun showProfile() { error.value = null; screen.value = Screen.Profile }
+    fun openRooms() { error.value = null; screen.value = Screen.Rooms }
+
+    fun logout() {
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { MatrixRepo.logout(getApplication()) }
+            screen.value = Screen.Login
         }
     }
 
