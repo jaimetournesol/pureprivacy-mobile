@@ -1,10 +1,13 @@
 package ai.tournesol.pureprivacy
 
+import android.content.Intent
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -55,9 +58,15 @@ import com.journeyapps.barcodescanner.ScanOptions
 
 class MainActivity : ComponentActivity() {
     private val vm: AppViewModel by viewModels()
+    private val notifPerm = registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            notifPerm.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+        }
+        handleNotifIntent(intent)
         setContent {
             PurePrivacyTheme {
                 Surface(Modifier.fillMaxSize(), color = Ink) {
@@ -71,6 +80,19 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleNotifIntent(intent)
+    }
+
+    /** A tapped message/call notification carries the room — open it. */
+    private fun handleNotifIntent(intent: Intent?) {
+        val roomId = intent?.getStringExtra(PpSyncService.EXTRA_ROOM_ID) ?: return
+        val name = intent.getStringExtra(PpSyncService.EXTRA_ROOM_NAME) ?: "Chat"
+        vm.openRoomFromNotif(roomId, name)
     }
 }
 

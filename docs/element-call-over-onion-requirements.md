@@ -132,12 +132,36 @@ How the joiner bridging works (`ElementCallActivity.kt`):
    call membership we PUBLISH carries the real onion — otherwise the peer reads a bare
    `127.0.0.1` and points at its own box.
 
-### Remaining refinement (call connects both ways; this hardens it)
-- **Media RTP over Tor.** WebRTC negotiated direct-UDP (it can't use a `turn:<onion>`
-  server — same `.onion` block). For onion-pure media add a `turn:127.0.0.1:<port>`
-  localhost bridge → onion coturn, and get the client to use it (rewrite the SFU's
-  advertised TURN URI, which needs a TLS-terminating WS proxy on the SFU bridge, or a
-  client-injected ICE server).
+## ✅ SOLVED 2026-06-14 — Media RTP over Tor (forced TURN relay)
+
+Verified live: alice's call now connects with `box1-lk` reporting
+`[remote][selected][trickle] udp4 relay …` and **`"connectionType": "turn"`**
+(it was `prflx`/direct-UDP before). All call media rides Tor through the box's
+coturn relay. Implementation (`ElementCallActivity.kt` + `net/TorNet.kt`):
+
+1. **Local TURN-over-TCP bridge** `127.0.0.1:13478 → onion:3478` over Tor SOCKS5
+   (`TorNet.startTcpForwarder`, with a dynamic onion supplier so the joiner can
+   target the focus box's coturn once discovered).
+2. **Inject an RTCPeerConnection patch** into the Element Call page (the HTTP proxy
+   inserts a `<script>` after `<head>`). It (a) rewrites the SFU-advertised
+   `turn:<onion>:3478` ICE server → `turn:127.0.0.1:13478` (keeping the box's
+   credentials, username `2147483647`), and (b) sets `iceTransportPolicy = 'relay'`
+   so WebRTC uses ONLY the relay — no direct-UDP leak. Verified by the EC console
+   line `[pp] RTCPeerConnection patched -> relay via 127.0.0.1:13478` and a coturn
+   `ALLOCATE … success` over Tor.
+
+### Box-side coturn/LiveKit requirements this exposed (appliance must match)
+Forcing relay made these previously-irrelevant settings matter (media used to go
+direct, so the relay path was never exercised). The appliance's `config.rs` must
+ensure, for the co-located SFU+coturn:
+- coturn `external-ip`/`relay-ip` = a **locally-reachable** address (the box/container
+  IP), NOT the `.onion` — otherwise coturn advertises a relay the SFU can't reach
+  (`udp send: Invalid argument`, `removing participant without connection`).
+- coturn `allow-loopback-peers` (relay to the local SFU).
+- LiveKit `rtc.udp_port` set (+ `enable_loopback_candidate: true`) so the TURN relay's
+  UDP leg has a SFU port to deliver to (TCP-only LiveKit can't receive the relayed UDP).
+The onion `turn:<onion>:3478?transport=tcp` advertisement + static creds stay as-is;
+the client reaches coturn over the Tor control channel, coturn relays locally to the SFU.
 
 ## Stock-client escape hatch (no branded client needed)
 

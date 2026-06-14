@@ -42,6 +42,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 if (MatrixRepo.tryRestore(getApplication())) {
                     MatrixRepo.startSync()
+                    PpSyncService.start(getApplication())
                     screen.value = Screen.Rooms
                 }
             } catch (t: Throwable) {
@@ -65,6 +66,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 val hs = normalizeHomeserver(onion)
                 MatrixRepo.login(getApplication(), hs, user.trim(), pass)
                 MatrixRepo.startSync()
+                PpSyncService.start(getApplication())
                 screen.value = Screen.Rooms
             } catch (t: Throwable) {
                 error.value = t.message ?: t.toString()
@@ -146,6 +148,21 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch(Dispatchers.IO) { runCatching { MatrixRepo.send(text) } }
     }
 
-    fun back() { screen.value = Screen.Rooms }
+    fun back() { MatrixRepo.currentRoomId = null; screen.value = Screen.Rooms }
     fun clearError() { error.value = null }
+
+    /** Open a room from a tapped notification — wait for login/sync if we were
+     *  cold-started by the tap. */
+    fun openRoomFromNotif(id: String, name: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            var waited = 0
+            while (!MatrixRepo.isLoggedIn && waited < 120) { kotlinx.coroutines.delay(500); waited++ }
+            waited = 0
+            while (MatrixRepo.rooms.value.none { it.id == id } && waited < 30) { kotlinx.coroutines.delay(500); waited++ }
+            runCatching {
+                MatrixRepo.openRoom(id)
+                screen.value = Screen.Chat(id, name)
+            }
+        }
+    }
 }

@@ -64,8 +64,10 @@ object TorNet {
     }
 
     /** Plain-HTTP local proxy: http://127.0.0.1:localPort -> https://onion:port (over Tor),
-     *  rewriting `rewrites` in response bodies. */
-    fun startHttpProxy(localPort: Int, onionBase: String, httpProxyPort: Int, rewrites: Map<String, String>) {
+     *  rewriting `rewrites` in response bodies. If [injectHtml] is set, it is inserted
+     *  into HTML responses (right after <head>) — used to patch the Element Call app
+     *  in-page (e.g. force WebRTC media through a localhost TURN bridge over Tor). */
+    fun startHttpProxy(localPort: Int, onionBase: String, httpProxyPort: Int, rewrites: Map<String, String>, injectHtml: String? = null) {
         if (started.containsKey(localPort)) return
         val client = torClient(httpProxyPort)
         val server = object : NanoHTTPD("127.0.0.1", localPort) {
@@ -99,6 +101,10 @@ object TorNet {
                         val out = if (textual) {
                             var text = resp.body?.string() ?: ""
                             for ((a, b) in rewrites) text = text.replace(a, b)
+                            if (injectHtml != null && ctType.contains("html")) {
+                                text = if (text.contains("<head>")) text.replaceFirst("<head>", "<head>$injectHtml")
+                                else injectHtml + text
+                            }
                             newFixedLengthResponse(status, ctType, text)
                         } else {
                             val bytes = resp.body?.bytes() ?: ByteArray(0)
@@ -142,6 +148,34 @@ object TorNet {
             }
         }
         Log.i(TAG, "tls forwarder ws 127.0.0.1:$localPort -> wss $onionHost:$onionPort")
+    }
+
+    /** Plain-TCP local listener bridged to an onion:port over Tor SOCKS5 (no TLS).
+     *  Carries TURN-over-TCP to the box's coturn so WebRTC media can ride Tor. The
+     *  destination onion is resolved per-connection via [host] — the joiner only
+     *  learns the call's focus box (where coturn lives) after the call state arrives,
+     *  so we point this at it dynamically. */
+    fun startTcpForwarder(localPort: Int, host: () -> String, onionPort: Int, socksPort: Int) {
+        if (started.containsKey(localPort)) return
+        val ss = ServerSocket(); ss.reuseAddress = true
+        ss.bind(InetSocketAddress(InetAddress.getByName("127.0.0.1"), localPort))
+        started[localPort] = ss
+        thread(name = "tcpfwd-$localPort") {
+            while (!ss.isClosed) {
+                val client = try { ss.accept() } catch (_: Throwable) { break }
+                thread { tcpBridge(client, host(), onionPort, socksPort) }
+            }
+        }
+        Log.i(TAG, "tcp forwarder 127.0.0.1:$localPort -> :$onionPort (dynamic onion)")
+    }
+
+    private fun tcpBridge(client: Socket, host: String, port: Int, socksPort: Int) {
+        try {
+            val raw = socks5(host, port, socksPort)
+            val t1 = thread { copy(client.getInputStream(), raw.getOutputStream()) }
+            copy(raw.getInputStream(), client.getOutputStream())
+            t1.join(200); client.close(); raw.close()
+        } catch (t: Throwable) { Log.d(TAG, "tcp bridge ended: ${t.message}"); runCatching { client.close() } }
     }
 
     private fun bridge(client: Socket, host: String, port: Int, socksPort: Int) {

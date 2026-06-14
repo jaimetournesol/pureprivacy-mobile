@@ -3,9 +3,15 @@ package ai.tournesol.pureprivacy.matrix
 import android.content.Context
 import android.util.Log
 import ai.tournesol.pureprivacy.tor.TorManager
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
 import org.matrix.rustcomponents.sdk.Client
+import org.matrix.rustcomponents.sdk.LatestEventValue
 import org.matrix.rustcomponents.sdk.ClientBuilder
 import org.matrix.rustcomponents.sdk.CreateRoomParameters
 import org.matrix.rustcomponents.sdk.RoomPreset
@@ -31,6 +37,15 @@ import java.io.File
 
 data class RoomSummary(val id: String, val name: String, val invited: Boolean = false)
 data class ChatMsg(val key: String, val sender: String, val body: String, val mine: Boolean)
+/** A thing worth alerting the user about when they're not looking at the room. */
+data class Notif(
+    val roomId: String,
+    val roomName: String,
+    val title: String,
+    val text: String,
+    val isCall: Boolean = false,
+    val isInvite: Boolean = false,
+)
 
 /**
  * The real chat brain: Element X's matrix-rust-sdk over embedded Tor. Login, native
@@ -51,11 +66,22 @@ object MatrixRepo {
         private set
     var currentRoom: Room? = null
         private set
+    /** The room the user currently has open — suppresses notifications for it. */
+    @Volatile var currentRoomId: String? = null
     fun client(): Client? = client
 
     val rooms = MutableStateFlow<List<RoomSummary>>(emptyList())
     val messages = MutableStateFlow<List<ChatMsg>>(emptyList())
     val status = MutableStateFlow("")
+
+    /** Background-notification stream — the foreground service collects this and
+     *  posts Android notifications for messages / calls / invites. */
+    val notifications = MutableSharedFlow<Notif>(extraBufferCapacity = 32)
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val lastSeen = java.util.concurrent.ConcurrentHashMap<String, String>()
+    @Volatile private var notifyArmed = false   // don't fire for the initial backfill
+    @Volatile private var notifyFromMs = 0L     // only notify for events newer than this
+    @Volatile private var pollStarted = false
 
     private val roomHandles = LinkedHashMap<String, Room>()
     private val timelineItems = ArrayList<TimelineItem>()
@@ -155,6 +181,21 @@ object MatrixRepo {
         // populate: no extra filtering, just show every room we're in
         result.controller().setFilter(RoomListEntriesDynamicFilterKind.All(emptyList()))
         status.value = "Connected"
+        // arm notifications: only events from ~now on are "new" (avoids backfill).
+        notifyFromMs = System.currentTimeMillis()
+        scope.launch { kotlinx.coroutines.delay(3000); notifyArmed = true }
+        // The room-list listener only fires on list *reordering* — a new message to
+        // the already-top room doesn't reorder it. So poll latest events too; this is
+        // a cheap local read (sliding sync has already cached the data).
+        if (!pollStarted) {
+            pollStarted = true
+            scope.launch {
+                while (true) {
+                    kotlinx.coroutines.delay(2500)
+                    runCatching { checkNotifs() }
+                }
+            }
+        }
     }
 
     private fun applyRoomUpdates(updates: List<RoomListEntriesUpdate>) {
@@ -183,6 +224,63 @@ object MatrixRepo {
                 RoomSummary(r.id(), prettyName(raw, r.id()), invited)
             }
         }
+        scope.launch { checkNotifs() }
+    }
+
+    /** Look at each room's latest event and emit a notification for anything new
+     *  the user isn't already looking at (a message, an incoming call, an invite). */
+    private suspend fun checkNotifs() {
+        val handles = synchronized(roomHandles) { LinkedHashMap(roomHandles) }
+        for ((id, room) in handles) {
+            val lev = runCatching { room.latestEvent() }.getOrNull() ?: continue
+            val key = keyOf(lev) ?: continue
+            if (lastSeen[id] == key) continue          // already handled this event
+            lastSeen[id] = key
+            if (!notifyArmed) continue
+            if (id == currentRoomId) continue          // user is looking at it
+            if (tsOf(lev) < notifyFromMs) continue     // backfill / history, not new
+            val n = toNotif(id, room, lev) ?: continue
+            Log.i(TAG, "notify: ${n.title} (${id})")
+            notifications.emit(n)
+        }
+    }
+
+    private fun keyOf(lev: LatestEventValue): String? = when (lev) {
+        is LatestEventValue.Remote -> "r:${lev.timestamp}:${lev.sender}"
+        is LatestEventValue.RemoteInvite -> "i:${lev.timestamp}:${lev.inviter}"
+        else -> null
+    }
+
+    private fun tsOf(lev: LatestEventValue): Long = when (lev) {
+        is LatestEventValue.Remote -> lev.timestamp.toLong()
+        is LatestEventValue.RemoteInvite -> lev.timestamp.toLong()
+        else -> 0L
+    }
+
+    private fun toNotif(id: String, room: Room, lev: LatestEventValue): Notif? {
+        val name = prettyName(runCatching { room.displayName() }.getOrNull(), id)
+        return when (lev) {
+            is LatestEventValue.Remote -> {
+                if (lev.isOwn) return null
+                val who = lev.sender.removePrefix("@").substringBefore(":")
+                when (val c = lev.content) {
+                    is TimelineItemContent.MsgLike -> {
+                        val k = c.content.kind
+                        if (k is MsgLikeKind.Message) Notif(id, name, name, k.content.body) else null
+                    }
+                    is TimelineItemContent.RtcNotification ->
+                        Notif(id, name, "📞 Incoming call", "$who is calling — over Tor", isCall = true)
+                    is TimelineItemContent.CallInvite ->
+                        Notif(id, name, "📞 Incoming call", "$who is calling — over Tor", isCall = true)
+                    else -> null
+                }
+            }
+            is LatestEventValue.RemoteInvite -> {
+                val who = (lev.inviter ?: "Someone").removePrefix("@").substringBefore(":")
+                Notif(id, name, "New chat invite", "$who wants to connect over Tor", isInvite = true)
+            }
+            else -> null
+        }
     }
 
     /** Turn whatever the SDK hands back into something a human wants to read.
@@ -209,6 +307,7 @@ object MatrixRepo {
             runCatching { room.join() }
         }
         currentRoom = room
+        currentRoomId = roomId
         val tl = room.timeline()
         timeline = tl
         tl.addListener(object : TimelineListener {
@@ -294,8 +393,9 @@ object MatrixRepo {
         runCatching { client?.logout() }
         ctx.getSharedPreferences("pp_session", Context.MODE_PRIVATE).edit().clear().apply()
         client = null; syncService = null; roomListService = null; timeline = null
-        currentRoom = null; userId = ""; deviceId = ""
+        currentRoom = null; currentRoomId = null; userId = ""; deviceId = ""
         roomHandles.clear(); timelineItems.clear()
+        lastSeen.clear(); notifyArmed = false
         rooms.value = emptyList(); messages.value = emptyList()
         wipeStore(ctx)                                  // remove crypto store too
         status.value = ""

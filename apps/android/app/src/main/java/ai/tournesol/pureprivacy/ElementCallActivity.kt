@@ -58,6 +58,9 @@ class ElementCallActivity : ComponentActivity() {
     // to the CALL's focus box, which for a cross-install call is the peer's box).
     private val peerFocusStarted = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     private val focusRe = Regex("(?:wss://|https://)([a-z2-7]{56}\\.onion):(?:7443|8443)")
+    // The box whose coturn carries this call's media. = own box for the caller, the
+    // focus box for a joiner. Resolved per-connection by the TURN forwarder.
+    @Volatile private var turnOnion = ""
 
     companion object {
         const val EC_LOCAL = 11080   // -> call.element.io (Element Call app, over Tor)
@@ -66,6 +69,7 @@ class ElementCallActivity : ComponentActivity() {
         const val SFU_LOCAL = 17443  // -> own LiveKit SFU (onion:7443, wss)
         const val JWT_PEER = 18444   // -> FOCUS (peer) lk-jwt, discovered from call state
         const val SFU_PEER = 17444   // -> FOCUS (peer) SFU
+        const val TURN_LOCAL = 13478 // -> coturn (onion:3478, TCP TURN) for media over Tor
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -97,11 +101,45 @@ class ElementCallActivity : ComponentActivity() {
             "ws://127.0.0.1:$SFU_LOCAL" to "wss://$onion:7443",
             "http://127.0.0.1:$HS_LOCAL" to "https://$onion:8009",
         ))
+        // Media over Tor: a TURN-over-TCP bridge to the call box's coturn. WebRTC
+        // can't use turn:<onion> directly (RFC7686), so we expose it at 127.0.0.1 and
+        // force the call to relay through it (see the injected patch below). The
+        // forwarder targets the call's coturn box, which the joiner only learns once
+        // the focus is discovered — hence the dynamic onion supplier.
+        turnOnion = onion
+        TorNet.startTcpForwarder(TURN_LOCAL, { turnOnion }, 3478, TorManager.SOCKS_PORT)
+        // Patch injected into the Element Call page: rewrite the SFU-advertised
+        // turn:<onion>:3478 ICE server to our localhost bridge (keeping the box's
+        // credentials) and force iceTransportPolicy=relay so ALL media rides Tor.
+        val turnPatch = """
+            <script>(function(){
+              var N = window.RTCPeerConnection; if (!N || N.__pp) return;
+              function fix(cfg){
+                cfg = cfg || {};
+                var list = cfg.iceServers || [];
+                list.forEach(function(s){
+                  var u = s.urls; if (typeof u === 'string') u = [u];
+                  if (u) s.urls = u.map(function(x){
+                    return x.replace(/(turns?:)[a-z2-7]{56}\.onion(:[0-9]+)?/i, '${'$'}1127.0.0.1:$TURN_LOCAL');
+                  });
+                });
+                cfg.iceServers = list;
+                cfg.iceTransportPolicy = 'relay';
+                return cfg;
+              }
+              function P(cfg, con){ return new N(fix(cfg), con); }
+              P.prototype = N.prototype; P.__pp = true;
+              var oset = N.prototype.setConfiguration;
+              if (oset) N.prototype.setConfiguration = function(c){ return oset.call(this, fix(c)); };
+              window.RTCPeerConnection = P; window.webkitRTCPeerConnection = P;
+              try { console.log('[pp] RTCPeerConnection patched -> relay via 127.0.0.1:$TURN_LOCAL'); } catch(e){}
+            })();</script>
+        """.trimIndent()
         // Serve Element Call itself from localhost (over Tor) so its origin is
         // 127.0.0.1 — a secure, PRIVATE origin in Chromium. Then all its calls to
         // our other 127.0.0.1 bridges are private->private (no Private Network
         // Access block) and localhost is a secure context (getUserMedia works).
-        TorNet.startHttpProxy(EC_LOCAL, "https://call.element.io", TorManager.HTTP_PORT, ecRewrites)
+        TorNet.startHttpProxy(EC_LOCAL, "https://call.element.io", TorManager.HTTP_PORT, ecRewrites, turnPatch)
         TorNet.startHttpProxy(HS_LOCAL, "https://$onion:8009", TorManager.HTTP_PORT, ecRewrites)
         TorNet.startHttpProxy(JWT_LOCAL, "https://$onion:8443", TorManager.HTTP_PORT, ecRewrites)
         TorNet.startTlsForwarder(SFU_LOCAL, onion, 7443, TorManager.SOCKS_PORT)
@@ -276,6 +314,8 @@ class ElementCallActivity : ComponentActivity() {
                 TorNet.startHttpProxy(JWT_PEER, "https://$host:8443", TorManager.HTTP_PORT, ecRewrites)
                 TorNet.startTlsForwarder(SFU_PEER, host, 7443, TorManager.SOCKS_PORT)
             }.onFailure { Log.e(TAG, "peer bridge start failed", it) }
+            // the call's coturn lives on the focus box too — point the TURN bridge there
+            turnOnion = host
             ecRewrites["https://$host:8443"] = "http://127.0.0.1:$JWT_PEER"
             ecRewrites["wss://$host:7443"] = "ws://127.0.0.1:$SFU_PEER"
             ecReverse["http://127.0.0.1:$JWT_PEER"] = "https://$host:8443"
