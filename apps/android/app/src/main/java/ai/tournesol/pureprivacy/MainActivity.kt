@@ -97,6 +97,7 @@ class MainActivity : ComponentActivity() {
         applyScreenSecurity()
         requestCorePermissions()   // mic + camera (for calls) + notifications
         handleNotifIntent(intent)
+        handleDeepLink(intent)
         setContent {
             PurePrivacyTheme {
                 // Answered an incoming call from the notification → launch the call UI
@@ -126,6 +127,17 @@ class MainActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         handleNotifIntent(intent)
+        handleDeepLink(intent)
+    }
+
+    /** A "pureprivacy://contact/@name:onion" link was opened (a camera/QR scanner
+     *  resolved our QR, or someone tapped the link) → hand it to the view model,
+     *  which adds the contact now or once a session is ready. */
+    private fun handleDeepLink(intent: Intent?) {
+        if (intent?.action != Intent.ACTION_VIEW) return
+        val data = intent.data ?: return
+        if (!data.scheme.equals("pureprivacy", ignoreCase = true)) return
+        vm.onDeepLink(data.toString())
     }
 
     /** A tapped message/call notification (or "Answer" from the incoming-call
@@ -473,7 +485,10 @@ fun ProfileScreen(vm: AppViewModel) {
     val ctx = LocalContext.current
     val id = vm.myId
     val name = id.removePrefix("@").substringBefore(":")
-    val qr = remember(id) { runCatching { Qr.bitmap(if (id.isBlank()) " " else id, 640) }.getOrNull() }
+    // Encode the QR as a deep link so ANY camera/QR scanner opens PurePrivacy and
+    // adds this contact — not just our in-app scanner (which also accepts it).
+    val qrPayload = if (id.isBlank()) " " else "pureprivacy://contact/$id"
+    val qr = remember(id) { runCatching { Qr.bitmap(qrPayload, 640) }.getOrNull() }
 
     val scan = rememberScan { contents -> if (contents != null) vm.addContact(contents) }
 

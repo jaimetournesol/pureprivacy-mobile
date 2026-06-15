@@ -72,6 +72,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     MatrixRepo.startSync()
                     PpSyncService.start(getApplication())
                     screen.value = Screen.Rooms
+                    consumePendingContact()
                 }.onFailure { error.value = null; screen.value = Screen.Login }
             } else {
                 error.value = null
@@ -97,6 +98,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 MatrixRepo.startSync()
                 PpSyncService.start(getApplication())
                 screen.value = Screen.Rooms
+                consumePendingContact()
             } catch (t: Throwable) {
                 error.value = t.message ?: t.toString()
             } finally {
@@ -160,12 +162,35 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun addContact(scanned: String?) {
         val raw = scanned?.trim().orEmpty()
         if (raw.isEmpty()) return
-        // accept "pureprivacy:@bob:onion", "matrix:u/bob:onion", or a bare "@bob:onion"
-        var id = raw.substringAfter("pureprivacy:", raw)
-            .substringAfter("matrix:u/", raw.substringAfter("pureprivacy:", raw))
-            .trim()
-        if (!id.startsWith("@") && id.contains(":") && id.contains(".")) id = "@$id"
+        // Pull the @name:onion out of whatever wrapper the QR / deep link carried:
+        // "pureprivacy://contact/@bob:onion", "pureprivacy:@bob:onion",
+        // "matrix:u/bob:onion", or a bare "@bob:onion".
+        val match = Regex("@?[A-Za-z0-9._=+\\-]+:[a-z2-7]{56}\\.onion").find(raw)
+        var id = match?.value ?: raw
+        if (!id.startsWith("@")) id = "@$id"
         startChat(id)
+    }
+
+    /** A `pureprivacy://contact/@name:onion` link was opened (system camera scanned
+     *  our QR, or a tapped link). If we're signed in, add them now; otherwise stash
+     *  it and run it the moment a session is ready, so the link is never lost. */
+    private var pendingContact: String? = null
+    fun onDeepLink(uri: String?) {
+        val raw = uri?.trim().orEmpty()
+        if (raw.isEmpty()) return
+        if (Regex("[a-z2-7]{56}\\.onion").containsMatchIn(raw).not()) return  // not an address link
+        when (screen.value) {
+            is Screen.Rooms, is Screen.Chat, is Screen.Profile -> addContact(raw)
+            // Splash (restoring) or Login: stash it. The normal flow lands on Rooms
+            // (returning user) or Login→sign-in; consumePendingContact runs at both.
+            else -> pendingContact = raw
+        }
+    }
+
+    private fun consumePendingContact() {
+        val p = pendingContact ?: return
+        pendingContact = null
+        addContact(p)
     }
 
     fun showProfile() { error.value = null; screen.value = Screen.Profile }

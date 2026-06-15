@@ -36,6 +36,16 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- Deep link: scanning a "pureprivacy://contact/@name:onion" QR (or
+                 tapping such a link) opens the app and adds that contact. This is
+                 what makes the on-screen "My code" QR openable by any camera/QR
+                 scanner, not just our in-app scanner. -->
+            <intent-filter android:autoVerify="false">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="pureprivacy" />
+            </intent-filter>
         </activity>
 
         <activity
