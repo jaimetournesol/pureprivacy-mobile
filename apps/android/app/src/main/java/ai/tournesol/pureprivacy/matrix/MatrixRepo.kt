@@ -27,6 +27,8 @@ import org.matrix.rustcomponents.sdk.Membership
 import org.matrix.rustcomponents.sdk.MembershipState
 import org.matrix.rustcomponents.sdk.MsgLikeKind
 import org.matrix.rustcomponents.sdk.Room
+import org.matrix.rustcomponents.sdk.RoomInfo
+import org.matrix.rustcomponents.sdk.RoomInfoListener
 import org.matrix.rustcomponents.sdk.RoomList
 import org.matrix.rustcomponents.sdk.RoomListEntriesDynamicFilterKind
 import org.matrix.rustcomponents.sdk.RoomListEntriesListener
@@ -150,6 +152,11 @@ object MatrixRepo {
     @Volatile private var appContext: Context? = null   // app context for prefs from sync paths
 
     private val roomHandles = LinkedHashMap<String, Room>()
+    // Per-room RoomInfo subscriptions (id -> handle): the EVENT-DRIVEN incoming-call
+    // path. The moment a peer's m.call.member federates in, the SDK fires the listener
+    // and we ring — no waiting for the backstop poll. The TaskHandle owns the FFI
+    // subscription (and pins the Room), so it survives roomHandles churn.
+    private val callSubs = java.util.concurrent.ConcurrentHashMap<String, TaskHandle>()
     private val timelineItems = ArrayList<TimelineItem>()
 
     val isLoggedIn: Boolean get() = client != null
@@ -422,7 +429,7 @@ object MatrixRepo {
         // scanned (mutual consent), then recompute the visible chat list. Deciding
         // "paired" inspects members (to exclude the @conduit bot) — a suspend call,
         // so it can't run inside the lock.
-        scope.launch { autoAcceptMutual(); rebuildRooms(); checkNotifs() }
+        scope.launch { autoAcceptMutual(); rebuildRooms(); checkNotifs(); reconcileCallSubs() }
     }
 
     /** The tuwunel server bot is a member of every room it administers; it must not
@@ -529,31 +536,13 @@ object MatrixRepo {
     private suspend fun checkNotifs() {
         val handles = synchronized(roomHandles) { LinkedHashMap(roomHandles) }
         for ((id, room) in handles) {
-            // Incoming-call detection: a peer has an active room call. Ring once on
-            // the transition; fire callEnded when it stops (so a ringing callee
-            // dismisses if the caller gives up). hasActiveRoomCall reflects the
-            // m.call.member state, which federates over Tor.
+            // Incoming-call detection (backstop poll; the live, low-latency path is the
+            // per-room RoomInfo subscription set up in reconcileCallSubs). Shared logic
+            // lives in evaluateRoomCall so both paths ring identically.
             runCatching {
-                val parts = if (room.hasActiveRoomCall()) room.activeRoomCallParticipants() else emptyList()
-                val peerInCall = parts.any { it != userId && !isServerBot(it) }
-                // Multi-device: if MY account is already in the call (this device or
-                // another of my devices answered), don't ring — and stop any ring in
-                // progress. So all my devices ring, and answering on one silences the rest.
-                val meInCall = parts.any { it == userId }
-                val shouldRing = peerInCall && !meInCall
-                if (shouldRing && activeCallRooms.add(id)) {
-                    Log.i(TAG, "ring START for $id (peerInCall=$peerInCall meInCall=$meInCall parts=${parts.size})")
-                    if (notifyArmed && id != currentRoomId) {
-                        val who = roomName(room)
-                        notifications.emit(Notif(id, who, "📞 Incoming call", "$who is calling — over Tor", isCall = true))
-                    }
-                } else if (!shouldRing && activeCallRooms.remove(id)) {
-                    // Distinguish the two stop reasons: meInCall=true means I (this or
-                    // another of my devices) answered; peerInCall=false means the caller
-                    // gave up. This is what proves the multi-device silence-on-answer.
-                    Log.i(TAG, "ring STOP for $id (reason=${if (meInCall) "answered-elsewhere" else "peer-left"} peerInCall=$peerInCall meInCall=$meInCall)")
-                    callEnded.emit(id)   // peer left, or I answered (here or on another device)
-                }
+                val hasCall = room.hasActiveRoomCall()
+                val parts = if (hasCall) room.activeRoomCallParticipants() else emptyList()
+                evaluateRoomCall(room, hasCall, parts)
             }
             val lev = runCatching { room.latestEvent() }.getOrNull() ?: continue
             val key = keyOf(lev) ?: continue
@@ -565,6 +554,55 @@ object MatrixRepo {
             val n = toNotif(id, room, lev) ?: continue
             Log.i(TAG, "notify: ${n.title} (${id})")
             notifications.emit(n)
+        }
+    }
+
+    /** Ring / stop-ring for one room from its current call state — shared by the
+     *  backstop poll and the live RoomInfo subscription. activeCallRooms is a
+     *  synchronized set, so a concurrent add() from both paths rings exactly once. */
+    private suspend fun evaluateRoomCall(room: Room, hasCall: Boolean, participants: List<String>) {
+        val id = runCatching { room.id() }.getOrNull() ?: return
+        val peerInCall = hasCall && participants.any { it != userId && !isServerBot(it) }
+        // Multi-device: if MY account is already in the call (this or another of my
+        // devices answered), don't ring — and stop any ring in progress.
+        val meInCall = participants.any { it == userId }
+        val shouldRing = peerInCall && !meInCall
+        if (shouldRing && activeCallRooms.add(id)) {
+            Log.i(TAG, "ring START for $id (peerInCall=$peerInCall meInCall=$meInCall parts=${participants.size})")
+            if (notifyArmed && id != currentRoomId) {
+                val who = roomName(room)
+                notifications.emit(Notif(id, who, "📞 Incoming call", "$who is calling — over Tor", isCall = true))
+            }
+        } else if (!shouldRing && activeCallRooms.remove(id)) {
+            Log.i(TAG, "ring STOP for $id (reason=${if (meInCall) "answered-elsewhere" else "peer-left"} peerInCall=$peerInCall meInCall=$meInCall)")
+            callEnded.emit(id)   // peer left, or I answered (here or on another device)
+        }
+    }
+
+    /** Keep a RoomInfo-update subscription on every room so an incoming call rings the
+     *  moment the peer's call membership federates in — the event-driven path that
+     *  removes the poll-cadence race. We keep one handle per room id (it owns the FFI
+     *  subscription and pins its Room, so it survives roomHandles being rebuilt), and
+     *  drop it when the room leaves the list. Called after every applyRoomUpdates. */
+    private fun reconcileCallSubs() {
+        val current = synchronized(roomHandles) { LinkedHashMap(roomHandles) }
+        for ((id, room) in current) {
+            if (callSubs.containsKey(id)) continue
+            val handle = runCatching {
+                room.subscribeToRoomInfoUpdates(object : RoomInfoListener {
+                    override fun call(roomInfo: RoomInfo) {
+                        scope.launch {
+                            runCatching {
+                                evaluateRoomCall(room, roomInfo.hasRoomCall, roomInfo.activeRoomCallParticipants)
+                            }
+                        }
+                    }
+                })
+            }.getOrNull()
+            if (handle != null) { callSubs[id] = handle; Log.i(TAG, "call-state sub armed for $id") }
+        }
+        for (id in callSubs.keys.toList()) {
+            if (!current.containsKey(id)) runCatching { callSubs.remove(id)?.cancel() }
         }
     }
 
@@ -988,11 +1026,12 @@ object MatrixRepo {
         runCatching { sessionPrefs(ctx).edit().clear().apply() }
         runCatching { ctx.getSharedPreferences(SESSION_OLD, Context.MODE_PRIVATE).edit().clear().apply() }
         runCatching { timelineHandle?.cancel() }
+        runCatching { callSubs.values.forEach { it.cancel() } }; callSubs.clear()
         timelineHandle = null; roomListResult = null; roomList = null
         client = null; syncService = null; roomListService = null; timeline = null
         currentRoom = null; currentRoomId = null; userId = ""; deviceId = ""
         roomHandles.clear(); timelineItems.clear()
-        lastSeen.clear(); notifyArmed = false
+        lastSeen.clear(); notifyArmed = false; activeCallRooms.clear()
         rooms.value = emptyList(); messages.value = emptyList()
         wipeStore(ctx)                                  // remove crypto store too
         status.value = ""
