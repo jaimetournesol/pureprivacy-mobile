@@ -485,9 +485,13 @@ fun ProfileScreen(vm: AppViewModel) {
     val ctx = LocalContext.current
     val id = vm.myId
     val name = id.removePrefix("@").substringBefore(":")
-    // Encode the QR as a deep link so ANY camera/QR scanner opens PurePrivacy and
-    // adds this contact — not just our in-app scanner (which also accepts it).
-    val qrPayload = if (id.isBlank()) " " else "pureprivacy://contact/$id"
+    // Encode the QR as a "pureprivacy:@name:onion" deep link: ANY camera/QR scanner
+    // opens PurePrivacy and adds this contact. Use the bare-scheme form (NOT
+    // "pureprivacy://contact/...") so it stays backward-compatible — the original
+    // address parser does substringAfter("pureprivacy:"), which yields the right id
+    // for "pureprivacy:@id" but mangles a "//contact/" path. Older apps must still be
+    // able to scan a newer phone's code, or pairing silently fails on their side.
+    val qrPayload = if (id.isBlank()) " " else "pureprivacy:$id"
     val qr = remember(id) { runCatching { Qr.bitmap(qrPayload, 640) }.getOrNull() }
 
     val scan = rememberScan { contents -> if (contents != null) vm.addContact(contents) }
