@@ -56,17 +56,26 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 if (TorManager.state.value is TorManager.State.Failed) { screen.value = Screen.Login; return@launch }
                 kotlinx.coroutines.delay(1000); waited++
             }
-            try {
-                if (MatrixRepo.tryRestore(getApplication())) {
+            // Restore can stall when Tor is flaky (the SDK runs a networked sliding-sync
+            // discovery during client build). Bound each attempt and retry once before
+            // dropping to the login form — never sit on the splash forever.
+            var restored = false
+            for (attempt in 1..2) {
+                val ok = kotlinx.coroutines.withTimeoutOrNull(30_000) {
+                    runCatching { MatrixRepo.tryRestore(getApplication()) }.getOrDefault(false)
+                }
+                if (ok == true) { restored = true; break }
+                kotlinx.coroutines.delay(1500)        // brief pause; a new Tor circuit may help
+            }
+            if (restored) {
+                runCatching {
                     MatrixRepo.startSync()
                     PpSyncService.start(getApplication())
                     screen.value = Screen.Rooms
-                } else {
-                    screen.value = Screen.Login      // session vanished
-                }
-            } catch (t: Throwable) {
+                }.onFailure { error.value = null; screen.value = Screen.Login }
+            } else {
                 error.value = null
-                screen.value = Screen.Login          // restore failed — let them sign in
+                screen.value = Screen.Login          // couldn't restore — let them sign in
             }
         }
     }
