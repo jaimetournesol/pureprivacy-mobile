@@ -916,6 +916,21 @@ object MatrixRepo {
             // peer separately with retry: a remote invite only sticks once their box
             // has allowlisted us (a few seconds after they scan us), so createRoom's
             // one-shot invite would fail silently and never recover.
+            // Let EITHER party start a call: the RTC membership state events
+            // (org.matrix.msc3401.call.member) default to needing PL50, so the invited
+            // peer (PL0) gets 403 "not enough power" and the call dies with "Connection
+            // lost". Drop those event types to PL0 so any room member can join a call.
+            val callPowerLevels = org.matrix.rustcomponents.sdk.PowerLevels(
+                usersDefault = null, eventsDefault = null, stateDefault = null,
+                ban = null, kick = null, redact = null, invite = null, notifications = null,
+                users = emptyMap(),
+                events = mapOf(
+                    "org.matrix.msc3401.call.member" to 0,
+                    "m.call.member" to 0,
+                    "org.matrix.msc3401.call" to 0,
+                    "m.call" to 0,
+                ),
+            )
             val rid = dms.firstOrNull {
                 runCatching { it.membership() == Membership.JOINED }.getOrDefault(false)
             }?.id() ?: c.createRoom(
@@ -928,7 +943,7 @@ object MatrixRepo {
                     preset = RoomPreset.TRUSTED_PRIVATE_CHAT,
                     invite = emptyList(),
                     avatar = null,
-                    powerLevelContentOverride = null,
+                    powerLevelContentOverride = callPowerLevels,
                     joinRuleOverride = null,
                     historyVisibilityOverride = null,
                     canonicalAlias = null,
