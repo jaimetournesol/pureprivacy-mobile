@@ -579,6 +579,24 @@ class ElementCallActivity : ComponentActivity() {
                 // Intercept Element Call's direct .onion requests (e.g. server-name
                 // /.well-known discovery) — Chromium would block them; serve over Tor.
                 if (host == ecOnion && request.method == "GET") {
+                    // Serve the rtc_foci well-known INSTANTLY (no Tor round-trip). On a
+                    // cold circuit the onion fetch takes >10s, but Element Call only
+                    // waits ~5s before giving up and falling back to its PUBLIC clearnet
+                    // SFU (livekit-jwt.call.element.io) — unreachable over Tor, so the
+                    // call dies with "Something went wrong". We already know our box's
+                    // focus, so answer locally and point it at our lk-jwt bridge.
+                    if (request.url.encodedPath == "/.well-known/matrix/client") {
+                        val wk = """{"m.homeserver":{"base_url":"http://127.0.0.1:$HS_LOCAL"},"org.matrix.msc4143.rtc_foci":[{"type":"livekit","livekit_service_url":"http://127.0.0.1:$JWT_LOCAL"}]}"""
+                        val hdrs = linkedMapOf(
+                            "Access-Control-Allow-Origin" to "*",
+                            "Access-Control-Allow-Headers" to "*",
+                        )
+                        Log.i(TAG, "served synthetic well-known (rtc_foci -> 127.0.0.1:$JWT_LOCAL) instantly")
+                        return android.webkit.WebResourceResponse(
+                            "application/json", "utf-8", 200, "OK", hdrs,
+                            java.io.ByteArrayInputStream(wk.toByteArray())
+                        )
+                    }
                     return try {
                         val path = request.url.encodedPath + (request.url.encodedQuery?.let { "?$it" } ?: "")
                         val (ct, code, bytes) = TorNet.fetchRewritten(
