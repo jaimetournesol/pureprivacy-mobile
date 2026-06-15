@@ -68,8 +68,10 @@ class ElementCallActivity : ComponentActivity() {
     // to the CALL's focus box, which for a cross-install call is the peer's box).
     private val peerFocusStarted = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     private val focusRe = Regex("(?:wss://|https://)([a-z2-7]{56}\\.onion):(?:7443|8443)")
-    // The box whose coturn carries this call's media. = own box for the caller, the
-    // focus box for a joiner. Resolved per-connection by the TURN forwarder.
+    // The box whose coturn carries this call's media. Starts as our own box, then is
+    // pinned to the real focus by Bridge.setTurnOnion when EC's ICE config reveals the
+    // turn:<onion> it actually uses (= the box whose SFU this call landed on). The TURN
+    // forwarder reads this live via its onion supplier, so updates take effect at once.
     @Volatile private var turnOnion = ""
 
     // Connect overlay: a branded "Connecting over Tor…" cover (EC's bundle loads over
@@ -81,6 +83,8 @@ class ElementCallActivity : ComponentActivity() {
     private var overlayRetry: Button? = null
     @Volatile private var ecConnected = false
     private var connectTimeout: kotlinx.coroutines.Job? = null
+    // elapsedRealtime at call start — anchors the peer-membership baseline window.
+    @Volatile private var callStartMs = 0L
     // INK / SUNFLOWER / PAPER / PAPERDIM as ARGB ints for the (non-Compose) overlay.
     private val cInk = 0xFF0E1116.toInt(); private val cSun = 0xFFF2B705.toInt()
     private val cPaper = 0xFFE6EDF3.toInt(); private val cDim = 0xFF8B98A5.toInt()
@@ -99,6 +103,7 @@ class ElementCallActivity : ComponentActivity() {
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        callStartMs = android.os.SystemClock.elapsedRealtime()
         // Block screenshots / screen-recording of the call surface (release only).
         applyScreenSecurity()
         val room = MatrixRepo.currentRoom
@@ -147,6 +152,12 @@ class ElementCallActivity : ComponentActivity() {
                 list.forEach(function(s){
                   var u = s.urls; if (typeof u === 'string') u = [u];
                   if (u) s.urls = u.map(function(x){
+                    // The turn:<onion> EC was handed comes from the lk-jwt of the box
+                    // whose SFU this call actually uses (the focus). Report that onion
+                    // to native so the TURN forwarder tunnels to the SAME box's coturn
+                    // — never a stale peer focus from old call membership.
+                    var m = x.match(/turns?:([a-z2-7]{56}\.onion)/i);
+                    if (m) { try { ppAndroid.setTurnOnion(m[1]); } catch(e){} }
                     return x.replace(/(turns?:)[a-z2-7]{56}\.onion(:[0-9]+)?/i, '${'$'}1127.0.0.1:$TURN_LOCAL');
                   });
                 });
@@ -200,7 +211,12 @@ class ElementCallActivity : ComponentActivity() {
                     runOnUiThread { request.grant(request.resources) }
                 }
                 override fun onConsoleMessage(m: android.webkit.ConsoleMessage): Boolean {
-                    Log.d(TAG, "EC console: ${m.message()} @${m.sourceId()}:${m.lineNumber()}")
+                    val msg = m.message()
+                    // Elevate errors/focus chatter to INFO so they survive a PpCall:I filter.
+                    if (msg.contains("rror", true) || msg.contains("focus", true) || msg.contains("livekit", true))
+                        Log.i(TAG, "EC console: $msg @${m.sourceId()}:${m.lineNumber()}")
+                    else
+                        Log.d(TAG, "EC console: $msg @${m.sourceId()}:${m.lineNumber()}")
                     return true
                 }
             }
@@ -299,6 +315,8 @@ class ElementCallActivity : ComponentActivity() {
                         maybeStartPeerFocus(msg)
                         maybeDetectPeerLeft(msg)
                         for ((a, b) in ecRewrites) msg = msg.replace(a, b)
+                        if (BuildConfig.DEBUG && (msg.contains("foci_preferred") || msg.contains("focus_active")))
+                            Log.i(TAG, "FOCUS toWidget(full): $msg")
                         if (BuildConfig.DEBUG) Log.i(TAG, "toWidget: ${msg.take(220)}")
                         withContext(Dispatchers.Main) {
                             web.evaluateJavascript("window.__ec && window.__ec().postMessage($msg, '*');", null)
@@ -405,6 +423,19 @@ class ElementCallActivity : ComponentActivity() {
 
     /** widget -> SDK (fromWidget messages). */
     inner class Bridge(private val handle: org.matrix.rustcomponents.sdk.WidgetDriverHandle) {
+        /** Called from the injected RTCPeerConnection patch with the focus onion that
+         *  EC's WebRTC is about to use for TURN. This — not call membership — is the
+         *  authoritative focus: it's whatever box's SFU/lk-jwt the call actually landed
+         *  on. Point the TURN forwarder there so relay + SFU share one box. */
+        @JavascriptInterface
+        fun setTurnOnion(onion: String) {
+            if (onion.isEmpty() || onion == turnOnion) return
+            Log.i(TAG, "TURN focus onion (from EC ICE config) -> $onion")
+            turnOnion = onion
+            // Warm the circuit to the right coturn now, before WebRTC's allocation.
+            runCatching { TorNet.prewarm(onion, 3478, TorManager.SOCKS_PORT) }
+        }
+
         @JavascriptInterface
         fun fromWidget(json: String) {
             markConnected()   // EC loaded and is posting widget messages → hide overlay
@@ -421,6 +452,8 @@ class ElementCallActivity : ComponentActivity() {
             // box can resolve it — a bare 127.0.0.1 would point at the peer's own box.
             var out = json
             for ((a, b) in ecReverse) out = out.replace(a, b)
+            if (BuildConfig.DEBUG && (out.contains("foci_preferred") || out.contains("focus_active")))
+                Log.i(TAG, "FOCUS fromWidget(full): $out")
             if (BuildConfig.DEBUG) Log.i(TAG, "fromWidget: ${out.take(220)}")
             lifecycleScope.launch(Dispatchers.IO) {
                 val ok = runCatching { handle.send(out) }.getOrElse { Log.e(TAG, "send failed", it); false }
@@ -429,37 +462,81 @@ class ElementCallActivity : ComponentActivity() {
         }
     }
 
-    // Peers (by @user:onion) currently in the call, parsed from the m.call.member
-    // state flowing through the widget. Once we've seen a peer join and then the set
-    // empties, the other side hung up → end the call here too (both ends terminate).
-    private val callPeers = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
-    @Volatile private var sawPeer = false
+    // "Other side hung up → end here too" detection from the m.call.member state.
+    // Two traps make a naive check end LIVE calls (the "connection lost ~30s in" bug):
+    //   (a) Our OWN membership has state_key "_<userId>_<deviceId>_m.call" — it never
+    //       equals userId, so a self == me check misses it and counts US as a peer;
+    //       when EC refreshes our membership (it briefly empties) it reads as a leave.
+    //   (b) A previous call leaves a STALE non-empty membership for the peer until it
+    //       expires; we'd see it "present" then "gone" and end a call they never joined.
+    // So: skip our own membership (state_key CONTAINS our userId), treat everything
+    // present in an initial grace window as baseline (stale / pre-existing, never arms a
+    // leave), and only auto-end for a peer we actually watched JOIN this session — then
+    // debounce to ride out membership-refresh flaps over slow Tor.
+    private val presentPeers = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val confirmedJoiners = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     @Volatile private var ending = false
+    private var peerLeftCheck: kotlinx.coroutines.Job? = null
+    private val BASELINE_MS = 6_000L     // members present this soon after start = stale/baseline
+    private val PEER_LEFT_DEBOUNCE_MS = 6_000L
 
     private fun maybeDetectPeerLeft(msg: String) {
         if (ending) return
         val me = MatrixRepo.userId
         runCatching {
             val state = org.json.JSONObject(msg).optJSONObject("data")?.optJSONArray("state") ?: return
+            val nowPresent = HashSet<String>()
+            var sawAnyMember = false
             for (i in 0 until state.length()) {
                 val e = state.optJSONObject(i) ?: continue
                 if (!e.optString("type").contains("call.member")) continue
+                sawAnyMember = true
                 val sk = e.optString("state_key")
-                if (sk.isEmpty() || sk == me) continue
+                if (sk.isEmpty() || sk.contains(me)) continue   // skip our own per-device membership
                 val content = e.optJSONObject("content")
                 val present = when {
                     content == null -> false
                     content.has("memberships") -> (content.optJSONArray("memberships")?.length() ?: 0) > 0
                     else -> content.length() > 0          // empty {} ⇒ that member left
                 }
-                if (present) { callPeers.add(sk); sawPeer = true } else callPeers.remove(sk)
+                if (present) nowPresent.add(sk)
             }
-            if (sawPeer && callPeers.isEmpty()) {
+            if (!sawAnyMember) return   // not a call-membership snapshot
+
+            val elapsed = android.os.SystemClock.elapsedRealtime() - callStartMs
+            if (elapsed < BASELINE_MS) {
+                // Baseline: accumulate pre-existing/stale members; never arm a leave on them.
+                presentPeers.addAll(nowPresent)
+                return
+            }
+            // A peer present now but not a moment ago = a genuine join this session.
+            for (sk in nowPresent) if (presentPeers.add(sk)) {
+                confirmedJoiners.add(sk)
+                Log.i(TAG, "peer joined the call: $sk")
+            }
+            presentPeers.retainAll(nowPresent)
+            val anyConfirmedPresent = confirmedJoiners.any { presentPeers.contains(it) }
+            if (confirmedJoiners.isNotEmpty() && !anyConfirmedPresent) {
+                schedulePeerLeftEnd()
+            } else {
+                peerLeftCheck?.cancel(); peerLeftCheck = null
+            }
+        }
+    }
+
+    /** End the call only after the joined peer has stayed gone past the debounce window
+     *  — a single empty membership snapshot is usually just a Tor-slowed refresh. */
+    private fun schedulePeerLeftEnd() {
+        if (ending || peerLeftCheck?.isActive == true) return
+        peerLeftCheck = lifecycleScope.launch {
+            kotlinx.coroutines.delay(PEER_LEFT_DEBOUNCE_MS)
+            val anyBack = confirmedJoiners.any { presentPeers.contains(it) }
+            if (!anyBack && !ending) {
                 ending = true
-                Log.i(TAG, "peer left the call -> ending on this side too")
+                Log.i(TAG, "peer left the call (confirmed after debounce) -> ending on this side")
                 runOnUiThread {
                     if (!isFinishing) {
-                        android.widget.Toast.makeText(this, "Call ended", android.widget.Toast.LENGTH_SHORT).show()
+                        android.widget.Toast.makeText(this@ElementCallActivity, "Call ended", android.widget.Toast.LENGTH_SHORT).show()
                         finish()
                     }
                 }
@@ -480,8 +557,11 @@ class ElementCallActivity : ComponentActivity() {
                 TorNet.startHttpProxy(JWT_PEER, "https://$host:8443", TorManager.HTTP_PORT, ecRewrites)
                 TorNet.startTlsForwarder(SFU_PEER, host, 7443, TorManager.SOCKS_PORT)
             }.onFailure { Log.e(TAG, "peer bridge start failed", it) }
-            // the call's coturn lives on the focus box too — point the TURN bridge there
-            turnOnion = host
+            // NB: we deliberately do NOT set turnOnion here. A foci_preferred in a
+            // member's state is only a *candidate* focus, not the one this call landed
+            // on — stale memberships would point the TURN relay at the wrong box. The
+            // authoritative focus comes from the turn:<onion> EC actually requests,
+            // reported via Bridge.setTurnOnion (the injected ICE patch).
             ecRewrites["https://$host:8443"] = "http://127.0.0.1:$JWT_PEER"
             ecRewrites["wss://$host:7443"] = "ws://127.0.0.1:$SFU_PEER"
             ecReverse["http://127.0.0.1:$JWT_PEER"] = "https://$host:8443"
@@ -522,6 +602,7 @@ class ElementCallActivity : ComponentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         connectTimeout?.cancel()
+        peerLeftCheck?.cancel()
         Log.i(TAG, "call activity destroyed (connected=$ecConnected)")
         runCatching { web.destroy() }
         // Tear down the per-call Tor bridges/forwarders so they don't linger.
