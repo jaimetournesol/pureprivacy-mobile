@@ -1,9 +1,18 @@
 package ai.tournesol.pureprivacy
 
 import android.annotation.SuppressLint
+import android.graphics.Color as AndroidColor
 import android.net.http.SslError
 import android.os.Bundle
 import android.util.Log
+import android.util.TypedValue
+import android.view.Gravity
+import android.view.View
+import android.widget.Button
+import android.widget.FrameLayout
+import android.widget.LinearLayout
+import android.widget.ProgressBar
+import android.widget.TextView
 import android.webkit.JavascriptInterface
 import android.webkit.PermissionRequest
 import android.webkit.SslErrorHandler
@@ -63,6 +72,20 @@ class ElementCallActivity : ComponentActivity() {
     // focus box for a joiner. Resolved per-connection by the TURN forwarder.
     @Volatile private var turnOnion = ""
 
+    // Connect overlay: a branded "Connecting over Tor…" cover (EC's bundle loads over
+    // Tor, ~10-20s of otherwise-blank screen) that turns into a clear error+retry if
+    // the call never comes up. ecConnected flips on the first widget round-trip.
+    private lateinit var rootView: FrameLayout
+    private var overlayStatus: TextView? = null
+    private var overlayProgress: ProgressBar? = null
+    private var overlayRetry: Button? = null
+    @Volatile private var ecConnected = false
+    private var connectTimeout: kotlinx.coroutines.Job? = null
+    // INK / SUNFLOWER / PAPER / PAPERDIM as ARGB ints for the (non-Compose) overlay.
+    private val cInk = 0xFF0E1116.toInt(); private val cSun = 0xFFF2B705.toInt()
+    private val cPaper = 0xFFE6EDF3.toInt(); private val cDim = 0xFF8B98A5.toInt()
+    private val MATCH = FrameLayout.LayoutParams.MATCH_PARENT
+
     companion object {
         const val EC_LOCAL = 11080   // -> call.element.io (Element Call app, over Tor)
         const val HS_LOCAL = 18009   // -> own homeserver client API (onion:8009)
@@ -79,10 +102,11 @@ class ElementCallActivity : ComponentActivity() {
         // Block screenshots / screen-recording of the call surface (release only).
         applyScreenSecurity()
         val room = MatrixRepo.currentRoom
-        if (room == null) { finish(); return }
+        if (room == null) { Log.w(TAG, "no current room — finishing"); finish(); return }
 
         val onion = MatrixRepo.userId.substringAfter(":")  // box homeserver onion
         ecOnion = onion
+        Log.i(TAG, "call start: room=${runCatching { room.id() }.getOrNull()} box=$onion tor=${TorManager.state.value}")
 
         // Local bridges: the WebView only ever talks to 127.0.0.1; we tunnel to the
         // onion over Tor (Chromium refuses .onion directly) and rewrite .onion URLs
@@ -173,7 +197,21 @@ class ElementCallActivity : ComponentActivity() {
                 }
             }
         }
-        setContentView(web)
+        // WebView under a branded connect overlay (covers EC's slow Tor load).
+        rootView = FrameLayout(this).apply {
+            addView(web, FrameLayout.LayoutParams(MATCH, MATCH))
+            addView(buildOverlay(), FrameLayout.LayoutParams(MATCH, MATCH))
+        }
+        setContentView(rootView)
+        Log.i(TAG, "bridges up (EC=$EC_LOCAL HS=$HS_LOCAL JWT=$JWT_LOCAL SFU=$SFU_LOCAL TURN=$TURN_LOCAL); loading Element Call over Tor")
+        // If EC never starts talking, surface a clear error instead of a blank screen.
+        connectTimeout = lifecycleScope.launch {
+            kotlinx.coroutines.delay(35_000)
+            if (!ecConnected) {
+                Log.w(TAG, "EC did not connect within 35s")
+                showCallError("Couldn't connect the call over Tor.\nYour box or your friend's may be slow or offline.")
+            }
+        }
 
         WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG)
 
@@ -244,6 +282,7 @@ class ElementCallActivity : ComponentActivity() {
                 launch(Dispatchers.IO) {
                     while (isActive) {
                         var msg = runCatching { handle.recv() }.getOrNull() ?: break
+                        markConnected()   // EC is talking to the SDK → hide the overlay
                         // A cross-install call lives on the creator's box (the focus).
                         // Discover that focus onion from the call membership flowing
                         // down, spin up bridges to it, then rewrite every onion URL
@@ -290,14 +329,77 @@ class ElementCallActivity : ComponentActivity() {
                 }
             } catch (t: Throwable) {
                 Log.e(TAG, "EC setup failed", t)
+                showCallError("Couldn't start the call.\n${t.message ?: "Unknown error"}")
             }
         }
+    }
+
+    /** EC is up (first widget message exchanged) → drop the connect overlay. */
+    private fun markConnected() {
+        if (ecConnected) return
+        ecConnected = true
+        connectTimeout?.cancel()
+        Log.i(TAG, "EC connected (widget handshake) — hiding overlay")
+        runOnUiThread { runCatching { (overlayStatus?.parent as? View)?.visibility = View.GONE } }
+    }
+
+    /** Swap the overlay into an error state with Retry/Close (UI thread-safe). */
+    private fun showCallError(msg: String) {
+        runOnUiThread {
+            runCatching {
+                overlayProgress?.visibility = View.GONE
+                overlayStatus?.text = msg
+                overlayStatus?.setTextColor(cPaper)
+                overlayRetry?.visibility = View.VISIBLE
+                (overlayStatus?.parent as? View)?.visibility = View.VISIBLE
+            }
+        }
+    }
+
+    /** The branded "Connecting over Tor…" overlay (becomes the error surface). */
+    private fun buildOverlay(): View {
+        fun sp(v: Float) = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, v, resources.displayMetrics)
+        fun dp(v: Int) = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v.toFloat(), resources.displayMetrics).toInt()
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setBackgroundColor(cInk)
+            setPadding(dp(32), dp(32), dp(32), dp(32))
+        }
+        col.addView(TextView(this).apply {
+            text = "✿"; setTextColor(cSun); setTextSize(TypedValue.COMPLEX_UNIT_PX, sp(56f)); gravity = Gravity.CENTER
+        })
+        col.addView(TextView(this).apply {
+            text = "PurePrivacy"; setTextColor(cPaper); setTextSize(TypedValue.COMPLEX_UNIT_PX, sp(24f))
+            gravity = Gravity.CENTER; setPadding(0, dp(12), 0, dp(28))
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+        })
+        overlayProgress = ProgressBar(this).apply { indeterminateTintList = android.content.res.ColorStateList.valueOf(cSun) }
+        col.addView(overlayProgress)
+        overlayStatus = TextView(this).apply {
+            text = "Connecting over Tor…\nThis can take 10–20 seconds."
+            setTextColor(cDim); setTextSize(TypedValue.COMPLEX_UNIT_PX, sp(14f)); gravity = Gravity.CENTER
+            setPadding(0, dp(18), 0, 0)
+        }
+        col.addView(overlayStatus)
+        overlayRetry = Button(this).apply {
+            text = "Retry"; visibility = View.GONE
+            setOnClickListener { Log.i(TAG, "user tapped Retry"); recreate() }
+        }
+        col.addView(overlayRetry)
+        col.addView(Button(this).apply {
+            text = "Close"; setOnClickListener { finish() }
+        })
+        // tap anywhere on the overlay (while connecting) to reveal the call surface
+        col.setOnClickListener { if (ecConnected) col.visibility = View.GONE }
+        return col
     }
 
     /** widget -> SDK (fromWidget messages). */
     inner class Bridge(private val handle: org.matrix.rustcomponents.sdk.WidgetDriverHandle) {
         @JavascriptInterface
         fun fromWidget(json: String) {
+            markConnected()   // EC loaded and is posting widget messages → hide overlay
             // Hang up / leave: Element Call posts `io.element.close`. Without this the
             // WebView lingers on a blank call surface (the "stuck on black screen"),
             // so close the activity and return to the chat.
@@ -411,6 +513,8 @@ class ElementCallActivity : ComponentActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        connectTimeout?.cancel()
+        Log.i(TAG, "call activity destroyed (connected=$ecConnected)")
         runCatching { web.destroy() }
         // Tear down the per-call Tor bridges/forwarders so they don't linger.
         runCatching { TorNet.stopAll() }
