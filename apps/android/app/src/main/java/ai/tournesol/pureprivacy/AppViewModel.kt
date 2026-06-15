@@ -10,6 +10,9 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 
 sealed class Screen {
+    /** Cold-start branded loading screen — shown while Tor boots and a saved
+     *  session restores, so a returning user never sees an empty login form. */
+    data object Splash : Screen()
     data object Login : Screen()
     data object Rooms : Screen()
     data object Profile : Screen()
@@ -22,7 +25,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     val messages = MatrixRepo.messages
     val status = MatrixRepo.status
 
-    val screen = MutableStateFlow<Screen>(Screen.Login)
+    val screen = MutableStateFlow<Screen>(Screen.Splash)
     val error = MutableStateFlow<String?>(null)
     /** Transient, non-error heads-up (e.g. "pairing request sent"). Shown as a snackbar. */
     val notice = MutableStateFlow<String?>(null)
@@ -36,10 +39,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         // Tor runs for the lifetime of the app; start() blocks reading its log.
         viewModelScope.launch(Dispatchers.IO) { TorManager.start(getApplication()) }
         // Restore a saved session (if any) once Tor is up, and jump to the chats.
+        // We open on Splash; a first-run user (no saved session) drops straight to
+        // Login, while a returning user waits on the branded splash until restore
+        // resolves — never the empty login form.
         viewModelScope.launch(Dispatchers.IO) {
+            if (!MatrixRepo.hasSavedSession(getApplication())) {
+                screen.value = Screen.Login          // nothing to restore — sign in
+                return@launch
+            }
             var waited = 0
             while (TorManager.state.value !is TorManager.State.Ready && waited < 120) {
-                if (TorManager.state.value is TorManager.State.Failed) return@launch
+                if (TorManager.state.value is TorManager.State.Failed) { screen.value = Screen.Login; return@launch }
                 kotlinx.coroutines.delay(1000); waited++
             }
             try {
@@ -47,9 +57,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     MatrixRepo.startSync()
                     PpSyncService.start(getApplication())
                     screen.value = Screen.Rooms
+                } else {
+                    screen.value = Screen.Login      // session vanished
                 }
             } catch (t: Throwable) {
-                error.value = null  // no saved/valid session; stay on Login
+                error.value = null
+                screen.value = Screen.Login          // restore failed — let them sign in
             }
         }
     }

@@ -88,6 +88,7 @@ class MainActivity : ComponentActivity() {
                 Surface(Modifier.fillMaxSize(), color = Ink) {
                     val screen by vm.screen.collectAsState()
                     when (val s = screen) {
+                        is Screen.Splash -> SplashScreen(vm)
                         is Screen.Login -> LoginScreen(vm)
                         is Screen.Rooms -> RoomsScreen(vm)
                         is Screen.Profile -> ProfileScreen(vm)
@@ -140,6 +141,30 @@ private fun TorBadge(modifier: Modifier = Modifier) {
         Icon(Icons.Filled.Lock, null, tint = color, modifier = Modifier.size(14.dp))
         Spacer(Modifier.width(6.dp))
         Text(label, color = color, fontSize = 12.sp)
+    }
+}
+
+@Composable
+fun SplashScreen(vm: AppViewModel) {
+    val tor by vm.torState.collectAsState()
+    val status = when (val s = tor) {
+        is TorManager.State.Bootstrapping -> if (s.percent > 0) "Connecting over Tor · ${s.percent}%" else "Connecting over Tor…"
+        is TorManager.State.Ready -> "Restoring your chats…"
+        is TorManager.State.Failed -> "Couldn't reach Tor — retrying…"
+        else -> "Starting Tor…"
+    }
+    Column(
+        Modifier.fillMaxSize().padding(32.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        SunflowerMark(size = 88)
+        Spacer(Modifier.height(20.dp))
+        Text("PurePrivacy", color = Paper, fontSize = 28.sp, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(40.dp))
+        CircularProgressIndicator(Modifier.size(28.dp), color = Sunflower, strokeWidth = 3.dp)
+        Spacer(Modifier.height(16.dp))
+        Text(status, color = PaperDim, fontSize = 14.sp, textAlign = TextAlign.Center)
     }
 }
 

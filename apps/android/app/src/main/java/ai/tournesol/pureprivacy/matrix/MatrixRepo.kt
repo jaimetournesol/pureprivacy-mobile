@@ -151,6 +151,11 @@ object MatrixRepo {
 
     val isLoggedIn: Boolean get() = client != null
 
+    /** Is there a persisted session to restore? Lets the UI show a splash (not the
+     *  empty login form) on a cold start for a returning user. */
+    fun hasSavedSession(ctx: Context): Boolean =
+        runCatching { sessionPrefs(ctx).getString("at", null) != null }.getOrDefault(false)
+
     private fun builder(ctx: Context, homeserverUrl: String?): ClientBuilder {
         appContext = ctx.applicationContext
         val base = File(ctx.filesDir, "matrix").apply { mkdirs() }
