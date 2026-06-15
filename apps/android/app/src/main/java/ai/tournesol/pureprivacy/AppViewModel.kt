@@ -35,6 +35,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** This user's Matrix address (@name:onion) — the payload behind "my code". */
     val myId: String get() = MatrixRepo.userId
 
+    /** Tell the repo whether our UI is on screen, so the background notification
+     *  poll can slow down when the app isn't visible (battery). */
+    fun setForeground(foreground: Boolean) = MatrixRepo.onForeground(foreground)
+
     init {
         // Tor runs for the lifetime of the app; start() blocks reading its log.
         viewModelScope.launch(Dispatchers.IO) { TorManager.start(getApplication()) }

@@ -64,6 +64,11 @@ class MainActivity : ComponentActivity() {
     private val vm: AppViewModel by viewModels()
     private val notifPerm = registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
 
+    // Foreground = snappy backstop poll + live previews; background = gentle poll
+    // (sliding sync still delivers in real time — this only changes wake cadence).
+    override fun onResume() { super.onResume(); vm.setForeground(true) }
+    override fun onStop() { super.onStop(); vm.setForeground(false) }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         // Keep the login password, identity QR and recovery info out of screenshots

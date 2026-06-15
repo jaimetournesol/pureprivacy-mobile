@@ -102,6 +102,8 @@ object MatrixRepo {
     private const val SESSION_ENC = "pp_session_enc"   // encrypted token store
     private const val SESSION_OLD = "pp_session"       // legacy plaintext (migrated away)
     private const val RECOVERY_ACCOUNT_DATA = "ai.tournesol.pureprivacy.recovery"
+    private const val FOREGROUND_POLL_MS = 2500L   // snappy while the app is on screen
+    private const val BACKGROUND_POLL_MS = 20000L  // gentle backstop in the background/doze
     /** Onions of contacts we've scanned (mirrors PAIR_ACCOUNT_DATA). */
     private val consentedOnions = java.util.Collections.synchronizedSet(mutableSetOf<String>())
 
@@ -144,6 +146,7 @@ object MatrixRepo {
     @Volatile private var notifyArmed = false   // don't fire for the initial backfill
     @Volatile private var notifyFromMs = 0L     // only notify for events newer than this
     @Volatile private var pollStarted = false
+    @Volatile private var appForeground = false          // drives the adaptive backstop poll
     @Volatile private var appContext: Context? = null   // app context for prefs from sync paths
 
     private val roomHandles = LinkedHashMap<String, Room>()
@@ -366,22 +369,32 @@ object MatrixRepo {
         // Set up / restore the auto-managed key backup (option A) once sync is running,
         // so a re-login or new device recovers room keys and decrypts history.
         scope.launch { runCatching { ensureKeyBackup() } }
-        // The room-list listener only fires on list *reordering* — a new message to
-        // the already-top room doesn't reorder it. So poll latest events too; this is
-        // a cheap local read (sliding sync has already cached the data).
+        // Sliding sync delivers events to the local store in ~real time and the
+        // room-list listener (applyRoomUpdates) fires checkNotifs the instant a new
+        // message reorders a room — which covers the common case with no polling.
+        // The one gap is a message to the already-top room (no reorder), so we keep a
+        // *backstop* poll — but adaptively: snappy while the user is in the app, and
+        // slow when backgrounded so we're not waking the CPU every 2.5s in doze (the
+        // real battery drain). Event receipt isn't delayed — only how fast a
+        // no-reorder message surfaces as a notification (≤ the background interval).
         if (!pollStarted) {
             pollStarted = true
             scope.launch {
                 while (true) {
-                    kotlinx.coroutines.delay(2500)
+                    kotlinx.coroutines.delay(if (appForeground) FOREGROUND_POLL_MS else BACKGROUND_POLL_MS)
                     runCatching { checkNotifs() }
-                    // Same reasoning: refresh the chat-list previews/timestamps from the
-                    // cached latest events so a new message updates the list even when it
-                    // doesn't reorder. Cheap (local reads), no membership re-fetch.
-                    runCatching { refreshPreviews() }
+                    // Chat-list previews only matter while the list is on screen.
+                    if (appForeground) runCatching { refreshPreviews() }
                 }
             }
         }
+    }
+
+    /** Nudge the backstop poll the moment the app comes back to the foreground, so
+     *  the chat list / previews refresh immediately instead of after a slow tick. */
+    fun onForeground(foreground: Boolean) {
+        appForeground = foreground
+        if (foreground) scope.launch { runCatching { checkNotifs() }; runCatching { refreshPreviews() } }
     }
 
     private fun applyRoomUpdates(updates: List<RoomListEntriesUpdate>) {
