@@ -171,6 +171,14 @@ class ElementCallActivity : ComponentActivity() {
         TorNet.startHttpProxy(JWT_LOCAL, "https://$onion:8443", TorManager.HTTP_PORT, ecRewrites)
         TorNet.startTlsForwarder(SFU_LOCAL, onion, 7443, TorManager.SOCKS_PORT)
 
+        // Pre-build the Tor circuits to our box's call services NOW, so when EC's
+        // WebRTC fires its TURN allocation (the time-critical, late step) the onion
+        // circuit is already up — otherwise a 10-30s circuit build on a real phone
+        // overruns WebRTC's allocation timeout → "could not establish pc connection".
+        TorNet.prewarm(onion, 3478, TorManager.SOCKS_PORT)   // coturn (TURN) — critical
+        TorNet.prewarm(onion, 7443, TorManager.SOCKS_PORT)   // LiveKit SFU (wss)
+        TorNet.prewarm(onion, 8443, TorManager.SOCKS_PORT)   // lk-jwt
+
         // NO global WebView proxy: a WebView proxy routes even 127.0.0.1 through Tor,
         // and Tor can't CONNECT to loopback (so the bridges were never hit). Instead
         // the WebView reaches our bridges directly on 127.0.0.1, and the bridges

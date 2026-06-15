@@ -192,6 +192,28 @@ object TorNet {
         Log.i(TAG, "stopAll: tore down ${items.size} bridges")
     }
 
+    /** Pre-build the Tor circuit to an onion service so the first real connection
+     *  (e.g. WebRTC's TURN allocation) doesn't pay the 10-30s circuit-build cost and
+     *  time out. Tor caches the circuit, so subsequent streams to the same onion attach
+     *  fast. Fire-and-forget with a couple of retries; warms a few seconds before use. */
+    fun prewarm(host: String, port: Int, socksPort: Int) {
+        thread(name = "prewarm-$host-$port") {
+            repeat(4) { attempt ->
+                try {
+                    val s = socks5(host, port, socksPort)
+                    Thread.sleep(800)            // hold briefly so the circuit settles
+                    runCatching { s.close() }
+                    Log.i(TAG, "prewarmed Tor circuit to :$port (attempt ${attempt + 1})")
+                    return@thread
+                } catch (t: Throwable) {
+                    Log.d(TAG, "prewarm :$port attempt ${attempt + 1} failed: ${t.message}")
+                    Thread.sleep(1500)
+                }
+            }
+            Log.w(TAG, "prewarm :$port gave up after retries")
+        }
+    }
+
     private fun tcpBridge(client: Socket, host: String, port: Int, socksPort: Int) {
         try {
             val raw = socks5(host, port, socksPort)
