@@ -25,6 +25,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Lock
@@ -45,6 +46,9 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.KeyboardCapitalization
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -62,6 +66,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Keep the login password, identity QR and recovery info out of screenshots
+        // and the Recents thumbnail (release builds only — see applyScreenSecurity).
+        applyScreenSecurity()
         if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) !=
             android.content.pm.PackageManager.PERMISSION_GRANTED) {
             notifPerm.launch(android.Manifest.permission.POST_NOTIFICATIONS)
@@ -69,6 +76,15 @@ class MainActivity : ComponentActivity() {
         handleNotifIntent(intent)
         setContent {
             PurePrivacyTheme {
+                // Answered an incoming call from the notification → launch the call UI
+                // once the room is open.
+                val launch by vm.launchCall.collectAsState()
+                LaunchedEffect(launch) {
+                    if (launch) {
+                        startActivity(Intent(this@MainActivity, ElementCallActivity::class.java))
+                        vm.launchCall.value = false
+                    }
+                }
                 Surface(Modifier.fillMaxSize(), color = Ink) {
                     val screen by vm.screen.collectAsState()
                     when (val s = screen) {
@@ -88,11 +104,13 @@ class MainActivity : ComponentActivity() {
         handleNotifIntent(intent)
     }
 
-    /** A tapped message/call notification carries the room — open it. */
+    /** A tapped message/call notification (or "Answer" from the incoming-call
+     *  screen) carries the room — open it, and join the call if answering. */
     private fun handleNotifIntent(intent: Intent?) {
         val roomId = intent?.getStringExtra(PpSyncService.EXTRA_ROOM_ID) ?: return
         val name = intent.getStringExtra(PpSyncService.EXTRA_ROOM_NAME) ?: "Chat"
-        vm.openRoomFromNotif(roomId, name)
+        val answer = intent.getBooleanExtra(PpSyncService.EXTRA_ANSWER, false)
+        vm.openRoomFromNotif(roomId, name, answer)
     }
 }
 
@@ -188,7 +206,13 @@ private fun PpField(value: String, onChange: (String) -> Unit, label: String, pa
         label = { Text(label) },
         singleLine = true,
         visualTransformation = if (password) PasswordVisualTransformation() else androidx.compose.ui.text.input.VisualTransformation.None,
-        keyboardOptions = if (password) KeyboardOptions.Default else KeyboardOptions.Default,
+        // Onion address, username and password are all case-sensitive lowercase ASCII —
+        // never let the IME autocapitalize the first letter or autocorrect them.
+        keyboardOptions = KeyboardOptions(
+            keyboardType = if (password) KeyboardType.Password else KeyboardType.Ascii,
+            autoCorrect = false,
+            capitalization = KeyboardCapitalization.None
+        ),
         modifier = Modifier.fillMaxWidth(),
         colors = OutlinedTextFieldDefaults.colors(
             focusedBorderColor = Sunflower, unfocusedBorderColor = Color(0xFF2D3742),
@@ -202,9 +226,15 @@ private fun PpField(value: String, onChange: (String) -> Unit, label: String, pa
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun RoomsScreen(vm: AppViewModel) {
-    val rooms by vm.rooms.collectAsState()
+    val allRooms by vm.rooms.collectAsState()
+    // Mutual consent: show a chat only once it's live (both scanned) or it's an
+    // incoming request (someone scanned you — scan them back to connect). An
+    // outgoing-only request stays invisible (just a "request sent" snackbar) until
+    // the other person scans you, so no conversation appears until both have.
+    val rooms = allRooms.filter { it.paired || it.invited }
     val busy by vm.busy.collectAsState()
     val err by vm.error.collectAsState()
+    val notice by vm.notice.collectAsState()
     val ctx = LocalContext.current
     var showSheet by remember { mutableStateOf(false) }
     var showNew by remember { mutableStateOf(false) }
@@ -212,6 +242,10 @@ fun RoomsScreen(vm: AppViewModel) {
     BackHandler { (ctx as? android.app.Activity)?.moveTaskToBack(true) }
 
     val scan = rememberScan { contents -> if (contents != null) vm.addContact(contents) }
+    val snackbar = remember { SnackbarHostState() }
+    LaunchedEffect(notice) {
+        notice?.let { snackbar.showSnackbar(it); vm.clearNotice() }
+    }
 
     if (showSheet) {
         ModalBottomSheet(onDismissRequest = { showSheet = false }, containerColor = InkSoft) {
@@ -263,6 +297,7 @@ fun RoomsScreen(vm: AppViewModel) {
 
     Scaffold(
         containerColor = Ink,
+        snackbarHost = { SnackbarHost(snackbar) },
         floatingActionButton = {
             FloatingActionButton(onClick = { vm.clearError(); showSheet = true },
                 containerColor = Sunflower, contentColor = Ink) {
@@ -304,7 +339,13 @@ fun RoomsScreen(vm: AppViewModel) {
             }
         } else {
             LazyColumn(Modifier.fillMaxSize().padding(pad)) {
-                items(rooms, key = { it.id }) { r -> RoomRow(r) { vm.openRoom(r.id, r.name) } }
+                items(rooms, key = { it.id }) { r ->
+                    RoomRow(r) {
+                        // Only a paired (both-scanned) chat opens. Tapping a pending
+                        // request opens the scanner so you can scan them back / finish.
+                        if (r.paired) vm.openRoom(r.id, r.name) else scan.launch(scanOptions())
+                    }
+                }
             }
         }
     }
@@ -327,21 +368,51 @@ private fun SheetAction(icon: androidx.compose.ui.graphics.vector.ImageVector, t
     }
 }
 
+/** Compact relative time for the chat list: "now", "14:32" today, "Mon", or "3 Jun". */
+private fun relativeTime(ts: Long): String {
+    val now = System.currentTimeMillis()
+    val diff = now - ts
+    return when {
+        diff < 60_000 -> "now"
+        android.text.format.DateUtils.isToday(ts) ->
+            android.text.format.DateFormat.format("HH:mm", ts).toString()
+        diff < 7 * 86_400_000L -> android.text.format.DateFormat.format("EEE", ts).toString()
+        else -> android.text.format.DateFormat.format("d MMM", ts).toString()
+    }
+}
+
 @Composable
 private fun RoomRow(r: RoomSummary, onClick: () -> Unit) {
+    val pending = !r.paired
     Row(
         Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 18.dp, vertical = 14.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Box(Modifier.size(44.dp).clip(RoundedCornerShape(12.dp)).background(InkCard), contentAlignment = Alignment.Center) {
-            Text(r.name.firstOrNull { it.isLetterOrDigit() }?.uppercase() ?: "#", color = Sunflower, fontWeight = FontWeight.Bold)
+            Text(r.name.firstOrNull { it.isLetterOrDigit() }?.uppercase() ?: "#",
+                color = if (pending) PaperDim else Sunflower, fontWeight = FontWeight.Bold)
         }
         Spacer(Modifier.width(14.dp))
         Column(Modifier.weight(1f)) {
-            Text(r.name, color = Paper, fontSize = 16.sp, maxLines = 1)
-            if (r.invited) Text("Invite · tap to join", color = Sunflower, fontSize = 12.sp)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(r.name, color = if (pending) PaperDim else Paper, fontSize = 16.sp,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
+                // A live chat shows when it last had activity, right-aligned.
+                if (!pending && r.ts > 0L) {
+                    Spacer(Modifier.width(8.dp))
+                    Text(relativeTime(r.ts), color = PaperDim, fontSize = 11.sp, maxLines = 1)
+                }
+            }
+            // Mutual-consent states: incoming request (they scanned you) vs outgoing
+            // (you scanned them, waiting). A live chat shows its last message preview.
+            when {
+                r.invited -> Text("Wants to connect · tap to scan their code", color = Sunflower, fontSize = 12.sp)
+                pending -> Text("Waiting for them to scan your code", color = PaperDim, fontSize = 12.sp)
+                r.preview != null -> Text(r.preview!!, color = PaperDim, fontSize = 13.sp,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
         }
-        if (r.invited) Box(Modifier.size(8.dp).clip(CircleShape).background(Sunflower))
+        if (pending) { Spacer(Modifier.width(8.dp)); Box(Modifier.size(8.dp).clip(CircleShape).background(Sunflower)) }
     }
     HorizontalDivider(color = Color(0xFF1B222B))
 }
@@ -351,6 +422,7 @@ private fun RoomRow(r: RoomSummary, onClick: () -> Unit) {
 fun ProfileScreen(vm: AppViewModel) {
     BackHandler { vm.openRooms() }
     val clip = LocalClipboardManager.current
+    val ctx = LocalContext.current
     val id = vm.myId
     val name = id.removePrefix("@").substringBefore(":")
     val qr = remember(id) { runCatching { Qr.bitmap(if (id.isBlank()) " " else id, 640) }.getOrNull() }
@@ -397,7 +469,10 @@ fun ProfileScreen(vm: AppViewModel) {
             // the raw address, copyable as a fallback to QR
             Row(
                 Modifier.clip(RoundedCornerShape(12.dp)).background(InkCard)
-                    .clickable { clip.setText(AnnotatedString(id)) }
+                    .clickable {
+                        clip.setText(AnnotatedString(id))
+                        android.widget.Toast.makeText(ctx, "Address copied", android.widget.Toast.LENGTH_SHORT).show()
+                    }
                     .padding(horizontal = 14.dp, vertical = 10.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
@@ -429,12 +504,19 @@ fun ChatScreen(vm: AppViewModel, roomId: String, roomName: String) {
     BackHandler { vm.back() }
     val ctx = LocalContext.current
     val messages by vm.messages.collectAsState()
+    val notice by vm.notice.collectAsState()
     var draft by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
+    val snackbar = remember { SnackbarHostState() }
     LaunchedEffect(messages.size) { if (messages.isNotEmpty()) listState.animateScrollToItem(messages.size - 1) }
+    LaunchedEffect(notice) { notice?.let { snackbar.showSnackbar(it); vm.clearNotice() } }
+    val pickFile = rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.GetContent()
+    ) { uri -> if (uri != null) vm.sendFile(uri) }
 
     Scaffold(
         containerColor = Ink,
+        snackbarHost = { SnackbarHost(snackbar) },
         topBar = {
             TopAppBar(
                 navigationIcon = {
@@ -454,6 +536,9 @@ fun ChatScreen(vm: AppViewModel, roomId: String, roomName: String) {
                 Modifier.fillMaxWidth().background(InkSoft).padding(10.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
+                IconButton(onClick = { pickFile.launch("*/*") }) {
+                    Icon(Icons.Filled.AttachFile, "attach a file", tint = Sunflower)
+                }
                 OutlinedTextField(
                     value = draft, onValueChange = { draft = it },
                     placeholder = { Text("Message", color = PaperDim) },
@@ -486,23 +571,41 @@ fun ChatScreen(vm: AppViewModel, roomId: String, roomName: String) {
                 Modifier.fillMaxSize().padding(pad).padding(horizontal = 12.dp),
                 state = listState
             ) {
-                items(messages, key = { it.key }) { m -> Bubble(m) }
+                items(messages, key = { it.key }) { m -> Bubble(m) { vm.saveAttachment(m) } }
             }
         }
     }
 }
 
 @Composable
-private fun Bubble(m: ChatMsg) {
+private fun Bubble(m: ChatMsg, onAttachment: () -> Unit = {}) {
     val align = if (m.mine) Alignment.End else Alignment.Start
-    Column(Modifier.fillMaxWidth().padding(vertical = 4.dp), horizontalAlignment = align) {
+    val isAttachment = m.media != null
+    Column(Modifier.fillMaxWidth().padding(vertical = 5.dp), horizontalAlignment = align) {
         if (!m.mine) Text(m.sender.removePrefix("@").substringBefore(":"), color = Sunflower, fontSize = 11.sp,
             modifier = Modifier.padding(start = 8.dp, bottom = 2.dp))
         Box(
             Modifier.widthIn(max = 280.dp)
                 .clip(RoundedCornerShape(16.dp))
                 .background(if (m.mine) BubbleMine else BubbleTheirs)
+                .then(if (isAttachment) Modifier.clickable { onAttachment() } else Modifier)
                 .padding(horizontal = 14.dp, vertical = 9.dp)
-        ) { Text(m.body, color = Paper, fontSize = 15.sp) }
+        ) {
+            if (isAttachment) {
+                Column {
+                    Text(m.body, color = Paper, fontSize = 15.sp)
+                    Text("Tap to save", color = PaperDim, fontSize = 11.sp, modifier = Modifier.padding(top = 2.dp))
+                }
+            } else {
+                Text(m.body, color = Paper, fontSize = 15.sp)
+            }
+        }
+        if (m.ts > 0L) Text(
+            remember(m.ts) {
+                java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(java.util.Date(m.ts))
+            },
+            color = PaperDim, fontSize = 10.sp,
+            modifier = Modifier.padding(start = 6.dp, end = 6.dp, top = 2.dp)
+        )
     }
 }

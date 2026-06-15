@@ -24,7 +24,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     val screen = MutableStateFlow<Screen>(Screen.Login)
     val error = MutableStateFlow<String?>(null)
+    /** Transient, non-error heads-up (e.g. "pairing request sent"). Shown as a snackbar. */
+    val notice = MutableStateFlow<String?>(null)
     val busy = MutableStateFlow(false)
+    fun clearNotice() { notice.value = null }
 
     /** This user's Matrix address (@name:onion) — the payload behind "my code". */
     val myId: String get() = MatrixRepo.userId
@@ -94,14 +97,30 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             error.value = "Enter a full address, e.g. @bob:xxxx.onion"
             return
         }
+        // Validate the server is a real v3 onion before we record consent / pair —
+        // a scanned/typed address drives a federation-allowlist write on our box.
+        val server = uid.substringAfter(":")
+        if (!Regex("^[a-z2-7]{56}\\.onion$").matches(server)) {
+            error.value = "That doesn't look like a valid PurePrivacy address."
+            return
+        }
         error.value = null
         busy.value = true
+        val who = uid.removePrefix("@").substringBefore(":")
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val roomId = MatrixRepo.startChat(uid)
-                kotlinx.coroutines.delay(1500)   // let the new room land in sync
-                MatrixRepo.openRoom(roomId)
-                screen.value = Screen.Chat(roomId, uid.removePrefix("@").substringBefore(":"))
+                val r = MatrixRepo.startChat(uid)
+                if (r.paired) {
+                    // both have scanned — open the live conversation.
+                    kotlinx.coroutines.delay(1200)   // let the room settle in sync
+                    MatrixRepo.openRoom(r.roomId)
+                    screen.value = Screen.Chat(r.roomId, who)
+                } else {
+                    // mutual consent: our request is recorded, waiting for them to
+                    // scan us back. Stay on the chat list; show a gentle heads-up.
+                    notice.value = "Request sent to $who. You'll connect once they scan your code too."
+                    screen.value = Screen.Rooms
+                }
             } catch (t: Throwable) {
                 error.value = t.message ?: t.toString()
             } finally {
@@ -149,12 +168,28 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch(Dispatchers.IO) { runCatching { MatrixRepo.send(text) } }
     }
 
+    /** Send a picked file/image as an attachment (E2EE, over Tor). */
+    fun sendFile(uri: android.net.Uri) {
+        notice.value = "Sending file over Tor…"
+        viewModelScope.launch(Dispatchers.IO) { runCatching { MatrixRepo.sendFile(getApplication(), uri) } }
+    }
+
+    /** Download a received attachment and save it to Downloads. */
+    fun saveAttachment(m: ai.tournesol.pureprivacy.matrix.ChatMsg) {
+        val media = m.media ?: return
+        notice.value = "Downloading over Tor…"
+        viewModelScope.launch(Dispatchers.IO) {
+            val ok = MatrixRepo.saveAttachment(getApplication(), media, m.fileName ?: "file", m.mime)
+            notice.value = if (ok) "Saved to Downloads" else "Couldn't save the file"
+        }
+    }
+
     fun back() { MatrixRepo.currentRoomId = null; screen.value = Screen.Rooms }
     fun clearError() { error.value = null }
 
     /** Open a room from a tapped notification — wait for login/sync if we were
      *  cold-started by the tap. */
-    fun openRoomFromNotif(id: String, name: String) {
+    fun openRoomFromNotif(id: String, name: String, answer: Boolean = false) {
         viewModelScope.launch(Dispatchers.IO) {
             var waited = 0
             while (!MatrixRepo.isLoggedIn && waited < 120) { kotlinx.coroutines.delay(500); waited++ }
@@ -163,7 +198,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             runCatching {
                 MatrixRepo.openRoom(id)
                 screen.value = Screen.Chat(id, name)
+                // Answering an incoming call: drop straight into the call once the
+                // room is open. MainActivity observes this and launches the call UI.
+                if (answer) launchCall.value = true
             }
         }
     }
+
+    /** Set when the user answered an incoming-call notification; MainActivity reacts
+     *  by launching the call once the chat is open. */
+    val launchCall = MutableStateFlow(false)
 }

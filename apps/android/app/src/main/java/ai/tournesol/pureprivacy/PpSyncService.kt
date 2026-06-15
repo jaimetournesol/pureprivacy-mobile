@@ -36,6 +36,13 @@ class PpSyncService : Service() {
         ensureChannels(this)
         startForegroundCompat()
         scope.launch { MatrixRepo.notifications.collect { post(it) } }
+        // When a call ends (e.g. the caller hung up before answer), clear its ringing
+        // notification so the callee stops being rung.
+        scope.launch {
+            MatrixRepo.callEnded.collect { roomId ->
+                runCatching { NotificationManagerCompat.from(this@PpSyncService).cancel(roomId.hashCode()) }
+            }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -59,15 +66,49 @@ class PpSyncService : Service() {
     }
 
     private fun post(n: Notif) {
-        val b = NotificationCompat.Builder(this, if (n.isCall) CH_CALL else CH_MSG)
+        if (n.isCall) { postCall(n); return }
+        val b = NotificationCompat.Builder(this, CH_MSG)
             .setContentTitle(n.title)
             .setContentText(n.text)
             .setSmallIcon(R.drawable.ic_sunflower)
             .setAutoCancel(true)
             .setContentIntent(openApp(n.roomId, n.roomName))
-            .setPriority(if (n.isCall) NotificationCompat.PRIORITY_HIGH else NotificationCompat.PRIORITY_DEFAULT)
-        if (n.isCall) b.setCategory(NotificationCompat.CATEGORY_CALL)
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
         runCatching { NotificationManagerCompat.from(this).notify(n.roomId.hashCode(), b.build()) }
+    }
+
+    /** Incoming call: a full-screen, ringing notification with Answer/Decline. The
+     *  full-screen intent wakes the phone over the lock screen (IncomingCallActivity
+     *  owns the ringtone); the actions answer/decline without opening the chat. */
+    private fun postCall(n: Notif) {
+        val ring = incomingCall(n, null)
+        val answer = incomingCall(n, IncomingCallActivity.EXTRA_ANSWER)
+        val decline = incomingCall(n, IncomingCallActivity.EXTRA_DECLINE)
+        val b = NotificationCompat.Builder(this, CH_CALL)
+            .setContentTitle("📞 ${n.roomName}")
+            .setContentText("Incoming call · over Tor")
+            .setSmallIcon(R.drawable.ic_sunflower)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setCategory(NotificationCompat.CATEGORY_CALL)
+            .setOngoing(true)
+            .setAutoCancel(false)
+            .setContentIntent(ring)
+            .setFullScreenIntent(ring, true)
+            .addAction(R.drawable.ic_sunflower, "Decline", decline)
+            .addAction(R.drawable.ic_sunflower, "Answer", answer)
+        runCatching { NotificationManagerCompat.from(this).notify(n.roomId.hashCode(), b.build()) }
+    }
+
+    private fun incomingCall(n: Notif, flag: String?): PendingIntent {
+        val i = Intent(this, IncomingCallActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+            putExtra(EXTRA_ROOM_ID, n.roomId)
+            putExtra(EXTRA_ROOM_NAME, n.roomName)
+            if (flag != null) putExtra(flag, true)
+            action = "pp.call.${flag ?: "ring"}.${n.roomId}"   // distinct PendingIntent per action
+        }
+        val pf = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        return PendingIntent.getActivity(this, (n.roomId + (flag ?: "ring")).hashCode(), i, pf)
     }
 
     private fun openApp(roomId: String?, roomName: String?): PendingIntent {
@@ -87,6 +128,7 @@ class PpSyncService : Service() {
         const val CH_CALL = "pp_call"
         const val EXTRA_ROOM_ID = "pp_room_id"
         const val EXTRA_ROOM_NAME = "pp_room_name"
+        const val EXTRA_ANSWER = "pp_answer_call"
 
         fun start(ctx: Context) {
             val i = Intent(ctx, PpSyncService::class.java)

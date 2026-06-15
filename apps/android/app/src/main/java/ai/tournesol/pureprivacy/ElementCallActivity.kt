@@ -32,6 +32,7 @@ import org.matrix.rustcomponents.sdk.makeWidgetDriver
 import org.matrix.rustcomponents.sdk.newVirtualElementCallWidget
 import uniffi.matrix_sdk.EncryptionSystem
 import uniffi.matrix_sdk.Intent as CallIntent
+import uniffi.matrix_sdk.NotificationType
 import uniffi.matrix_sdk.VirtualElementCallWidgetConfig
 import uniffi.matrix_sdk.VirtualElementCallWidgetProperties
 
@@ -75,6 +76,8 @@ class ElementCallActivity : ComponentActivity() {
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Block screenshots / screen-recording of the call surface (release only).
+        applyScreenSecurity()
         val room = MatrixRepo.currentRoom
         if (room == null) { finish(); return }
 
@@ -172,7 +175,7 @@ class ElementCallActivity : ComponentActivity() {
         }
         setContentView(web)
 
-        WebView.setWebContentsDebuggingEnabled(true)
+        WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG)
 
         lifecycleScope.launch(Dispatchers.IO) {
             try {
@@ -202,7 +205,11 @@ class ElementCallActivity : ComponentActivity() {
                     confineToRoom = true,
                     hideScreensharing = true,
                     controlledAudioDevices = null,
-                    sendNotificationType = null,
+                    // RING makes Element Call publish an m.rtc.notification when the
+                    // call starts — that's what federates to the peer and lets their
+                    // phone ring (the callee's checkNotifs surfaces it; the caller is
+                    // already in the room so they don't ring themselves).
+                    sendNotificationType = NotificationType.RING,
                 )
                 val settings = newVirtualElementCallWidget(props, config)
                 val rawUrl = generateWebviewUrl(
@@ -217,7 +224,7 @@ class ElementCallActivity : ComponentActivity() {
                     // Element Call's in-room widget view is under /room (root '/' is the
                     // standalone "start new call" home).
                     .replace("127.0.0.1:$EC_LOCAL/#?", "127.0.0.1:$EC_LOCAL/room/#?")
-                Log.i(TAG, "EC url: $url")
+                if (BuildConfig.DEBUG) Log.i(TAG, "EC url: $url")
 
                 val driverAndHandle = makeWidgetDriver(settings)
                 val driver = driverAndHandle.driver
@@ -243,8 +250,9 @@ class ElementCallActivity : ComponentActivity() {
                         // (own + peer) to the matching localhost bridge before the
                         // WebView sees it — Chromium would block the raw .onion.
                         maybeStartPeerFocus(msg)
+                        maybeDetectPeerLeft(msg)
                         for ((a, b) in ecRewrites) msg = msg.replace(a, b)
-                        Log.i(TAG, "toWidget: ${msg.take(220)}")
+                        if (BuildConfig.DEBUG) Log.i(TAG, "toWidget: ${msg.take(220)}")
                         withContext(Dispatchers.Main) {
                             web.evaluateJavascript("window.__ec && window.__ec().postMessage($msg, '*');", null)
                         }
@@ -265,6 +273,8 @@ class ElementCallActivity : ComponentActivity() {
                     <script>
                       window.__ec = function(){ return document.getElementById('ec').contentWindow; };
                       window.addEventListener('message', function(e){
+                        // Only accept widget messages from the Element Call iframe origin.
+                        if (e.origin !== 'http://127.0.0.1:$EC_LOCAL') return;
                         try { var d = e.data; if (!d || !d.api) return;
                           var isReq  = (d.api === 'fromWidget' && !('response' in d));
                           var isResp = (d.api === 'toWidget'   &&  ('response' in d));
@@ -301,10 +311,48 @@ class ElementCallActivity : ComponentActivity() {
             // box can resolve it — a bare 127.0.0.1 would point at the peer's own box.
             var out = json
             for ((a, b) in ecReverse) out = out.replace(a, b)
-            Log.i(TAG, "fromWidget: ${out.take(220)}")
+            if (BuildConfig.DEBUG) Log.i(TAG, "fromWidget: ${out.take(220)}")
             lifecycleScope.launch(Dispatchers.IO) {
                 val ok = runCatching { handle.send(out) }.getOrElse { Log.e(TAG, "send failed", it); false }
                 if (!ok) Log.w(TAG, "handle.send returned false")
+            }
+        }
+    }
+
+    // Peers (by @user:onion) currently in the call, parsed from the m.call.member
+    // state flowing through the widget. Once we've seen a peer join and then the set
+    // empties, the other side hung up → end the call here too (both ends terminate).
+    private val callPeers = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    @Volatile private var sawPeer = false
+    @Volatile private var ending = false
+
+    private fun maybeDetectPeerLeft(msg: String) {
+        if (ending) return
+        val me = MatrixRepo.userId
+        runCatching {
+            val state = org.json.JSONObject(msg).optJSONObject("data")?.optJSONArray("state") ?: return
+            for (i in 0 until state.length()) {
+                val e = state.optJSONObject(i) ?: continue
+                if (!e.optString("type").contains("call.member")) continue
+                val sk = e.optString("state_key")
+                if (sk.isEmpty() || sk == me) continue
+                val content = e.optJSONObject("content")
+                val present = when {
+                    content == null -> false
+                    content.has("memberships") -> (content.optJSONArray("memberships")?.length() ?: 0) > 0
+                    else -> content.length() > 0          // empty {} ⇒ that member left
+                }
+                if (present) { callPeers.add(sk); sawPeer = true } else callPeers.remove(sk)
+            }
+            if (sawPeer && callPeers.isEmpty()) {
+                ending = true
+                Log.i(TAG, "peer left the call -> ending on this side too")
+                runOnUiThread {
+                    if (!isFinishing) {
+                        android.widget.Toast.makeText(this, "Call ended", android.widget.Toast.LENGTH_SHORT).show()
+                        finish()
+                    }
+                }
             }
         }
     }
@@ -364,5 +412,7 @@ class ElementCallActivity : ComponentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         runCatching { web.destroy() }
+        // Tear down the per-call Tor bridges/forwarders so they don't linger.
+        runCatching { TorNet.stopAll() }
     }
 }

@@ -1,7 +1,10 @@
 package ai.tournesol.pureprivacy.matrix
 
 import android.content.Context
+import android.content.SharedPreferences
 import android.util.Log
+import androidx.security.crypto.EncryptedSharedPreferences
+import androidx.security.crypto.MasterKey
 import ai.tournesol.pureprivacy.tor.TorManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -11,18 +14,26 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import org.matrix.rustcomponents.sdk.Client
+import org.matrix.rustcomponents.sdk.EnableRecoveryProgress
+import org.matrix.rustcomponents.sdk.EnableRecoveryProgressListener
+import org.matrix.rustcomponents.sdk.EncryptedMessage
 import org.matrix.rustcomponents.sdk.LatestEventValue
+import org.matrix.rustcomponents.sdk.RecoveryState
 import org.matrix.rustcomponents.sdk.ClientBuilder
 import org.matrix.rustcomponents.sdk.CreateRoomParameters
 import org.matrix.rustcomponents.sdk.RoomPreset
 import org.matrix.rustcomponents.sdk.RoomVisibility
 import org.matrix.rustcomponents.sdk.Membership
+import org.matrix.rustcomponents.sdk.MembershipState
 import org.matrix.rustcomponents.sdk.MsgLikeKind
 import org.matrix.rustcomponents.sdk.Room
+import org.matrix.rustcomponents.sdk.RoomList
 import org.matrix.rustcomponents.sdk.RoomListEntriesDynamicFilterKind
 import org.matrix.rustcomponents.sdk.RoomListEntriesListener
 import org.matrix.rustcomponents.sdk.RoomListEntriesUpdate
+import org.matrix.rustcomponents.sdk.RoomListEntriesWithDynamicAdaptersResult
 import org.matrix.rustcomponents.sdk.RoomListService
+import org.matrix.rustcomponents.sdk.TaskHandle
 import org.matrix.rustcomponents.sdk.Session
 import org.matrix.rustcomponents.sdk.SlidingSyncVersion
 import org.matrix.rustcomponents.sdk.SlidingSyncVersionBuilder
@@ -35,8 +46,35 @@ import org.matrix.rustcomponents.sdk.TimelineListener
 import org.matrix.rustcomponents.sdk.messageEventContentFromMarkdown
 import java.io.File
 
-data class RoomSummary(val id: String, val name: String, val invited: Boolean = false)
-data class ChatMsg(val key: String, val sender: String, val body: String, val mine: Boolean)
+/**
+ * A row in the chat list.
+ *  - [paired]   both people have scanned → a live, openable conversation.
+ *  - [invited]  the other person scanned you; you haven't scanned them back yet
+ *               (an incoming request — tap to scan them and complete the pairing).
+ *  - neither    you scanned them; waiting for them to scan you back (outgoing).
+ */
+data class RoomSummary(
+    val id: String,
+    val name: String,
+    val invited: Boolean = false,
+    val paired: Boolean = false,
+    /** Short preview of the latest event ("You: hi", "📎 file.pdf", "📞 Call"). */
+    val preview: String? = null,
+    /** Timestamp of the latest event (ms); 0 if none. Used to sort the chat list. */
+    val ts: Long = 0L,
+)
+/** Outcome of acting on a scanned/typed contact. [paired] is true only once both
+ *  sides have scanned (a live conversation); false means the request is pending. */
+data class ConnectResult(val roomId: String, val paired: Boolean)
+data class ChatMsg(
+    val key: String, val sender: String, val body: String, val mine: Boolean, val ts: Long = 0L,
+    // Set for file/image/video/audio messages: the SDK media handle to download, the
+    // attachment filename + mime, and whether it's an image (for a future preview).
+    val media: org.matrix.rustcomponents.sdk.MediaSource? = null,
+    val fileName: String? = null,
+    val mime: String? = null,
+    val isImage: Boolean = false,
+)
 /** A thing worth alerting the user about when they're not looking at the room. */
 data class Notif(
     val roomId: String,
@@ -55,10 +93,29 @@ data class Notif(
 object MatrixRepo {
     private const val TAG = "PpMatrix"
 
+    /** Account-data event where we record the onions of contacts we've scanned.
+     *  Two jobs: (1) our box's desktop app reads it and allowlists those onions for
+     *  federation — this is how a phone QR exchange pairs the two boxes; (2) it's our
+     *  record of consent, so an incoming invite from someone we've also scanned is
+     *  auto-accepted (a chat appears only once BOTH sides have scanned). */
+    private const val PAIR_ACCOUNT_DATA = "ai.tournesol.pureprivacy.pairings"
+    private const val SESSION_ENC = "pp_session_enc"   // encrypted token store
+    private const val SESSION_OLD = "pp_session"       // legacy plaintext (migrated away)
+    private const val RECOVERY_ACCOUNT_DATA = "ai.tournesol.pureprivacy.recovery"
+    /** Onions of contacts we've scanned (mirrors PAIR_ACCOUNT_DATA). */
+    private val consentedOnions = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+
     private var client: Client? = null
     private var syncService: SyncService? = null
     private var roomListService: RoomListService? = null
     private var timeline: Timeline? = null
+    // These subscription handles MUST be held for the lifetime of the sync /
+    // open room: the SDK cancels the underlying stream task the moment its handle
+    // is dropped, which silently stops incremental room-list + timeline updates
+    // (the bug where new messages/invites only appeared after an app restart).
+    private var roomList: RoomList? = null
+    private var roomListResult: RoomListEntriesWithDynamicAdaptersResult? = null
+    private var timelineHandle: TaskHandle? = null
 
     var userId: String = ""
         private set
@@ -77,11 +134,17 @@ object MatrixRepo {
     /** Background-notification stream — the foreground service collects this and
      *  posts Android notifications for messages / calls / invites. */
     val notifications = MutableSharedFlow<Notif>(extraBufferCapacity = 32)
+    /** Emits a roomId when an active call there ends — used to stop a ringing
+     *  callee (caller hung up before answer) and cancel the call notification. */
+    val callEnded = MutableSharedFlow<String>(extraBufferCapacity = 16)
+    /** Rooms where a peer currently has an active call (to ring once per call). */
+    private val activeCallRooms = java.util.Collections.synchronizedSet(mutableSetOf<String>())
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val lastSeen = java.util.concurrent.ConcurrentHashMap<String, String>()
     @Volatile private var notifyArmed = false   // don't fire for the initial backfill
     @Volatile private var notifyFromMs = 0L     // only notify for events newer than this
     @Volatile private var pollStarted = false
+    @Volatile private var appContext: Context? = null   // app context for prefs from sync paths
 
     private val roomHandles = LinkedHashMap<String, Room>()
     private val timelineItems = ArrayList<TimelineItem>()
@@ -89,6 +152,7 @@ object MatrixRepo {
     val isLoggedIn: Boolean get() = client != null
 
     private fun builder(ctx: Context, homeserverUrl: String?): ClientBuilder {
+        appContext = ctx.applicationContext
         val base = File(ctx.filesDir, "matrix").apply { mkdirs() }
         val session = File(base, "session").apply { mkdirs() }
         val cache = File(base, "cache").apply { mkdirs() }
@@ -97,8 +161,14 @@ object MatrixRepo {
             .proxy(TorManager.proxyUrl)                 // route every request through Tor
             .disableSslVerification()                   // onion box uses a self-signed/plain endpoint
             .slidingSyncVersionBuilder(SlidingSyncVersionBuilder.DISCOVER_NATIVE)
-            .autoEnableCrossSigning(false)
-            .autoEnableBackups(false)
+            // Key backup + cross-signing (option A, see ensureKeyBackup): cross-signing
+            // auto-trusts our own devices (no manual verification UX), backups let a
+            // re-login / new device recover room keys. ONE_SHOT downloads the entire key
+            // backup as soon as recovery unlocks it — the right strategy for restoring
+            // full history on a new device (vs lazy per-message download over slow Tor).
+            .autoEnableCrossSigning(true)
+            .autoEnableBackups(true)
+            .backupDownloadStrategy(uniffi.matrix_sdk.BackupDownloadStrategy.ONE_SHOT)
         if (homeserverUrl != null) b = b.homeserverUrl(homeserverUrl)
         return b
     }
@@ -113,6 +183,10 @@ object MatrixRepo {
     suspend fun login(ctx: Context, homeserverUrl: String, user: String, pass: String) {
         status.value = "Connecting over Tor…"
         wipeStore(ctx)                                  // clean crypto store for this sign-in
+        // Drop the cached recovery key — a fresh sign-in (possibly a different account)
+        // should re-read the authoritative key from the box's account data, not reuse a
+        // stale one. ensureKeyBackup then recovers this new device's keys from backup.
+        runCatching { sessionPrefs(ctx).edit().remove("rk").apply() }
         val c = builder(ctx, homeserverUrl).build()
         client = c
         status.value = "Signing in…"
@@ -131,7 +205,7 @@ object MatrixRepo {
      *  mismatch + survives app restarts). Returns false if no saved session. */
     suspend fun tryRestore(ctx: Context): Boolean {
         if (client != null) return true
-        val p = ctx.getSharedPreferences("pp_session", Context.MODE_PRIVATE)
+        val p = sessionPrefs(ctx)
         val at = p.getString("at", null) ?: return false
         val hs = p.getString("hs", null) ?: return false
         status.value = "Restoring session over Tor…"
@@ -151,7 +225,7 @@ object MatrixRepo {
     }
 
     private fun persist(ctx: Context, s: Session) {
-        ctx.getSharedPreferences("pp_session", Context.MODE_PRIVATE).edit()
+        sessionPrefs(ctx).edit()
             .putString("at", s.accessToken)
             .putString("rt", s.refreshToken)
             .putString("uid", s.userId)
@@ -162,15 +236,114 @@ object MatrixRepo {
             .apply()
     }
 
+    /** The session store — access token, refresh token, device id — encrypted at rest
+     *  with an AES-256 key held in the Android Keystore. Migrates the old plaintext
+     *  prefs once, then wipes them. If the keyset is ever corrupted (e.g. partial data
+     *  clear) we reset it and recreate rather than crash on every launch. */
+    private fun sessionPrefs(ctx: Context): SharedPreferences {
+        val prefs = runCatching { buildEncryptedPrefs(ctx) }.getOrElse {
+            Log.w(TAG, "encrypted prefs unavailable, resetting keyset: ${it.message}")
+            ctx.deleteSharedPreferences(SESSION_ENC)
+            buildEncryptedPrefs(ctx)
+        }
+        migrateLegacySession(ctx, prefs)
+        return prefs
+    }
+
+    private fun buildEncryptedPrefs(ctx: Context): SharedPreferences {
+        val key = MasterKey.Builder(ctx).setKeyScheme(MasterKey.KeyScheme.AES256_GCM).build()
+        return EncryptedSharedPreferences.create(
+            ctx, SESSION_ENC, key,
+            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+        )
+    }
+
+    /** Move tokens out of the legacy plaintext prefs into the encrypted store (once),
+     *  then clear the plaintext copy so the access token never lingers unencrypted. */
+    private fun migrateLegacySession(ctx: Context, enc: SharedPreferences) {
+        val old = ctx.getSharedPreferences(SESSION_OLD, Context.MODE_PRIVATE)
+        if (old.getString("at", null) == null) return
+        if (enc.getString("at", null) == null) {
+            val e = enc.edit()
+            for ((k, v) in old.all) if (v is String) e.putString(k, v)
+            e.apply()
+            Log.i(TAG, "migrated session into encrypted prefs")
+        }
+        old.edit().clear().apply()
+    }
+
+    /** Option A automatic key backup. Cross-signing + key backup are auto-enabled in the
+     *  client builder; this sets up "recovery" so the room-key backup survives a re-login
+     *  or a brand-new device:
+     *   - first device for an account: create the recovery key, then stash it in the
+     *     encrypted prefs AND in account data on the user's own box (their trusted server);
+     *   - a later device / re-login: fetch that key and recover(), pulling the room keys
+     *     down from backup so message history decrypts.
+     *  Trade-off the user accepted (option A): the recovery key lives in plaintext account
+     *  data on the box. The box is the user's own onion server and already stores the
+     *  encrypted history, so this gives zero-friction recovery without ever prompting. */
+    private suspend fun ensureKeyBackup() {
+        val ctx = appContext ?: return
+        val c = client ?: return
+        val enc = c.encryption()
+        // recoveryState is UNKNOWN until the first sync resolves the crypto state.
+        var waited = 0
+        while (enc.recoveryState() == RecoveryState.UNKNOWN && waited < 30) {
+            kotlinx.coroutines.delay(1000); waited++
+        }
+        val stored = readStoredRecoveryKey(c, ctx)
+        if (stored != null) {
+            // We (or our box) already hold a recovery key → make sure THIS device is
+            // hooked up to the backup so it can decrypt history. Idempotent if already done.
+            val rs = enc.recoveryState()
+            if (rs == RecoveryState.INCOMPLETE || rs == RecoveryState.DISABLED) {
+                runCatching { enc.recover(stored) }
+                    .onSuccess { Log.i(TAG, "key backup: recovered room keys from backup") }
+                    .onFailure { Log.w(TAG, "key backup: recover failed: ${it.message}") }
+            }
+            persistRecoveryKey(c, ctx, stored)   // ensure both copies (prefs + box) exist
+            return
+        }
+        // No recovery key anywhere → first device for this account. Create backup + key.
+        if (enc.recoveryState() != RecoveryState.ENABLED) {
+            val key = runCatching {
+                enc.enableRecovery(true, null, object : EnableRecoveryProgressListener {
+                    override fun onUpdate(status: EnableRecoveryProgress) {}
+                })
+            }.getOrElse { Log.w(TAG, "key backup: enableRecovery failed: ${it.message}"); return }
+            persistRecoveryKey(c, ctx, key)
+            Log.i(TAG, "key backup: created recovery + backup (first device)")
+        }
+    }
+
+    /** Read the recovery key: this device's encrypted prefs first, else account data on
+     *  the box (so a fresh install/device that has neither still finds it). */
+    private suspend fun readStoredRecoveryKey(c: Client, ctx: Context): String? {
+        sessionPrefs(ctx).getString("rk", null)?.let { return it }
+        return runCatching { c.accountData(RECOVERY_ACCOUNT_DATA) }.getOrNull()
+            ?.let { runCatching { org.json.JSONObject(it).optString("key").ifBlank { null } }.getOrNull() }
+    }
+
+    private suspend fun persistRecoveryKey(c: Client, ctx: Context, key: String) {
+        sessionPrefs(ctx).edit().putString("rk", key).apply()
+        runCatching {
+            if (c.accountData(RECOVERY_ACCOUNT_DATA) == null)
+                c.setAccountData(RECOVERY_ACCOUNT_DATA, org.json.JSONObject().put("key", key).toString())
+        }
+    }
+
     suspend fun startSync() {
         val c = client ?: error("not logged in")
+        runCatching { loadConsent() }   // restore who we've already scanned
         val ss = c.syncService().finish()
         syncService = ss
         ss.start()
         val rls = ss.roomListService()
         roomListService = rls
-        val roomList = rls.allRooms()
-        val result = roomList.entriesWithDynamicAdapters(
+        val rl = rls.allRooms()
+        roomList = rl                       // HOLD: dropping the RoomList cancels its stream
+        val result = rl.entriesWithDynamicAdapters(
             200u,
             object : RoomListEntriesListener {
                 override fun onUpdate(roomEntriesUpdate: List<RoomListEntriesUpdate>) {
@@ -178,12 +351,16 @@ object MatrixRepo {
                 }
             }
         )
+        roomListResult = result            // HOLD: owns the entries-stream TaskHandle
         // populate: no extra filtering, just show every room we're in
         result.controller().setFilter(RoomListEntriesDynamicFilterKind.All(emptyList()))
         status.value = "Connected"
         // arm notifications: only events from ~now on are "new" (avoids backfill).
         notifyFromMs = System.currentTimeMillis()
         scope.launch { kotlinx.coroutines.delay(3000); notifyArmed = true }
+        // Set up / restore the auto-managed key backup (option A) once sync is running,
+        // so a re-login or new device recovers room keys and decrypts history.
+        scope.launch { runCatching { ensureKeyBackup() } }
         // The room-list listener only fires on list *reordering* — a new message to
         // the already-top room doesn't reorder it. So poll latest events too; this is
         // a cheap local read (sliding sync has already cached the data).
@@ -193,6 +370,10 @@ object MatrixRepo {
                 while (true) {
                     kotlinx.coroutines.delay(2500)
                     runCatching { checkNotifs() }
+                    // Same reasoning: refresh the chat-list previews/timestamps from the
+                    // cached latest events so a new message updates the list even when it
+                    // doesn't reorder. Cheap (local reads), no membership re-fetch.
+                    runCatching { refreshPreviews() }
                 }
             }
         }
@@ -218,13 +399,111 @@ object MatrixRepo {
             }
             roomHandles.clear()
             list.forEach { r -> runCatching { roomHandles[r.id()] = r } }
-            rooms.value = roomHandles.values.map { r ->
-                val raw = runCatching { r.displayName() }.getOrNull()
-                val invited = runCatching { r.membership() == Membership.INVITED }.getOrDefault(false)
-                RoomSummary(r.id(), prettyName(raw, r.id()), invited)
+        }
+        // Off-thread: accept any newly-arrived invite from a contact we've also
+        // scanned (mutual consent), then recompute the visible chat list. Deciding
+        // "paired" inspects members (to exclude the @conduit bot) — a suspend call,
+        // so it can't run inside the lock.
+        scope.launch { autoAcceptMutual(); rebuildRooms(); checkNotifs() }
+    }
+
+    /** The tuwunel server bot is a member of every room it administers; it must not
+     *  count as the human peer when deciding names or whether a chat is live. */
+    private fun isServerBot(uid: String): Boolean = uid.startsWith("@conduit:")
+
+    /** Is the human peer actually joined? (Both joined = a live, mutually-scanned
+     *  chat.) Counts a joined member who is neither me nor the server bot. */
+    private suspend fun peerJoined(r: Room): Boolean {
+        // Prefer the cached member list; but on a fresh device the cache is empty
+        // until the first networked fetch — and for a *federated* room (one hosted
+        // on the peer's box, e.g. when they created the DM) that networked fetch is
+        // the only way to learn the peer is joined. So when the cached pass finds
+        // nobody, fall through to members() (which fetches over Tor). Without this a
+        // reinstall / second device would never re-surface an existing chat.
+        if (scanForJoinedPeer(runCatching { r.membersNoSync() }.getOrNull())) return true
+        return scanForJoinedPeer(runCatching { r.members() }.getOrNull())
+    }
+
+    /** True if [iter] yields a joined member who is neither me nor the server bot. */
+    private fun scanForJoinedPeer(iter: org.matrix.rustcomponents.sdk.RoomMembersIterator?): Boolean {
+        if (iter == null) return false
+        while (true) {
+            val chunk = runCatching { iter.nextChunk(64u) }.getOrNull()
+            if (chunk.isNullOrEmpty()) break
+            for (m in chunk) {
+                if (m.userId == userId || isServerBot(m.userId)) continue
+                if (m.membership is MembershipState.Join) return true
             }
         }
-        scope.launch { checkNotifs() }
+        return false
+    }
+
+    /** Rebuild the chat list with accurate per-room state (incl. the bot-aware
+     *  paired check). Runs in a coroutine; assigns `rooms` once when done. */
+    private suspend fun rebuildRooms() {
+        val handles = synchronized(roomHandles) { roomHandles.values.toList() }
+        rooms.value = handles.map { r ->
+            val mem = runCatching { r.membership() }.getOrNull()
+            val (preview, ts) = latestPreview(r)
+            RoomSummary(
+                r.id(), roomName(r),
+                invited = mem == Membership.INVITED,
+                // a live conversation = I'm in AND the human peer is in too — which
+                // only happens once both have scanned each other.
+                paired = mem == Membership.JOINED && peerJoined(r),
+                preview = preview,
+                ts = ts,
+            )
+        // Invites first (actionable), then most-recently-active chats on top.
+        }.sortedWith(compareByDescending<RoomSummary> { it.invited }.thenByDescending { it.ts })
+        Log.i(TAG, "rebuildRooms: ${rooms.value.size} rooms (" +
+            "${rooms.value.count { it.paired }} paired, ${rooms.value.count { it.invited }} invited)")
+    }
+
+    /** Cheap refresh of just the chat-list previews + timestamps (and re-sort) from the
+     *  cached latest events — no membership re-fetch. Keeps the list current when a new
+     *  message arrives to a room that doesn't reorder. Preserves name/paired/invited. */
+    private suspend fun refreshPreviews() {
+        val current = rooms.value
+        if (current.isEmpty()) return
+        val handles = synchronized(roomHandles) { LinkedHashMap(roomHandles) }
+        var changed = false
+        val updated = current.map { rs ->
+            val r = handles[rs.id] ?: return@map rs
+            val (preview, ts) = latestPreview(r)
+            if (preview != rs.preview || ts != rs.ts) { changed = true; rs.copy(preview = preview, ts = ts) } else rs
+        }
+        if (changed) rooms.value =
+            updated.sortedWith(compareByDescending<RoomSummary> { it.invited }.thenByDescending { it.ts })
+    }
+
+    /** A short preview (text + timestamp ms) of a room's latest event, for the chat
+     *  list. Mirrors the chat bubble's attachment icons; prefixes own messages with
+     *  "You: ". Returns (null, 0) when there's nothing to show. */
+    private suspend fun latestPreview(room: Room): Pair<String?, Long> {
+        val lev = runCatching { room.latestEvent() }.getOrNull() ?: return null to 0L
+        val remote = lev as? LatestEventValue.Remote ?: return null to tsOf(lev)
+        val text = when (val c = remote.content) {
+            is TimelineItemContent.MsgLike -> {
+                val k = c.content.kind
+                if (k is MsgLikeKind.Message) {
+                    val mc = k.content
+                    val body = when (val mt = mc.msgType) {
+                        is org.matrix.rustcomponents.sdk.MessageType.File ->
+                            "📎 ${mt.content.filename ?: mc.body}"
+                        is org.matrix.rustcomponents.sdk.MessageType.Image ->
+                            "🖼️ ${mt.content.filename ?: mc.body}"
+                        is org.matrix.rustcomponents.sdk.MessageType.Video -> "🎞️ ${mc.body}"
+                        is org.matrix.rustcomponents.sdk.MessageType.Audio -> "🎵 ${mc.body}"
+                        else -> mc.body.replace("\n", " ").trim()
+                    }
+                    if (remote.isOwn) "You: $body" else body
+                } else null
+            }
+            is TimelineItemContent.RtcNotification, is TimelineItemContent.CallInvite -> "📞 Call"
+            else -> null
+        }
+        return text to tsOf(lev)
     }
 
     /** Look at each room's latest event and emit a notification for anything new
@@ -232,6 +511,32 @@ object MatrixRepo {
     private suspend fun checkNotifs() {
         val handles = synchronized(roomHandles) { LinkedHashMap(roomHandles) }
         for ((id, room) in handles) {
+            // Incoming-call detection: a peer has an active room call. Ring once on
+            // the transition; fire callEnded when it stops (so a ringing callee
+            // dismisses if the caller gives up). hasActiveRoomCall reflects the
+            // m.call.member state, which federates over Tor.
+            runCatching {
+                val parts = if (room.hasActiveRoomCall()) room.activeRoomCallParticipants() else emptyList()
+                val peerInCall = parts.any { it != userId && !isServerBot(it) }
+                // Multi-device: if MY account is already in the call (this device or
+                // another of my devices answered), don't ring — and stop any ring in
+                // progress. So all my devices ring, and answering on one silences the rest.
+                val meInCall = parts.any { it == userId }
+                val shouldRing = peerInCall && !meInCall
+                if (shouldRing && activeCallRooms.add(id)) {
+                    Log.i(TAG, "ring START for $id (peerInCall=$peerInCall meInCall=$meInCall parts=${parts.size})")
+                    if (notifyArmed && id != currentRoomId) {
+                        val who = roomName(room)
+                        notifications.emit(Notif(id, who, "📞 Incoming call", "$who is calling — over Tor", isCall = true))
+                    }
+                } else if (!shouldRing && activeCallRooms.remove(id)) {
+                    // Distinguish the two stop reasons: meInCall=true means I (this or
+                    // another of my devices) answered; peerInCall=false means the caller
+                    // gave up. This is what proves the multi-device silence-on-answer.
+                    Log.i(TAG, "ring STOP for $id (reason=${if (meInCall) "answered-elsewhere" else "peer-left"} peerInCall=$peerInCall meInCall=$meInCall)")
+                    callEnded.emit(id)   // peer left, or I answered (here or on another device)
+                }
+            }
             val lev = runCatching { room.latestEvent() }.getOrNull() ?: continue
             val key = keyOf(lev) ?: continue
             if (lastSeen[id] == key) continue          // already handled this event
@@ -258,7 +563,7 @@ object MatrixRepo {
     }
 
     private fun toNotif(id: String, room: Room, lev: LatestEventValue): Notif? {
-        val name = prettyName(runCatching { room.displayName() }.getOrNull(), id)
+        val name = roomName(room)
         return when (lev) {
             is LatestEventValue.Remote -> {
                 if (lev.isOwn) return null
@@ -283,6 +588,25 @@ object MatrixRepo {
         }
     }
 
+    /** The name to show for a room. For a 1:1 DM that's the *other person*: the
+     *  SDK's `heroes` are the non-self members the server summarised for the room,
+     *  so for alice↔bob this resolves to "bob" on alice's phone and "alice" on
+     *  bob's. Falls back to the room's own display name for non-DM / unsummarised
+     *  rooms. Cross-box the peer's profile name often isn't replicated, so we use
+     *  their matrix-id localpart (which is exactly their username). */
+    private fun roomName(r: Room): String {
+        val hero = runCatching { r.heroes() }.getOrDefault(emptyList())
+            .firstOrNull { it.userId != userId && !isServerBot(it.userId) }
+        if (hero != null) {
+            val dn = hero.displayName?.trim().orEmpty()
+            if (dn.isNotBlank() && !dn.startsWith("@") && !dn.contains(".onion")
+                && !Regex("^[a-z2-7]{40,}").containsMatchIn(dn)) return dn
+            val local = hero.userId.removePrefix("@").substringBefore(":")
+            if (local.isNotBlank()) return local
+        }
+        return prettyName(runCatching { r.displayName() }.getOrNull(), r.id())
+    }
+
     /** Turn whatever the SDK hands back into something a human wants to read.
      *  Unnamed/system rooms otherwise leak a room id or a raw onion string. */
     private fun prettyName(raw: String?, id: String): String {
@@ -300,17 +624,19 @@ object MatrixRepo {
         messages.value = emptyList()
         val room = runCatching { rls.room(roomId) }.getOrNull()
             ?: roomHandles[roomId] ?: error("room not found")
-        // Accept an invite transparently: a contact who scanned your code invited
-        // you — tapping the chat should just join it (over Tor), no extra step.
-        if (runCatching { room.membership() == Membership.INVITED }.getOrDefault(false)) {
-            status.value = "Joining over Tor…"
-            runCatching { room.join() }
-        }
+        // NB: no auto-join here. Accepting a contact (joining the room) only happens
+        // by scanning the other person's code — the mutual-consent rule. The chat
+        // list routes a tap on an incoming request to the scanner instead of here.
+        // Tear down the previous room's timeline subscription before opening another,
+        // or the old TaskHandle leaks and stale diffs keep mutating timelineItems.
+        runCatching { timelineHandle?.cancel() }
+        timelineHandle = null
+        runCatching { timeline?.destroy() }
         currentRoom = room
         currentRoomId = roomId
         val tl = room.timeline()
         timeline = tl
-        tl.addListener(object : TimelineListener {
+        timelineHandle = tl.addListener(object : TimelineListener {   // HOLD the handle
             override fun onUpdate(diff: List<TimelineDiff>) {
                 applyTimelineDiffs(diff)
             }
@@ -345,11 +671,38 @@ object MatrixRepo {
         if (content is TimelineItemContent.MsgLike) {
             val kind = content.content.kind
             if (kind is MsgLikeKind.Message) {
-                val body = kind.content.body
+                val mc = kind.content
                 val sender = ev.sender
                 val key = runCatching { ev.eventOrTransactionId.toString() }
-                    .getOrDefault("$sender:$body:${System.identityHashCode(this)}")
-                return ChatMsg(key, sender, body, sender == me)
+                    .getOrDefault("$sender:${mc.body}:${System.identityHashCode(this)}")
+                val ts = runCatching { ev.timestamp.toLong() }.getOrDefault(0L)
+                // Attachments render as a tappable chip carrying the media source.
+                var text = mc.body; var media: org.matrix.rustcomponents.sdk.MediaSource? = null
+                var fileName: String? = null; var mime: String? = null; var isImage = false
+                when (val mt = mc.msgType) {
+                    is org.matrix.rustcomponents.sdk.MessageType.File ->
+                        { media = mt.content.source; fileName = mt.content.filename ?: mc.body; mime = mt.content.info?.mimetype; text = "📎 $fileName" }
+                    is org.matrix.rustcomponents.sdk.MessageType.Image ->
+                        { media = mt.content.source; fileName = mt.content.filename ?: mc.body; mime = "image/*"; isImage = true; text = "🖼️ $fileName" }
+                    is org.matrix.rustcomponents.sdk.MessageType.Video ->
+                        { media = mt.content.source; fileName = mc.body; text = "🎞️ ${mc.body}" }
+                    is org.matrix.rustcomponents.sdk.MessageType.Audio ->
+                        { media = mt.content.source; fileName = mc.body; text = "🎵 ${mc.body}" }
+                    else -> {}
+                }
+                return ChatMsg(key, sender, text, sender == me, ts, media, fileName, mime, isImage)
+            }
+            // An event we received but can't decrypt (missing the megolm room key —
+            // e.g. the sender used a new device whose key never reached us). Surface a
+            // placeholder instead of silently dropping it, and log the session id so we
+            // can tell "didn't arrive" apart from "arrived but undecryptable".
+            if (kind is MsgLikeKind.UnableToDecrypt) {
+                val sender = ev.sender
+                val ts = runCatching { ev.timestamp.toLong() }.getOrDefault(0L)
+                val sid = (kind.msg as? EncryptedMessage.MegolmV1AesSha2)?.sessionId
+                Log.w(TAG, "UTD event from $sender ts=$ts session=$sid")
+                val key = runCatching { ev.eventOrTransactionId.toString() }.getOrDefault("utd:$sender:$ts")
+                return ChatMsg(key, sender, "🔒 Can't decrypt this message", sender == me, ts)
             }
         }
         return null
@@ -360,30 +713,221 @@ object MatrixRepo {
         tl.send(messageEventContentFromMarkdown(text))
     }
 
-    /** Start a direct, end-to-end-encrypted chat with another user (@user:onion),
-     *  inviting them. Returns the room id. Reuses an existing DM with that user if
-     *  one already exists (no duplicate rooms from scanning twice). Federates the
-     *  invite over Tor. */
-    suspend fun startChat(userId: String): String {
-        val c = client ?: error("not logged in")
-        // dedup: if we already share a DM with this person, open it.
-        runCatching { c.getDmRoom(userId) }.getOrNull()?.let { return it.id() }
-        val params = CreateRoomParameters(
-            name = null,
-            topic = null,
-            isEncrypted = true,          // E2EE on — the SDK manages keys
-            isDirect = true,
-            visibility = RoomVisibility.Private,
-            preset = RoomPreset.TRUSTED_PRIVATE_CHAT,
-            invite = listOf(userId),
-            avatar = null,
-            powerLevelContentOverride = null,
-            joinRuleOverride = null,
-            historyVisibilityOverride = null,
-            canonicalAlias = null,
-            isSpace = false,
+    /** Send a file/attachment from a content URI — uploaded E2EE by the SDK and
+     *  federated over Tor. Copies the picked content to a cache file first because
+     *  the SDK's UploadSource needs a real path. */
+    suspend fun sendFile(ctx: Context, uri: android.net.Uri) {
+        val tl = timeline ?: return
+        val cr = ctx.contentResolver
+        // Keep only the basename — the SDK uses the file's basename as the displayed
+        // filename, so stash the copy in a unique subdir under that clean name.
+        val name = (queryDisplayName(cr, uri) ?: "file").substringAfterLast('/').ifBlank { "file" }
+        val mime = cr.getType(uri) ?: "application/octet-stream"
+        val dir = File(ctx.cacheDir, "pp_up/${System.currentTimeMillis()}").apply { mkdirs() }
+        val tmp = File(dir, name)
+        runCatching { cr.openInputStream(uri)?.use { i -> tmp.outputStream().use { o -> i.copyTo(o) } } }
+        if (!tmp.exists() || tmp.length() == 0L) { runCatching { dir.deleteRecursively() }; return }
+        // UploadParameters(source, caption, formattedCaption, mentions, inReplyTo) —
+        // the trailing arg is a reply event-id, NOT the filename. Pass null or the SDK
+        // throws InvalidRepliedToEventId. The filename rides on UploadSource.File's path.
+        val params = org.matrix.rustcomponents.sdk.UploadParameters(
+            org.matrix.rustcomponents.sdk.UploadSource.File(tmp.absolutePath), null, null, null, null
         )
-        return c.createRoom(params)
+        val info = org.matrix.rustcomponents.sdk.FileInfo(mime, tmp.length().toULong(), null, null)
+        runCatching { tl.sendFile(params, info).join() }.onFailure { Log.e(TAG, "sendFile failed", it) }
+        runCatching { dir.deleteRecursively() }
+    }
+
+    /** Download an attachment over Tor and save it to the device's Downloads. */
+    suspend fun saveAttachment(ctx: Context, media: org.matrix.rustcomponents.sdk.MediaSource, name: String, mime: String?): Boolean {
+        val c = client ?: return false
+        val bytes = runCatching { c.getMediaContent(media) }.getOrNull() ?: return false
+        return runCatching {
+            if (android.os.Build.VERSION.SDK_INT >= 29) {
+                val v = android.content.ContentValues().apply {
+                    put(android.provider.MediaStore.Downloads.DISPLAY_NAME, name)
+                    put(android.provider.MediaStore.Downloads.MIME_TYPE, mime ?: "application/octet-stream")
+                }
+                val u = ctx.contentResolver.insert(android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, v)
+                    ?: return false
+                ctx.contentResolver.openOutputStream(u)!!.use { it.write(bytes) }
+            } else {
+                val dir = ctx.getExternalFilesDir(android.os.Environment.DIRECTORY_DOWNLOADS)
+                File(dir, name).outputStream().use { it.write(bytes) }
+            }
+            true
+        }.getOrDefault(false)
+    }
+
+    private fun queryDisplayName(cr: android.content.ContentResolver, uri: android.net.Uri): String? =
+        runCatching {
+            cr.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cur ->
+                if (cur.moveToFirst() && cur.columnCount > 0) cur.getString(0) else null
+            }
+        }.getOrNull()
+
+    /** Load our recorded consent (scanned-contact onions) from account data into
+     *  memory, so consent survives an app restart. Best-effort. */
+    private suspend fun loadConsent() {
+        val c = client ?: return
+        val raw = runCatching { c.accountData(PAIR_ACCOUNT_DATA) }.getOrNull() ?: return
+        runCatching {
+            val arr = org.json.JSONObject(raw).optJSONArray("onions") ?: return
+            for (i in 0 until arr.length()) consentedOnions.add(arr.getString(i))
+        }
+    }
+
+    /** Record consent for a scanned contact: remember their box's onion (the server
+     *  part of their @id) in account data. Our box's desktop app reads this and
+     *  allowlists the onion for federation — so scanning their QR pairs the boxes. */
+    private suspend fun recordPairing(peerUserId: String) {
+        val c = client ?: return
+        val onion = peerUserId.substringAfter(":", "").trim()
+        if (!onion.endsWith(".onion")) { Log.w(TAG, "recordPairing: '$onion' is not an onion"); return }
+        if (onion in consentedOnions) return   // already recorded AND persisted
+        // Build the new set (existing server value ∪ what we know ∪ this onion).
+        val set = linkedSetOf<String>()
+        runCatching { c.accountData(PAIR_ACCOUNT_DATA) }.getOrNull()?.let { raw ->
+            runCatching {
+                org.json.JSONObject(raw).optJSONArray("onions")?.let { a ->
+                    for (i in 0 until a.length()) set.add(a.getString(i))
+                }
+            }
+        }
+        set.addAll(consentedOnions)
+        set.add(onion)
+        val json = org.json.JSONObject().put("onions", org.json.JSONArray(set.toList())).toString()
+        // The write goes to our box over Tor, which can be flaky and reqwest caches
+        // a failed connect — so retry. Only mark consent once it actually persisted,
+        // otherwise a failed write would silently never reach the box's allowlist.
+        for (attempt in 1..8) {
+            val r = runCatching { c.setAccountData(PAIR_ACCOUNT_DATA, json) }
+            if (r.isSuccess) {
+                consentedOnions.addAll(set)
+                Log.i(TAG, "recordPairing: persisted $onion (attempt $attempt)")
+                return
+            }
+            Log.w(TAG, "recordPairing: write attempt $attempt failed: ${r.exceptionOrNull()?.message}")
+            kotlinx.coroutines.delay(3000)
+        }
+        Log.e(TAG, "recordPairing: gave up persisting $onion after retries")
+    }
+
+    /** Auto-accept incoming invites from contacts we've ALSO scanned: mutual consent
+     *  is satisfied, so the chat goes live without any extra tap. An invite from
+     *  someone we haven't scanned is left pending (shown as "scan their code"). */
+    private suspend fun autoAcceptMutual() {
+        val c = client ?: return
+        val handles = synchronized(roomHandles) { roomHandles.values.toList() }
+        for (r in handles) {
+            val invited = runCatching { r.membership() == Membership.INVITED }.getOrDefault(false)
+            if (!invited) continue
+            val inviter = runCatching { r.inviter() }.getOrNull()?.userId ?: continue
+            val onion = inviter.substringAfter(":", "")
+            if (onion in consentedOnions) {
+                runCatching { c.joinRoomById(r.id()) }
+            }
+        }
+    }
+
+    /** Find a room we've been INVITED to whose inviter is [peer] — a DM the peer
+     *  created and is waiting for us to join. Lets a mutual QR-scan converge on the
+     *  peer's room instead of spawning a competing one. */
+    private suspend fun findInviteFrom(peer: String): String? {
+        val handles = synchronized(roomHandles) { roomHandles.values.toList() }
+        for (r in handles) {
+            val invited = runCatching { r.membership() == Membership.INVITED }.getOrDefault(false)
+            if (!invited) continue
+            val inviter = runCatching { r.inviter() }.getOrNull()?.userId
+            if (inviter == peer) return r.id()
+        }
+        return null
+    }
+
+    /** Act on a scanned/typed contact (@user:onion). Mutual consent: a conversation
+     *  only goes live once BOTH people have scanned each other. Scanning does two
+     *  things — records consent (so our box allowlists their onion for federation,
+     *  and we'll auto-accept their invite) and, for one side, sends the invite.
+     *
+     *  Returns [ConnectResult] — `paired=true` means it's live now (they'd already
+     *  scanned us), `paired=false` means pending until they scan back. Exactly ONE
+     *  room is ever created, with no race: the lexicographically smaller user id is
+     *  the sole creator; the larger never creates — it just waits and auto-joins the
+     *  invite once it federates over Tor (see [autoAcceptMutual]). Federates over Tor. */
+    suspend fun startChat(userId: String): ConnectResult {
+        val c = client ?: error("not logged in")
+        val me = this.userId
+        // Record consent in the background: our box's desktop reads this account data
+        // and allowlists their onion (the box-pairing half of a QR exchange). It can
+        // retry over flaky Tor without blocking the UI; once it lands we re-run the
+        // mutual-accept pass in case their invite is already waiting.
+        scope.launch { recordPairing(userId); autoAcceptMutual(); rebuildRooms() }
+        // 1. Already share a LIVE DM (both joined)? reuse it. (A room the peer has
+        //    left doesn't count — peerJoined excludes the bot and left members.)
+        val dms = runCatching { c.getDmRooms(userId) }.getOrDefault(emptyList())
+        dms.firstOrNull { peerJoined(it) }?.let { return ConnectResult(it.id(), true) }
+        // 2. The peer already invited us → join → both in → live (mutual).
+        findInviteFrom(userId)?.let { rid ->
+            runCatching { c.joinRoomById(rid) }
+            return ConnectResult(rid, true)
+        }
+        // 3. No invite yet. The smaller id creates + invites; the larger id creates
+        //    nothing (avoids a duplicate room) and waits — when the smaller's invite
+        //    federates over Tor, autoAcceptMutual joins it (we've consented). Either
+        //    way the chat goes live only once both have scanned.
+        if (me < userId) {
+            // Reuse a DM we already created for this peer if one exists (so a re-scan
+            // doesn't spawn another room), else make one. Either way (re)invite the
+            // peer separately with retry: a remote invite only sticks once their box
+            // has allowlisted us (a few seconds after they scan us), so createRoom's
+            // one-shot invite would fail silently and never recover.
+            val rid = dms.firstOrNull {
+                runCatching { it.membership() == Membership.JOINED }.getOrDefault(false)
+            }?.id() ?: c.createRoom(
+                CreateRoomParameters(
+                    name = null,
+                    topic = null,
+                    isEncrypted = true,          // E2EE on — the SDK manages keys
+                    isDirect = true,
+                    visibility = RoomVisibility.Private,
+                    preset = RoomPreset.TRUSTED_PRIVATE_CHAT,
+                    invite = emptyList(),
+                    avatar = null,
+                    powerLevelContentOverride = null,
+                    joinRuleOverride = null,
+                    historyVisibilityOverride = null,
+                    canonicalAlias = null,
+                    isSpace = false,
+                )
+            )
+            scope.launch { ensureInvited(rid, userId) }
+            return ConnectResult(rid, false)
+        }
+        // larger id: nothing to create; their invite will arrive and auto-join.
+        return ConnectResult("", false)
+    }
+
+    /** (Re)invite [peer] to [roomId] until the invite sticks. Federated invites only
+     *  succeed once the peer's box has allowlisted us — which happens a few seconds
+     *  after they scan us — so retry over Tor instead of failing once and giving up. */
+    private suspend fun ensureInvited(roomId: String, peer: String) {
+        val c = client ?: return
+        for (attempt in 1..24) {
+            val room = runCatching { c.getRoom(roomId) }.getOrNull()
+            if (room != null) {
+                val present = runCatching {
+                    when (room.member(peer).membership) {
+                        is MembershipState.Join, is MembershipState.Invite -> true
+                        else -> false
+                    }
+                }.getOrDefault(false)
+                if (present) { Log.i(TAG, "ensureInvited: $peer present in $roomId (attempt $attempt)"); return }
+                val r = runCatching { room.inviteUserById(peer) }
+                if (r.isFailure) Log.w(TAG, "ensureInvited attempt $attempt: ${r.exceptionOrNull()?.message}")
+            }
+            kotlinx.coroutines.delay(6000)
+        }
+        Log.e(TAG, "ensureInvited: gave up inviting $peer to $roomId")
     }
 
     /** Sign out: best-effort server logout, then wipe the local session so the
@@ -391,7 +935,10 @@ object MatrixRepo {
     suspend fun logout(ctx: Context) {
         runCatching { syncService?.stop() }
         runCatching { client?.logout() }
-        ctx.getSharedPreferences("pp_session", Context.MODE_PRIVATE).edit().clear().apply()
+        runCatching { sessionPrefs(ctx).edit().clear().apply() }
+        runCatching { ctx.getSharedPreferences(SESSION_OLD, Context.MODE_PRIVATE).edit().clear().apply() }
+        runCatching { timelineHandle?.cancel() }
+        timelineHandle = null; roomListResult = null; roomList = null
         client = null; syncService = null; roomListService = null; timeline = null
         currentRoom = null; currentRoomId = null; userId = ""; deviceId = ""
         roomHandles.clear(); timelineItems.clear()

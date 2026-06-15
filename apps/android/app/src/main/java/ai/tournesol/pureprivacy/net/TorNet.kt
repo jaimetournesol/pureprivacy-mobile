@@ -37,15 +37,23 @@ object TorNet {
     })
     private fun trustAllCtx() = SSLContext.getInstance("TLS").apply { init(null, trustAll, SecureRandom()) }
 
-    /** OkHttp reaching the onion over Tor's HTTP tunnel (CONNECT => remote DNS),
-     *  trusting the box's self-signed onion certs. */
-    private fun torClient(httpProxyPort: Int): OkHttpClient =
-        OkHttpClient.Builder()
+    /** OkHttp over Tor's HTTP tunnel (CONNECT => remote DNS). [trustAllCerts] is for
+     *  the box's self-signed .onion endpoints only — the .onion IS the auth there.
+     *  For CLEARNET hosts (call.element.io, reached over a Tor circuit whose exit is
+     *  an untrusted MITM) we keep NORMAL CA validation, so a hostile exit can't swap
+     *  the Element Call bundle. */
+    private fun torClient(httpProxyPort: Int, trustAllCerts: Boolean): OkHttpClient {
+        val b = OkHttpClient.Builder()
             .proxy(Proxy(Proxy.Type.HTTP, InetSocketAddress("127.0.0.1", httpProxyPort)))
-            .sslSocketFactory(trustAllCtx().socketFactory, trustAll[0] as X509TrustManager)
-            .hostnameVerifier { _, _ -> true }
             .retryOnConnectionFailure(true)
-            .build()
+        if (trustAllCerts) {
+            b.sslSocketFactory(trustAllCtx().socketFactory, trustAll[0] as X509TrustManager)
+                .hostnameVerifier { _, _ -> true }
+        }
+        return b.build()
+    }
+
+    private fun isOnion(s: String) = s.contains(".onion")
 
     private val started = HashMap<Int, Any>()
 
@@ -53,7 +61,7 @@ object TorNet {
      *  the WebView's shouldInterceptRequest to serve .onion requests Chromium would
      *  otherwise block (e.g. server-name /.well-known discovery). */
     fun fetchRewritten(url: String, httpProxyPort: Int, rewrites: Map<String, String>): Triple<String, Int, ByteArray> {
-        val client = torClient(httpProxyPort)
+        val client = torClient(httpProxyPort, isOnion(url))
         client.newCall(Request.Builder().url(url).get().build()).execute().use { resp ->
             var text = resp.body?.string() ?: ""
             for ((a, b) in rewrites) text = text.replace(a, b)
@@ -69,7 +77,8 @@ object TorNet {
      *  in-page (e.g. force WebRTC media through a localhost TURN bridge over Tor). */
     fun startHttpProxy(localPort: Int, onionBase: String, httpProxyPort: Int, rewrites: Map<String, String>, injectHtml: String? = null) {
         if (started.containsKey(localPort)) return
-        val client = torClient(httpProxyPort)
+        // CA-validate clearnet (call.element.io); trust-all only for the self-signed onion.
+        val client = torClient(httpProxyPort, isOnion(onionBase))
         val server = object : NanoHTTPD("127.0.0.1", localPort) {
             override fun serve(session: IHTTPSession): Response {
                 if (session.method == Method.OPTIONS) {
@@ -167,6 +176,20 @@ object TorNet {
             }
         }
         Log.i(TAG, "tcp forwarder 127.0.0.1:$localPort -> :$onionPort (dynamic onion)")
+    }
+
+    /** Tear down every local bridge/forwarder started for a call. Called when the
+     *  call activity is destroyed so the loopback listeners + their Tor circuits
+     *  don't linger (and so the next call starts them fresh). */
+    fun stopAll() {
+        val items = synchronized(started) { val v = started.values.toList(); started.clear(); v }
+        for (v in items) runCatching {
+            when (v) {
+                is NanoHTTPD -> v.stop()
+                is ServerSocket -> v.close()
+            }
+        }
+        Log.i(TAG, "stopAll: tore down ${items.size} bridges")
     }
 
     private fun tcpBridge(client: Socket, host: String, port: Int, socksPort: Int) {
