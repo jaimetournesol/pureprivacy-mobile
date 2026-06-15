@@ -40,6 +40,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.runtime.produceState
+import ai.tournesol.pureprivacy.matrix.MatrixRepo
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
@@ -524,6 +530,13 @@ fun ProfileScreen(vm: AppViewModel) {
             val err by vm.error.collectAsState()
             if (busy) { Spacer(Modifier.height(14.dp)); CircularProgressIndicator(color = Sunflower) }
             if (err != null) { Spacer(Modifier.height(12.dp)); Text(err!!, color = Color(0xFFE5534B), fontSize = 13.sp, textAlign = TextAlign.Center) }
+
+            Spacer(Modifier.height(36.dp))
+            Text(
+                "🔒 No telemetry, no analytics, no trackers.\nNothing leaves your phone but your messages — end-to-end encrypted, over Tor, to your own box.",
+                color = PaperDim, fontSize = 12.sp, textAlign = TextAlign.Center,
+                lineHeight = 17.sp
+            )
         }
     }
 }
@@ -621,7 +634,30 @@ private fun Bubble(m: ChatMsg, onAttachment: () -> Unit = {}) {
                 .then(if (isAttachment) Modifier.clickable { onAttachment() } else Modifier)
                 .padding(horizontal = 14.dp, vertical = 9.dp)
         ) {
-            if (isAttachment) {
+            if (m.isImage && m.media != null) {
+                // Inline thumbnail: fetch the image bytes over Tor (cached by key) and
+                // render them; fall back to the chip while loading / on failure.
+                val bmp by produceState<ImageBitmap?>(null, m.key) {
+                    value = withContext(Dispatchers.IO) {
+                        MatrixRepo.mediaBytes(m.key, m.media!!)?.let { b ->
+                            runCatching { android.graphics.BitmapFactory.decodeByteArray(b, 0, b.size)?.asImageBitmap() }.getOrNull()
+                        }
+                    }
+                }
+                val img = bmp
+                if (img != null) {
+                    Column {
+                        Image(img, m.fileName ?: "image", contentScale = ContentScale.Fit,
+                            modifier = Modifier.widthIn(max = 240.dp).clip(RoundedCornerShape(12.dp)))
+                        Text("Tap to save", color = PaperDim, fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp))
+                    }
+                } else {
+                    Column {
+                        Text(m.body, color = Paper, fontSize = 15.sp)
+                        Text("Loading over Tor…", color = PaperDim, fontSize = 11.sp, modifier = Modifier.padding(top = 2.dp))
+                    }
+                }
+            } else if (isAttachment) {
                 Column {
                     Text(m.body, color = Paper, fontSize = 15.sp)
                     Text("Tap to save", color = PaperDim, fontSize = 11.sp, modifier = Modifier.padding(top = 2.dp))

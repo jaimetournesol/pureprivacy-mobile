@@ -751,9 +751,26 @@ object MatrixRepo {
         val params = org.matrix.rustcomponents.sdk.UploadParameters(
             org.matrix.rustcomponents.sdk.UploadSource.File(tmp.absolutePath), null, null, null, null
         )
+        // Send everything as a generic file (reliable). NB: sending as m.image via
+        // Timeline.sendImage currently throws RoomException.InvalidAttachmentData on
+        // sdk-android 26.06.11 — to revisit. Incoming m.image events still render
+        // inline (see toChatMsg/Bubble), e.g. from an Element client.
         val info = org.matrix.rustcomponents.sdk.FileInfo(mime, tmp.length().toULong(), null, null)
         runCatching { tl.sendFile(params, info).join() }.onFailure { Log.e(TAG, "sendFile failed", it) }
         runCatching { dir.deleteRecursively() }
+    }
+
+    private val mediaCache = java.util.concurrent.ConcurrentHashMap<String, ByteArray>()
+
+    /** Fetch an attachment's bytes over Tor, cached by message key — used to render
+     *  inline image thumbnails without re-downloading on every recomposition. */
+    suspend fun mediaBytes(key: String, media: org.matrix.rustcomponents.sdk.MediaSource): ByteArray? {
+        mediaCache[key]?.let { return it }
+        val c = client ?: return null
+        val bytes = runCatching { c.getMediaContent(media) }.getOrNull() ?: return null
+        if (mediaCache.size > 60) mediaCache.clear()   // crude bound; fine at chat scale
+        mediaCache[key] = bytes
+        return bytes
     }
 
     /** Download an attachment over Tor and save it to the device's Downloads. */
