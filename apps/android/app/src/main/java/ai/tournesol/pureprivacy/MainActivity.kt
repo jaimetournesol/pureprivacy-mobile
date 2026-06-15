@@ -68,7 +68,22 @@ import com.journeyapps.barcodescanner.ScanOptions
 
 class MainActivity : ComponentActivity() {
     private val vm: AppViewModel by viewModels()
-    private val notifPerm = registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
+    private val perms = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {}
+
+    /** Ask for everything a call needs (mic + camera) plus notifications, up front —
+     *  without these granted the Element Call WebView's getUserMedia throws
+     *  NotReadableError and the call dies with "Something went wrong". */
+    private fun requestCorePermissions() {
+        val want = mutableListOf(
+            android.Manifest.permission.RECORD_AUDIO,
+            android.Manifest.permission.CAMERA,
+        )
+        if (Build.VERSION.SDK_INT >= 33) want += android.Manifest.permission.POST_NOTIFICATIONS
+        val ask = want.filter {
+            checkSelfPermission(it) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        }
+        if (ask.isNotEmpty()) perms.launch(ask.toTypedArray())
+    }
 
     // Foreground = snappy backstop poll + live previews; background = gentle poll
     // (sliding sync still delivers in real time — this only changes wake cadence).
@@ -80,10 +95,7 @@ class MainActivity : ComponentActivity() {
         // Keep the login password, identity QR and recovery info out of screenshots
         // and the Recents thumbnail (release builds only — see applyScreenSecurity).
         applyScreenSecurity()
-        if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) !=
-            android.content.pm.PackageManager.PERMISSION_GRANTED) {
-            notifPerm.launch(android.Manifest.permission.POST_NOTIFICATIONS)
-        }
+        requestCorePermissions()   // mic + camera (for calls) + notifications
         handleNotifIntent(intent)
         setContent {
             PurePrivacyTheme {
