@@ -35,10 +35,12 @@ import androidx.compose.ui.unit.sp
 import androidx.core.app.NotificationManagerCompat
 import androidx.lifecycle.lifecycleScope
 import ai.tournesol.pureprivacy.matrix.MatrixRepo
+import ai.tournesol.pureprivacy.ui.theme.Danger
 import ai.tournesol.pureprivacy.ui.theme.Ink
 import ai.tournesol.pureprivacy.ui.theme.InkCard
 import ai.tournesol.pureprivacy.ui.theme.Paper
 import ai.tournesol.pureprivacy.ui.theme.PaperDim
+import ai.tournesol.pureprivacy.ui.theme.Success
 import ai.tournesol.pureprivacy.ui.theme.Sunflower
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -216,15 +218,23 @@ private fun IncomingCallScreen(caller: String, onAnswer: () -> Unit, onDecline: 
         Spacer(Modifier.height(28.dp))
         Text(caller, color = Paper, fontSize = 26.sp, fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(8.dp))
-        Text("🔒 Incoming call · over Tor", color = PaperDim, fontSize = 14.sp)
+        Text("Incoming call · routed over Tor", color = PaperDim, fontSize = 14.sp)
+        Spacer(Modifier.height(4.dp))
+        // Honest about the crypto: the media is hidden over Tor, but it is NOT yet
+        // end-to-end encrypted between participants (the SFU on the host's box can see
+        // it). No padlock — that would falsely imply E2EE.
+        Text(
+            "Hidden over Tor — voice isn't yet end-to-end encrypted.",
+            color = PaperDim, fontSize = 11.sp, textAlign = androidx.compose.ui.text.style.TextAlign.Center
+        )
         Spacer(Modifier.weight(1f))
         Row(
             Modifier.fillMaxWidth().padding(bottom = 56.dp),
             horizontalArrangement = Arrangement.SpaceEvenly,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            CallAction("Decline", Icons.Filled.CallEnd, Color(0xFFE5534B), onDecline)
-            CallAction("Answer", Icons.Filled.Call, Color(0xFF3FB950), onAnswer)
+            CallAction("Decline", Icons.Filled.CallEnd, Danger, onDecline)
+            CallAction("Answer", Icons.Filled.Call, Success, onAnswer)
         }
     }
 }
