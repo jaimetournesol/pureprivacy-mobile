@@ -120,6 +120,15 @@ object MatrixRepo {
     private var roomList: RoomList? = null
     private var roomListResult: RoomListEntriesWithDynamicAdaptersResult? = null
     private var timelineHandle: TaskHandle? = null
+    // Self-healing sync. The SyncService does NOT restart itself when it faults
+    // (ERROR) or stops (TERMINATED) — which happens on a Tor circuit change, a
+    // network blip, or the box restarting. Left unwatched, the phone silently
+    // stops receiving room/membership updates AND incoming-call (m.call.member)
+    // state until the app is force-killed and relaunched. So we observe its state,
+    // restart it with capped backoff, and reconcile on every recovery. This handle
+    // owns the state-observer stream task (drop it -> the observer stops firing).
+    private var syncStateHandle: TaskHandle? = null
+    @Volatile private var syncRestartDelayMs = 0L
 
     var userId: String = ""
         private set
@@ -354,6 +363,42 @@ object MatrixRepo {
         val ss = c.syncService().finish()
         syncService = ss
         ss.start()
+        // Watch the sync stream and self-heal. RUNNING -> reset backoff + reconcile
+        // any room/pairing/call state that drifted while we were down. ERROR /
+        // TERMINATED -> restart with capped exponential backoff. IDLE/OFFLINE are
+        // SDK-managed (it auto-resumes from OFFLINE when the network returns), so we
+        // don't fight them. Replaces the previous fire-once start() that left the app
+        // stuck on stale state after any interruption (the "needs an app restart" bug).
+        runCatching { syncStateHandle?.cancel() }
+        syncStateHandle = ss.state(object : org.matrix.rustcomponents.sdk.SyncServiceStateObserver {
+            override fun onUpdate(state: org.matrix.rustcomponents.sdk.SyncServiceState) {
+                Log.i(TAG, "syncService state=$state")
+                when (state) {
+                    org.matrix.rustcomponents.sdk.SyncServiceState.RUNNING -> {
+                        syncRestartDelayMs = 0L
+                        if (status.value != "Connected") status.value = "Connected"
+                        scope.launch {
+                            runCatching { autoAcceptMutual() }
+                            runCatching { rebuildRooms() }
+                            runCatching { reconcileCallSubs() }
+                            runCatching { checkNotifs() }
+                        }
+                    }
+                    org.matrix.rustcomponents.sdk.SyncServiceState.ERROR,
+                    org.matrix.rustcomponents.sdk.SyncServiceState.TERMINATED -> {
+                        val delay = syncRestartDelayMs.coerceAtLeast(1000L)
+                        syncRestartDelayMs = (delay * 2).coerceAtMost(30000L)
+                        status.value = "Reconnecting over Tor…"
+                        scope.launch {
+                            kotlinx.coroutines.delay(delay)
+                            Log.i(TAG, "syncService restart after ${delay}ms (was $state)")
+                            runCatching { ss.start() }
+                        }
+                    }
+                    else -> {}   // IDLE / OFFLINE — SDK-managed
+                }
+            }
+        })
         val rls = ss.roomListService()
         roomListService = rls
         val rl = rls.allRooms()
@@ -390,8 +435,16 @@ object MatrixRepo {
                 while (true) {
                     kotlinx.coroutines.delay(if (appForeground) FOREGROUND_POLL_MS else BACKGROUND_POLL_MS)
                     runCatching { checkNotifs() }
-                    // Chat-list previews only matter while the list is on screen.
-                    if (appForeground) runCatching { refreshPreviews() }
+                    // Self-correct room + pairing state even when nothing reordered
+                    // the room list — a peer joining an existing room (-> "paired") or
+                    // an invite still waiting to auto-accept won't always reorder, so
+                    // the room-list listener never fires. autoAcceptMutual is cheap
+                    // (cached membership) and matters even backgrounded, so the chat is
+                    // already live when the app is opened.
+                    runCatching { autoAcceptMutual() }
+                    // The full rebuild (which recomputes "paired" + refreshes previews)
+                    // only matters while the list is on screen.
+                    if (appForeground) runCatching { rebuildRooms() }
                 }
             }
         }
@@ -569,13 +622,41 @@ object MatrixRepo {
         val shouldRing = peerInCall && !meInCall
         if (shouldRing && activeCallRooms.add(id)) {
             Log.i(TAG, "ring START for $id (peerInCall=$peerInCall meInCall=$meInCall parts=${participants.size})")
-            if (notifyArmed && id != currentRoomId) {
+            // Ring even when this very chat is open on screen. The `currentRoomId` guard
+            // is right for MESSAGES (no need to notify about a chat you're reading) but
+            // wrong for CALLS — calling someone who happens to have your conversation
+            // open would otherwise show them nothing. activeCallRooms already dedups to
+            // one ring per call, and clearMyCallMembership() stops the stale-membership
+            // ghost that previously turned an open chat into a phantom perpetual ring.
+            if (notifyArmed) {
                 val who = roomName(room)
                 notifications.emit(Notif(id, who, "📞 Incoming call", "$who is calling — over Tor", isCall = true))
             }
         } else if (!shouldRing && activeCallRooms.remove(id)) {
             Log.i(TAG, "ring STOP for $id (reason=${if (meInCall) "answered-elsewhere" else "peer-left"} peerInCall=$peerInCall meInCall=$meInCall)")
             callEnded.emit(id)   // peer left, or I answered (here or on another device)
+        }
+    }
+
+    /** Retract THIS device's RTC call membership (write an empty `m.call.member` state)
+     *  when we leave a call. Element Call normally manages this, but over flaky Tor /
+     *  an abrupt close the membership can linger — and a stale OWN membership is poison:
+     *  our own `evaluateRoomCall` then reads `meInCall=true` forever, so the next
+     *  incoming call never rings; the peer also sees a ghost participant that makes
+     *  Element Call refuse to start a new call. The state_key is the per-device RTC key
+     *  `_<userId>_<deviceId>_m.call` (matches what Element Call writes). Fire-and-forget
+     *  on the app scope so it still completes after the call activity is destroyed. */
+    fun clearMyCallMembership(roomId: String) {
+        val c = client ?: return
+        val uid = userId; val did = deviceId
+        if (uid.isBlank() || did.isBlank()) return
+        scope.launch {
+            val room = runCatching { c.getRoom(roomId) }.getOrNull() ?: return@launch
+            val stateKey = "_${uid}_${did}_m.call"
+            runCatching {
+                room.sendStateEventRaw("org.matrix.msc3401.call.member", stateKey, "{}")
+            }.onSuccess { Log.i(TAG, "cleared my call membership in $roomId") }
+                .onFailure { Log.w(TAG, "clearMyCallMembership failed: ${it.message}") }
         }
     }
 
@@ -1026,6 +1107,7 @@ object MatrixRepo {
         runCatching { sessionPrefs(ctx).edit().clear().apply() }
         runCatching { ctx.getSharedPreferences(SESSION_OLD, Context.MODE_PRIVATE).edit().clear().apply() }
         runCatching { timelineHandle?.cancel() }
+        runCatching { syncStateHandle?.cancel() }; syncStateHandle = null; syncRestartDelayMs = 0L
         runCatching { callSubs.values.forEach { it.cancel() } }; callSubs.clear()
         timelineHandle = null; roomListResult = null; roomList = null
         client = null; syncService = null; roomListService = null; timeline = null
