@@ -544,6 +544,30 @@ object MatrixRepo {
         return false
     }
 
+    /** A room with no human counterpart — its only members (per the local cache)
+     *  are us + the @conduit server bot (the box's auto-created Admin/control room),
+     *  or it's a stray room we created but never invited anyone to. Such a room must
+     *  NEVER appear as a chat (paired / invited / OUTGOING). Without this guard the
+     *  "pending outgoing" rule (JOINED && !peerJoined) wrongly surfaces the @conduit
+     *  Admin Room as "Pending · waiting for them to scan your code" the moment a user
+     *  signs in — before they've added anyone. Uses the cached member list only: a
+     *  bot-only / empty room is always LOCAL so its members are cached; a federated
+     *  peer room whose cache isn't warm yet is NOT this, so we don't hide it. */
+    private suspend fun lacksHumanPeer(r: Room): Boolean {
+        val iter = runCatching { r.membersNoSync() }.getOrNull() ?: return false
+        var sawAny = false
+        var sawHuman = false
+        while (true) {
+            val chunk = runCatching { iter.nextChunk(64u) }.getOrNull()
+            if (chunk.isNullOrEmpty()) break
+            for (m in chunk) {
+                sawAny = true
+                if (m.userId != userId && !isServerBot(m.userId)) sawHuman = true
+            }
+        }
+        return sawAny && !sawHuman
+    }
+
     /** Rebuild the chat list with accurate per-room state (incl. the bot-aware
      *  paired check). Runs in a coroutine; assigns `rooms` once when done. */
     private suspend fun rebuildRooms() {
@@ -560,7 +584,9 @@ object MatrixRepo {
                 paired = peerIn,
                 // I'm joined but the peer isn't (and they didn't invite me): I scanned
                 // them and I'm waiting for them to scan me back → a pending OUTGOING row.
-                outgoing = mem == Membership.JOINED && !peerIn,
+                // Excludes the box's @conduit Admin Room / stray empty rooms (no human
+                // peer), which must never show as a chat.
+                outgoing = mem == Membership.JOINED && !peerIn && !lacksHumanPeer(r),
                 peerId = peerId(r),
                 preview = preview,
                 ts = ts,
