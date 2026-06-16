@@ -26,9 +26,12 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.AttachFile
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.QrCode
 import androidx.compose.material.icons.filled.QrCode2
 import androidx.compose.material.icons.filled.QrCodeScanner
@@ -60,6 +63,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import ai.tournesol.pureprivacy.matrix.ChatMsg
 import ai.tournesol.pureprivacy.matrix.RoomSummary
+import ai.tournesol.pureprivacy.matrix.SendState
 import ai.tournesol.pureprivacy.tor.TorManager
 import ai.tournesol.pureprivacy.ui.theme.*
 import ai.tournesol.pureprivacy.util.Qr
@@ -130,9 +134,12 @@ class MainActivity : ComponentActivity() {
         handleDeepLink(intent)
     }
 
-    /** A "pureprivacy://contact/@name:onion" link was opened (a camera/QR scanner
-     *  resolved our QR, or someone tapped the link) → hand it to the view model,
-     *  which adds the contact now or once a session is ready. */
+    /** A "pureprivacy://…" link was opened (a camera/QR scanner resolved a QR, or
+     *  someone tapped the link). Two kinds ride this scheme — the desktop's
+     *  "pureprivacy://connect?…" SETUP code and a contact's "pureprivacy:@name:onion"
+     *  address. We hand the raw URI to the view model, which routes by type
+     *  (onDeepLink): a setup code drives the sign-in pre-fill; a contact is added now
+     *  or once a session is ready. */
     private fun handleDeepLink(intent: Intent?) {
         if (intent?.action != Intent.ACTION_VIEW) return
         val data = intent.data ?: return
@@ -163,31 +170,74 @@ private fun scanOptions() = ScanOptions().apply {
     setOrientationLocked(false)
 }
 
+/** The Tor status affordance. When [onRetry] is supplied (the Login/Rooms/Chat
+ *  badges all pass vm::retryTor), a FAILED or stuck badge becomes tappable: it opens
+ *  a tiny sheet that narrates the slowness ("Connecting over Tor can take a moment")
+ *  and offers a retry — turning an inert "Tor: failed" label into a recovery path. */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun TorBadge(modifier: Modifier = Modifier) {
+private fun TorBadge(modifier: Modifier = Modifier, onRetry: (() -> Unit)? = null) {
     val st by TorManager.state.collectAsState()
     val (label, color) = when (val s = st) {
-        is TorManager.State.Ready -> "Tor: connected" to Sunflower
+        // Connected = a steady "you are protected" state → Success green, NOT gold.
+        // Gold is reserved for actionable controls; a secure status shouldn't read as
+        // "tap me". Connecting stays dim, failed stays Danger (those ARE actionable).
+        is TorManager.State.Ready -> "Tor: connected" to Success
         is TorManager.State.Bootstrapping -> "Tor: ${s.percent}% ${s.message}" to PaperDim
-        is TorManager.State.Failed -> "Tor: failed" to Color(0xFFE5534B)
+        is TorManager.State.Failed -> "Tor: failed · tap to retry" to Danger
         else -> "Tor: starting…" to PaperDim
     }
-    Row(modifier, verticalAlignment = Alignment.CenterVertically) {
+    // Only the failed state is actionable (a healthy/booting Tor needs no nudge).
+    val actionable = onRetry != null && st is TorManager.State.Failed
+    var showSheet by remember { mutableStateOf(false) }
+
+    Row(
+        modifier.then(if (actionable) Modifier.clickable { showSheet = true } else Modifier),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
         Icon(Icons.Filled.Lock, null, tint = color, modifier = Modifier.size(14.dp))
         Spacer(Modifier.width(6.dp))
         Text(label, color = color, fontSize = 12.sp)
+    }
+
+    if (showSheet && onRetry != null) {
+        ModalBottomSheet(onDismissRequest = { showSheet = false }, containerColor = InkSoft) {
+            Column(Modifier.fillMaxWidth().padding(start = 24.dp, end = 24.dp, bottom = 28.dp)) {
+                Text("Reconnecting over Tor", color = Paper, fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "Connecting over Tor can take a moment — private, and a little slower, that's the deal. Tap to try again.",
+                    color = PaperDim, fontSize = 13.sp, lineHeight = 18.sp
+                )
+                Spacer(Modifier.height(18.dp))
+                Button(
+                    onClick = { onRetry(); showSheet = false },
+                    colors = ButtonDefaults.buttonColors(containerColor = Sunflower, contentColor = Ink),
+                    modifier = Modifier.fillMaxWidth().height(48.dp),
+                    shape = RoundedCornerShape(14.dp)
+                ) {
+                    Icon(Icons.Filled.Refresh, null); Spacer(Modifier.width(8.dp))
+                    Text("Retry connection", fontWeight = FontWeight.SemiBold)
+                }
+            }
+        }
     }
 }
 
 @Composable
 fun SplashScreen(vm: AppViewModel) {
     val tor by vm.torState.collectAsState()
+    val phase by vm.restorePhase.collectAsState()
+    // While restore is progressing, narrate where we are. A RETURNING user is always
+    // told we're "restoring your session" — never left staring at a frozen splash or
+    // dumped onto a blank login that reads as "I got logged out".
     val status = when (val s = tor) {
         is TorManager.State.Bootstrapping -> if (s.percent > 0) "Connecting over Tor · ${s.percent}%" else "Connecting over Tor…"
-        is TorManager.State.Ready -> "Restoring your chats…"
-        is TorManager.State.Failed -> "Couldn't reach Tor — retrying…"
+        is TorManager.State.Ready -> "Restoring your session…"
+        is TorManager.State.Failed -> "Couldn't reach Tor — keep waiting or try again"
         else -> "Starting Tor…"
     }
+    val slow = phase == AppViewModel.RestorePhase.Slow
     Column(
         Modifier.fillMaxSize().padding(32.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -200,6 +250,34 @@ fun SplashScreen(vm: AppViewModel) {
         CircularProgressIndicator(Modifier.size(28.dp), color = Sunflower, strokeWidth = 3.dp)
         Spacer(Modifier.height(16.dp))
         Text(status, color = PaperDim, fontSize = 14.sp, textAlign = TextAlign.Center)
+
+        // Restore has taken a while (slow Tor, flaky circuit). Surface an explicit,
+        // RECOVERABLE state instead of silently falling through to a blank login:
+        // narrate the slowness, let them keep waiting, retry, or choose to sign in.
+        if (slow) {
+            Spacer(Modifier.height(28.dp))
+            Text(
+                "Still connecting over Tor — this is the slow part.\nPrivate, and a little slower; that's the deal.",
+                color = PaperDim, fontSize = 13.sp, textAlign = TextAlign.Center, lineHeight = 18.sp
+            )
+            Spacer(Modifier.height(18.dp))
+            Button(
+                onClick = { vm.retryRestore() },
+                colors = ButtonDefaults.buttonColors(containerColor = Sunflower, contentColor = Ink),
+                modifier = Modifier.fillMaxWidth().height(50.dp), shape = RoundedCornerShape(14.dp)
+            ) {
+                Icon(Icons.Filled.Refresh, null); Spacer(Modifier.width(8.dp))
+                Text("Try again", fontWeight = FontWeight.SemiBold)
+            }
+            Spacer(Modifier.height(6.dp))
+            // Keep waiting = just leave the splash up (restore is still running in the
+            // background); offered for reassurance that waiting is a valid choice.
+            Text("Keep waiting", color = PaperDim, fontSize = 13.sp)
+            Spacer(Modifier.height(10.dp))
+            TextButton(onClick = { vm.signInInstead() }) {
+                Text("Sign in instead", color = Sunflower, fontSize = 13.sp)
+            }
+        }
     }
 }
 
@@ -208,8 +286,34 @@ fun LoginScreen(vm: AppViewModel) {
     var onion by remember { mutableStateOf("") }
     var user by remember { mutableStateOf("") }
     var pass by remember { mutableStateOf("") }
+    // Reveal the manual onion/username/password fields. Hidden by default so the
+    // primary path is "scan the desktop's setup code" — but a scanned code (which
+    // pre-fills these) opens them automatically, as does "or sign in manually".
+    var manual by remember { mutableStateOf(false) }
     val busy by vm.busy.collectAsState()
     val err by vm.error.collectAsState()
+    // Heads-up after a setup-code scan ("Box found — enter your password…"). The
+    // Login screen has no snackbar host, so we show it inline and clear it on the
+    // next sign-in attempt / new scan.
+    val notice by vm.notice.collectAsState()
+
+    // A scanned/opened "Connect your phone" code pre-fills the box onion + username
+    // (the hard-to-type parts). The password is still the user's to enter — the
+    // QR's token is a pairing nonce, not a login credential (see loginFromConnectUri).
+    val prefill by vm.loginPrefill.collectAsState()
+    LaunchedEffect(prefill) {
+        prefill?.let {
+            onion = it.onion
+            user = it.user
+            manual = true               // show the fields so they can type the password
+            vm.clearLoginPrefill()
+        }
+    }
+
+    // Scan the desktop's "Connect your phone" QR. A setup code routes to
+    // loginFromConnectUri (pre-fill); anything else is handled by onDeepLink, so a
+    // stray contact code scanned here is never misrouted into a chat-with-myself.
+    val scan = rememberScan { contents -> if (contents != null) vm.onDeepLink(contents) }
 
     Column(
         Modifier.fillMaxSize().padding(28.dp).verticalScroll(rememberScrollState()),
@@ -222,31 +326,72 @@ fun LoginScreen(vm: AppViewModel) {
         Text("Private, and a little slower — that's the deal.",
             color = PaperDim, fontSize = 13.sp, textAlign = TextAlign.Center)
         Spacer(Modifier.height(8.dp))
-        TorBadge()
+        TorBadge(onRetry = vm::retryTor)
         Spacer(Modifier.height(28.dp))
 
-        PpField(onion, { onion = it }, "Your box (.onion)")
-        Spacer(Modifier.height(12.dp))
-        PpField(user, { user = it }, "Username")
-        Spacer(Modifier.height(12.dp))
-        PpField(pass, { pass = it }, "Password", password = true)
-        Spacer(Modifier.height(20.dp))
-
+        // Primary affordance: put your box in your pocket by scanning the code the
+        // desktop app shows under "Connect your phone" — no 56-char onion to type.
         Button(
-            onClick = { vm.login(onion, user, pass) },
-            enabled = !busy && onion.isNotBlank() && user.isNotBlank(),
+            onClick = { scan.launch(scanOptions()) },
+            enabled = !busy,
             colors = ButtonDefaults.buttonColors(containerColor = Sunflower, contentColor = Ink),
             modifier = Modifier.fillMaxWidth().height(52.dp),
             shape = RoundedCornerShape(14.dp)
         ) {
-            if (busy) CircularProgressIndicator(Modifier.size(22.dp), color = Ink, strokeWidth = 2.dp)
-            else Text("Connect over Tor", fontWeight = FontWeight.SemiBold)
+            Icon(Icons.Filled.QrCodeScanner, null); Spacer(Modifier.width(8.dp))
+            Text("Scan setup code", fontWeight = FontWeight.SemiBold)
         }
+        Spacer(Modifier.height(14.dp))
+        // Orientation for newcomers: the box lives on their computer.
+        Text(
+            "New here? Your box lives on your computer — set it up in the PurePrivacy desktop app, then sign in here.",
+            color = PaperDim, fontSize = 12.sp, textAlign = TextAlign.Center, lineHeight = 17.sp
+        )
+
+        if (!manual) {
+            Spacer(Modifier.height(8.dp))
+            TextButton(onClick = { manual = true }) {
+                Text("or sign in manually", color = Sunflower, fontSize = 13.sp)
+            }
+        } else {
+            Spacer(Modifier.height(24.dp))
+            PpField(onion, { onion = it }, "Your box (.onion)")
+            Spacer(Modifier.height(12.dp))
+            PpField(user, { user = it }, "Username")
+            Spacer(Modifier.height(12.dp))
+            PpField(pass, { pass = it }, "Password", password = true)
+            Spacer(Modifier.height(20.dp))
+
+            Button(
+                onClick = { vm.clearNotice(); vm.login(onion, user, pass) },
+                enabled = !busy && onion.isNotBlank() && user.isNotBlank(),
+                colors = ButtonDefaults.buttonColors(containerColor = Sunflower, contentColor = Ink),
+                modifier = Modifier.fillMaxWidth().height(52.dp),
+                shape = RoundedCornerShape(14.dp)
+            ) {
+                if (busy) CircularProgressIndicator(Modifier.size(22.dp), color = Ink, strokeWidth = 2.dp)
+                else Text("Connect over Tor", fontWeight = FontWeight.SemiBold)
+            }
+        }
+
         val status by vm.status.collectAsState()
         if (busy && status.isNotBlank()) { Spacer(Modifier.height(10.dp)); Text(status, color = PaperDim, fontSize = 13.sp) }
+        if (notice != null && err == null) {
+            Spacer(Modifier.height(14.dp))
+            Text(notice!!, color = Sunflower, fontSize = 13.sp, textAlign = TextAlign.Center)
+        }
         if (err != null) {
             Spacer(Modifier.height(14.dp))
-            Text(err!!, color = Color(0xFFE5534B), fontSize = 13.sp, textAlign = TextAlign.Center)
+            Text(err!!, color = Danger, fontSize = 13.sp, textAlign = TextAlign.Center)
+            // Most sign-in failures here are Tor not being ready yet (slow/flaky
+            // circuit). Give the error path its own recovery: re-kick Tor and clear
+            // the error, so the user isn't stuck re-typing with nothing to try.
+            Spacer(Modifier.height(10.dp))
+            TextButton(onClick = { vm.clearError(); vm.retryTor() }) {
+                Icon(Icons.Filled.Refresh, null, tint = Sunflower, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("Retry connection over Tor", color = Sunflower, fontSize = 13.sp)
+            }
         }
     }
 }
@@ -254,9 +399,64 @@ fun LoginScreen(vm: AppViewModel) {
 @Composable
 private fun SunflowerMark(size: Int = 72) {
     Box(Modifier.size(size.dp).clip(RoundedCornerShape((size / 3.6).dp)).background(InkCard), contentAlignment = Alignment.Center) {
-        Text("✿", color = Sunflower, fontSize = (size * 0.6).sp)
+        Image(
+            androidx.compose.ui.res.painterResource(R.drawable.ic_sunflower),
+            "PurePrivacy",
+            modifier = Modifier.size((size * 0.62).dp)
+        )
     }
 }
+
+/** A read-back identity affordance: a contact's full (or middle-truncated) @name:onion
+ *  in monospace, in a tappable chip that copies the FULL address to the clipboard. Lets
+ *  two people verify each other out-of-band — read the onion aloud, or paste it. Used on
+ *  the profile ("my code") and wherever a contact identity is shown/confirmed.
+ *
+ *  - [wrap] true renders the whole id across lines (good when you want it fully legible,
+ *    e.g. your own code); false middle-truncates a long onion to one line ("@bob:abcd…wxyz.onion").
+ *  - [enabled] false greys it out and disables copy (e.g. while the id is still loading). */
+@Composable
+private fun IdentityChip(
+    id: String,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+    wrap: Boolean = true,
+    fullWidth: Boolean = false,
+) {
+    val clip = LocalClipboardManager.current
+    val ctx = LocalContext.current
+    val shown = if (wrap) id else middleTruncate(id)
+    Row(
+        modifier
+            .then(if (fullWidth) Modifier.fillMaxWidth() else Modifier)
+            .clip(RoundedCornerShape(12.dp)).background(InkCard)
+            .then(
+                if (enabled) Modifier.clickable {
+                    clip.setText(AnnotatedString(id))
+                    android.widget.Toast.makeText(ctx, "Address copied", android.widget.Toast.LENGTH_SHORT).show()
+                } else Modifier
+            )
+            .padding(horizontal = 14.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            shown,
+            color = if (enabled) PaperDim else PaperDim.copy(alpha = 0.5f),
+            fontSize = 12.sp, fontFamily = FontFamily.Monospace,
+            maxLines = if (wrap) Int.MAX_VALUE else 1,
+            overflow = if (wrap) TextOverflow.Clip else TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f)
+        )
+        if (enabled) {
+            Spacer(Modifier.width(10.dp))
+            Icon(Icons.Filled.ContentCopy, "copy", tint = Sunflower, modifier = Modifier.size(18.dp))
+        }
+    }
+}
+
+/** Keep both ends of a long @name:onion readable when it can't wrap: "@bob:abcd…wxyz.onion". */
+private fun middleTruncate(s: String, head: Int = 14, tail: Int = 10): String =
+    if (s.length <= head + tail + 1) s else s.take(head) + "…" + s.takeLast(tail)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -275,7 +475,7 @@ private fun PpField(value: String, onChange: (String) -> Unit, label: String, pa
         ),
         modifier = Modifier.fillMaxWidth(),
         colors = OutlinedTextFieldDefaults.colors(
-            focusedBorderColor = Sunflower, unfocusedBorderColor = Color(0xFF2D3742),
+            focusedBorderColor = Sunflower, unfocusedBorderColor = Outline,
             focusedLabelColor = Sunflower, unfocusedLabelColor = PaperDim,
             focusedTextColor = Paper, unfocusedTextColor = Paper,
             cursorColor = Sunflower
@@ -287,11 +487,12 @@ private fun PpField(value: String, onChange: (String) -> Unit, label: String, pa
 @Composable
 fun RoomsScreen(vm: AppViewModel) {
     val allRooms by vm.rooms.collectAsState()
-    // Mutual consent: show a chat only once it's live (both scanned) or it's an
-    // incoming request (someone scanned you — scan them back to connect). An
-    // outgoing-only request stays invisible (just a "request sent" snackbar) until
-    // the other person scans you, so no conversation appears until both have.
-    val rooms = allRooms.filter { it.paired || it.invited }
+    // Mutual consent, made legible. A row shows when it's live (both scanned), an
+    // INCOMING request (someone scanned you — scan them back), or an OUTGOING request
+    // you started (you scanned them; they haven't scanned back yet). The outgoing one
+    // is a persistent, labelled "Pending" row now — not a snackbar that vanishes,
+    // leaving the user on an empty "No chats yet" wondering if anything happened.
+    val rooms = allRooms.filter { it.paired || it.invited || it.outgoing }
     val busy by vm.busy.collectAsState()
     val err by vm.error.collectAsState()
     val notice by vm.notice.collectAsState()
@@ -339,11 +540,11 @@ fun RoomsScreen(vm: AppViewModel) {
                         singleLine = true,
                         placeholder = { Text("@bob:xxxx.onion", color = PaperDim) },
                         colors = OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = Sunflower, unfocusedBorderColor = Color(0xFF2D3742),
+                            focusedBorderColor = Sunflower, unfocusedBorderColor = Outline,
                             focusedTextColor = Paper, unfocusedTextColor = Paper, cursorColor = Sunflower
                         )
                     )
-                    if (err != null) { Spacer(Modifier.height(8.dp)); Text(err!!, color = Color(0xFFE5534B), fontSize = 12.sp) }
+                    if (err != null) { Spacer(Modifier.height(8.dp)); Text(err!!, color = Danger, fontSize = 12.sp) }
                 }
             },
             confirmButton = {
@@ -366,7 +567,7 @@ fun RoomsScreen(vm: AppViewModel) {
         },
         topBar = {
             TopAppBar(
-                title = { Column { Text("Chats", color = Paper, fontWeight = FontWeight.Bold); TorBadge() } },
+                title = { Column { Text("Chats", color = Paper, fontWeight = FontWeight.Bold); TorBadge(onRetry = vm::retryTor) } },
                 actions = {
                     IconButton(onClick = { vm.showProfile() }) {
                         Icon(Icons.Filled.QrCode, "my code", tint = Sunflower)
@@ -400,11 +601,14 @@ fun RoomsScreen(vm: AppViewModel) {
         } else {
             LazyColumn(Modifier.fillMaxSize().padding(pad)) {
                 items(rooms, key = { it.id }) { r ->
-                    RoomRow(r) {
-                        // Only a paired (both-scanned) chat opens. Tapping a pending
-                        // request opens the scanner so you can scan them back / finish.
-                        if (r.paired) vm.openRoom(r.id, r.name) else scan.launch(scanOptions())
-                    }
+                    RoomRow(
+                        r,
+                        // A live chat opens on tap. A pending row no longer launches the
+                        // camera on a surprise tap — it shows an explicit, labelled
+                        // "Scan their code…" button (onScan) instead.
+                        onOpen = { vm.openRoom(r.id, r.name) },
+                        onScan = { scan.launch(scanOptions()) },
+                    )
                 }
             }
         }
@@ -442,47 +646,76 @@ private fun relativeTime(ts: Long): String {
 }
 
 @Composable
-private fun RoomRow(r: RoomSummary, onClick: () -> Unit) {
-    val pending = !r.paired
-    Row(
-        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 18.dp, vertical = 14.dp),
-        verticalAlignment = Alignment.CenterVertically
+private fun RoomRow(r: RoomSummary, onOpen: () -> Unit, onScan: () -> Unit) {
+    val pending = !r.paired   // invited (incoming) or outgoing (waiting)
+    Column(
+        // Only a live (paired) chat is tappable-to-open as a whole row. A pending row's
+        // action is the explicit labelled button below — tapping the row body does
+        // nothing surprising (no silent camera launch).
+        Modifier.fillMaxWidth()
+            .then(if (r.paired) Modifier.clickable(onClick = onOpen) else Modifier)
+            .padding(horizontal = 18.dp, vertical = 14.dp)
     ) {
-        Box(Modifier.size(44.dp).clip(RoundedCornerShape(12.dp)).background(InkCard), contentAlignment = Alignment.Center) {
-            Text(r.name.firstOrNull { it.isLetterOrDigit() }?.uppercase() ?: "#",
-                color = if (pending) PaperDim else Sunflower, fontWeight = FontWeight.Bold)
-        }
-        Spacer(Modifier.width(14.dp))
-        Column(Modifier.weight(1f)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(r.name, color = if (pending) PaperDim else Paper, fontSize = 16.sp,
-                    maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
-                // A live chat shows when it last had activity, right-aligned.
-                if (!pending && r.ts > 0L) {
-                    Spacer(Modifier.width(8.dp))
-                    Text(relativeTime(r.ts), color = PaperDim, fontSize = 11.sp, maxLines = 1)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Box(Modifier.size(44.dp).clip(RoundedCornerShape(12.dp)).background(InkCard), contentAlignment = Alignment.Center) {
+                Text(r.name.firstOrNull { it.isLetterOrDigit() }?.uppercase() ?: "#",
+                    color = if (pending) PaperDim else Sunflower, fontWeight = FontWeight.Bold)
+            }
+            Spacer(Modifier.width(14.dp))
+            Column(Modifier.weight(1f)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(r.name, color = if (pending) PaperDim else Paper, fontSize = 16.sp,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
+                    // A live chat shows when it last had activity, right-aligned.
+                    if (!pending && r.ts > 0L) {
+                        Spacer(Modifier.width(8.dp))
+                        Text(relativeTime(r.ts), color = PaperDim, fontSize = 11.sp, maxLines = 1)
+                    }
+                }
+                // Mutual-consent states: incoming request (they scanned you), outgoing
+                // (you scanned them, waiting). A live chat shows its last message preview.
+                when {
+                    r.invited -> Text("Wants to connect", color = Sunflower, fontSize = 12.sp)
+                    r.outgoing -> Text("Pending · waiting for them to scan your code",
+                        color = PaperDim, fontSize = 12.sp)
+                    r.preview != null -> Text(r.preview!!, color = PaperDim, fontSize = 13.sp,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
             }
-            // Mutual-consent states: incoming request (they scanned you) vs outgoing
-            // (you scanned them, waiting). A live chat shows its last message preview.
-            when {
-                r.invited -> Text("Wants to connect · tap to scan their code", color = Sunflower, fontSize = 12.sp)
-                pending -> Text("Waiting for them to scan your code", color = PaperDim, fontSize = 12.sp)
-                r.preview != null -> Text(r.preview!!, color = PaperDim, fontSize = 13.sp,
-                    maxLines = 1, overflow = TextOverflow.Ellipsis)
+            if (pending) { Spacer(Modifier.width(8.dp)); Box(Modifier.size(8.dp).clip(CircleShape).background(Sunflower)) }
+        }
+
+        // Pending rows: a read-back identity chip (verify the contact out-of-band) plus
+        // an EXPLICIT, labelled scan action — never a surprise camera launch on tap.
+        if (pending) {
+            r.peerId?.let { pid ->
+                Spacer(Modifier.height(10.dp))
+                IdentityChip(pid, wrap = false, fullWidth = true)
+            }
+            Spacer(Modifier.height(10.dp))
+            OutlinedButton(
+                onClick = onScan,
+                modifier = Modifier.fillMaxWidth().height(44.dp),
+                shape = RoundedCornerShape(12.dp),
+                border = androidx.compose.foundation.BorderStroke(1.dp, Sunflower),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = Sunflower)
+            ) {
+                Icon(Icons.Filled.QrCodeScanner, null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    if (r.invited) "Scan their code to connect" else "Scan their code to finish",
+                    fontSize = 13.sp, fontWeight = FontWeight.SemiBold
+                )
             }
         }
-        if (pending) { Spacer(Modifier.width(8.dp)); Box(Modifier.size(8.dp).clip(CircleShape).background(Sunflower)) }
     }
-    HorizontalDivider(color = Color(0xFF1B222B))
+    HorizontalDivider(color = Divider)
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ProfileScreen(vm: AppViewModel) {
     BackHandler { vm.openRooms() }
-    val clip = LocalClipboardManager.current
-    val ctx = LocalContext.current
     val id = vm.myId
     val name = id.removePrefix("@").substringBefore(":")
     // Encode the QR as a "pureprivacy:@name:onion" deep link: ANY camera/QR scanner
@@ -491,8 +724,11 @@ fun ProfileScreen(vm: AppViewModel) {
     // address parser does substringAfter("pureprivacy:"), which yields the right id
     // for "pureprivacy:@id" but mangles a "//contact/" path. Older apps must still be
     // able to scan a newer phone's code, or pairing silently fails on their side.
-    val qrPayload = if (id.isBlank()) " " else "pureprivacy:$id"
-    val qr = remember(id) { runCatching { Qr.bitmap(qrPayload, 640) }.getOrNull() }
+    // While the id is still blank (session not restored yet) we DON'T encode a blank
+    // " " into a broken, scannable-to-nothing QR — we show a "Preparing your code…"
+    // placeholder and disable copy until the real address arrives.
+    val ready = id.isNotBlank()
+    val qr = remember(id) { if (ready) runCatching { Qr.bitmap("pureprivacy:$id", 640) }.getOrNull() else null }
 
     val scan = rememberScan { contents -> if (contents != null) vm.addContact(contents) }
 
@@ -515,10 +751,16 @@ fun ProfileScreen(vm: AppViewModel) {
         ) {
             Spacer(Modifier.height(8.dp))
             Box(Modifier.size(64.dp).clip(RoundedCornerShape(20.dp)).background(InkCard), contentAlignment = Alignment.Center) {
-                Text(name.firstOrNull()?.uppercase() ?: "✿", color = Sunflower, fontSize = 30.sp, fontWeight = FontWeight.Bold)
+                val initial = name.firstOrNull()?.uppercase()
+                if (initial != null) {
+                    Text(initial, color = Sunflower, fontSize = 30.sp, fontWeight = FontWeight.Bold)
+                } else {
+                    // No name yet (id still blank) — show the brand mark, never a stray glyph.
+                    Image(androidx.compose.ui.res.painterResource(R.drawable.ic_sunflower), null, modifier = Modifier.size(36.dp))
+                }
             }
             Spacer(Modifier.height(12.dp))
-            Text(name, color = Paper, fontSize = 22.sp, fontWeight = FontWeight.Bold)
+            Text(name.ifBlank { "Preparing your code…" }, color = Paper, fontSize = 22.sp, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(20.dp))
 
             // The QR — dark on white in a rounded card so it scans cleanly off-screen.
@@ -526,27 +768,29 @@ fun ProfileScreen(vm: AppViewModel) {
                 if (qr != null) {
                     Image(qr.asImageBitmap(), "your code", modifier = Modifier.size(240.dp))
                 } else {
-                    Box(Modifier.size(240.dp), contentAlignment = Alignment.Center) { CircularProgressIndicator(color = Ink) }
+                    // Not ready (no id yet) OR still encoding: spinner + "preparing" copy,
+                    // never a broken QR encoding a blank address.
+                    Box(Modifier.size(240.dp), contentAlignment = Alignment.Center) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            CircularProgressIndicator(color = Ink)
+                            Spacer(Modifier.height(12.dp))
+                            Text("Preparing your code…", color = Ink, fontSize = 12.sp)
+                        }
+                    }
                 }
             }
             Spacer(Modifier.height(16.dp))
             Text("Have a friend scan this to message you", color = PaperDim, fontSize = 13.sp, textAlign = TextAlign.Center)
             Spacer(Modifier.height(12.dp))
 
-            // the raw address, copyable as a fallback to QR
-            Row(
-                Modifier.clip(RoundedCornerShape(12.dp)).background(InkCard)
-                    .clickable {
-                        clip.setText(AnnotatedString(id))
-                        android.widget.Toast.makeText(ctx, "Address copied", android.widget.Toast.LENGTH_SHORT).show()
-                    }
-                    .padding(horizontal = 14.dp, vertical = 10.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(id, color = PaperDim, fontSize = 12.sp, fontFamily = FontFamily.Monospace, maxLines = 1, modifier = Modifier.weight(1f, fill = false))
-                Spacer(Modifier.width(10.dp))
-                Icon(Icons.Filled.ContentCopy, "copy", tint = Sunflower, modifier = Modifier.size(18.dp))
-            }
+            // The raw address, copyable as a fallback to QR. Un-clipped: a friend can read
+            // the whole @name:onion back to you out-of-band. Copy is disabled until the
+            // id is ready (no point copying a blank).
+            IdentityChip(
+                id = if (ready) id else "Preparing your code…",
+                enabled = ready,
+                fullWidth = true,
+            )
 
             Spacer(Modifier.height(28.dp))
             Button(
@@ -560,7 +804,7 @@ fun ProfileScreen(vm: AppViewModel) {
             val busy by vm.busy.collectAsState()
             val err by vm.error.collectAsState()
             if (busy) { Spacer(Modifier.height(14.dp)); CircularProgressIndicator(color = Sunflower) }
-            if (err != null) { Spacer(Modifier.height(12.dp)); Text(err!!, color = Color(0xFFE5534B), fontSize = 13.sp, textAlign = TextAlign.Center) }
+            if (err != null) { Spacer(Modifier.height(12.dp)); Text(err!!, color = Danger, fontSize = 13.sp, textAlign = TextAlign.Center) }
 
             Spacer(Modifier.height(36.dp))
             Text(
@@ -596,7 +840,7 @@ fun ChatScreen(vm: AppViewModel, roomId: String, roomName: String) {
                 navigationIcon = {
                     IconButton(onClick = { vm.back() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, null, tint = Paper) }
                 },
-                title = { Column { Text(roomName, color = Paper, fontWeight = FontWeight.Bold, maxLines = 1); TorBadge() } },
+                title = { Column { Text(roomName, color = Paper, fontWeight = FontWeight.Bold, maxLines = 1); TorBadge(onRetry = vm::retryTor) } },
                 actions = {
                     IconButton(onClick = {
                         ctx.startActivity(android.content.Intent(ctx, ElementCallActivity::class.java))
@@ -619,7 +863,7 @@ fun ChatScreen(vm: AppViewModel, roomId: String, roomName: String) {
                     modifier = Modifier.weight(1f),
                     shape = RoundedCornerShape(22.dp),
                     colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = Sunflower, unfocusedBorderColor = Color(0xFF2D3742),
+                        focusedBorderColor = Sunflower, unfocusedBorderColor = Outline,
                         focusedTextColor = Paper, unfocusedTextColor = Paper, cursorColor = Sunflower
                     )
                 )
@@ -645,16 +889,19 @@ fun ChatScreen(vm: AppViewModel, roomId: String, roomName: String) {
                 Modifier.fillMaxSize().padding(pad).padding(horizontal = 12.dp),
                 state = listState
             ) {
-                items(messages, key = { it.key }) { m -> Bubble(m) { vm.saveAttachment(m) } }
+                items(messages, key = { it.key }) { m ->
+                    Bubble(m, onAttachment = { vm.saveAttachment(m) }, onRetry = { vm.retrySend(m.key) })
+                }
             }
         }
     }
 }
 
 @Composable
-private fun Bubble(m: ChatMsg, onAttachment: () -> Unit = {}) {
+private fun Bubble(m: ChatMsg, onAttachment: () -> Unit = {}, onRetry: () -> Unit = {}) {
     val align = if (m.mine) Alignment.End else Alignment.Start
     val isAttachment = m.media != null
+    val failed = m.mine && m.sendState == SendState.Failed
     Column(Modifier.fillMaxWidth().padding(vertical = 5.dp), horizontalAlignment = align) {
         if (!m.mine) Text(m.sender.removePrefix("@").substringBefore(":"), color = Sunflower, fontSize = 11.sp,
             modifier = Modifier.padding(start = 8.dp, bottom = 2.dp))
@@ -662,7 +909,15 @@ private fun Bubble(m: ChatMsg, onAttachment: () -> Unit = {}) {
             Modifier.widthIn(max = 280.dp)
                 .clip(RoundedCornerShape(16.dp))
                 .background(if (m.mine) BubbleMine else BubbleTheirs)
-                .then(if (isAttachment) Modifier.clickable { onAttachment() } else Modifier)
+                // A failed own message is tappable to RE-SEND (SDK resend path). An
+                // attachment stays tappable to save; failed-retry takes precedence.
+                .then(
+                    when {
+                        failed -> Modifier.clickable { onRetry() }
+                        isAttachment -> Modifier.clickable { onAttachment() }
+                        else -> Modifier
+                    }
+                )
                 .padding(horizontal = 14.dp, vertical = 9.dp)
         ) {
             if (m.isImage && m.media != null) {
@@ -697,12 +952,36 @@ private fun Bubble(m: ChatMsg, onAttachment: () -> Unit = {}) {
                 Text(m.body, color = Paper, fontSize = 15.sp)
             }
         }
-        if (m.ts > 0L) Text(
-            remember(m.ts) {
-                java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(java.util.Date(m.ts))
-            },
-            color = PaperDim, fontSize = 10.sp,
-            modifier = Modifier.padding(start = 6.dp, end = 6.dp, top = 2.dp)
-        )
+        // Footer: timestamp, plus — for OUR messages — the real delivery state read
+        // from the SDK local echo. "sending…" with a clock while it round-trips over
+        // Tor, a small ✓ once the server echoes it back, and a tappable "Not sent ·
+        // tap to retry" if the send failed. Honours the brand: slowness is narrated,
+        // not hidden as silent data loss.
+        Row(
+            Modifier.padding(start = 6.dp, end = 6.dp, top = 2.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            if (m.ts > 0L) Text(
+                remember(m.ts) {
+                    java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(java.util.Date(m.ts))
+                },
+                color = PaperDim, fontSize = 10.sp
+            )
+            if (m.mine) {
+                Spacer(Modifier.width(6.dp))
+                when (m.sendState) {
+                    SendState.Sending -> {
+                        Icon(Icons.Filled.Schedule, "sending", tint = PaperDim, modifier = Modifier.size(11.dp))
+                        Spacer(Modifier.width(3.dp))
+                        Text("sending…", color = PaperDim, fontSize = 10.sp)
+                    }
+                    SendState.Sent ->
+                        Icon(Icons.Filled.Check, "sent", tint = PaperDim, modifier = Modifier.size(12.dp))
+                    SendState.Failed ->
+                        Text("Not sent · tap to retry", color = Danger, fontSize = 10.sp,
+                            modifier = Modifier.clickable { onRetry() })
+                }
+            }
+        }
     }
 }

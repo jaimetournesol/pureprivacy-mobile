@@ -87,8 +87,10 @@ class ElementCallActivity : ComponentActivity() {
     // elapsedRealtime at call start — anchors the peer-membership baseline window.
     @Volatile private var callStartMs = 0L
     // INK / SUNFLOWER / PAPER / PAPERDIM as ARGB ints for the (non-Compose) overlay.
-    private val cInk = 0xFF0E1116.toInt(); private val cSun = 0xFFF2B705.toInt()
-    private val cPaper = 0xFFE6EDF3.toInt(); private val cDim = 0xFF8B98A5.toInt()
+    // Kept in sync with ui/theme/Theme.kt's warm "candlelight" neutrals so the call
+    // surface matches the rest of the app (and the desktop).
+    private val cInk = 0xFF16140F.toInt(); private val cSun = 0xFFF2B705.toInt()
+    private val cPaper = 0xFFECE6D7.toInt(); private val cDim = 0xFF9A9384.toInt()
     private val MATCH = FrameLayout.LayoutParams.MATCH_PARENT
 
     companion object {
@@ -333,7 +335,7 @@ class ElementCallActivity : ComponentActivity() {
                 val wrapper = """
                     <!doctype html><html><head>
                     <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-                    </head><body style="margin:0;background:#0E1116">
+                    </head><body style="margin:0;background:#16140F">
                     <iframe id="ec" src="$url"
                       allow="camera;microphone;autoplay;display-capture;clipboard-write;fullscreen"
                       style="position:fixed;inset:0;width:100%;height:100%;border:0"></iframe>
@@ -357,7 +359,7 @@ class ElementCallActivity : ComponentActivity() {
                 }
             } catch (t: Throwable) {
                 Log.e(TAG, "EC setup failed", t)
-                showCallError("Couldn't start the call.\n${t.message ?: "Unknown error"}")
+                showCallError(ai.tournesol.pureprivacy.util.mapError(t))
             }
         }
     }
@@ -394,8 +396,10 @@ class ElementCallActivity : ComponentActivity() {
             setBackgroundColor(cInk)
             setPadding(dp(32), dp(32), dp(32), dp(32))
         }
-        col.addView(TextView(this).apply {
-            text = "✿"; setTextColor(cSun); setTextSize(TypedValue.COMPLEX_UNIT_PX, sp(56f)); gravity = Gravity.CENTER
+        // The real sunflower mark (vector), not a "✿" glyph — one consistent brand.
+        col.addView(android.widget.ImageView(this).apply {
+            setImageResource(R.drawable.ic_sunflower)
+            layoutParams = LinearLayout.LayoutParams(dp(64), dp(64))
         })
         col.addView(TextView(this).apply {
             text = "PurePrivacy"; setTextColor(cPaper); setTextSize(TypedValue.COMPLEX_UNIT_PX, sp(24f))

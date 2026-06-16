@@ -30,16 +30,22 @@ object TorManager {
     val state: StateFlow<State> = _state
 
     @Volatile private var process: Process? = null
+    // Bumped on every start()/retry(). A start() invocation only writes _state while it
+    // owns the current generation — so a stale loop tearing down after a retry() can't
+    // clobber the fresh bootstrap's state with a Failed("tor exited").
+    @Volatile private var generation = 0L
 
     /** Returns the SDK proxy URL once Tor is ready. */
     val proxyUrl: String get() = "socks5h://127.0.0.1:$SOCKS_PORT"
 
     suspend fun start(ctx: Context) = withContext(Dispatchers.IO) {
         if (process != null && _state.value is State.Ready) return@withContext
+        val gen = ++generation
+        fun setState(s: State) { if (gen == generation) _state.value = s }
         try {
-            _state.value = State.Bootstrapping(0, "starting")
+            setState(State.Bootstrapping(0, "starting"))
             val torExe = findTorExecutable(ctx)
-                ?: run { _state.value = State.Failed("libtor.so not found in nativeLibraryDir"); return@withContext }
+                ?: run { setState(State.Failed("libtor.so not found in nativeLibraryDir")); return@withContext }
 
             val dataDir = File(ctx.filesDir, "tor").apply { mkdirs() }
             val torrc = File(dataDir, "torrc")
@@ -75,22 +81,25 @@ object TorManager {
                         val pct = m.groupValues[1].toIntOrNull() ?: 0
                         val msg = m.groupValues[2].ifBlank { "bootstrapping" }
                         if (pct >= 100) {
-                            _state.value = State.Ready
+                            setState(State.Ready)
                             Log.i(TAG, "Tor ready (100%)")
                         } else {
-                            _state.value = State.Bootstrapping(pct, msg)
+                            setState(State.Bootstrapping(pct, msg))
                         }
                     }
                     if (line.contains("[err]") || line.contains("Reading config failed")) {
-                        _state.value = State.Failed(line)
+                        setState(State.Failed(line))
                     }
                 }
             }
             val code = proc.waitFor()
-            if (_state.value !is State.Ready) _state.value = State.Failed("tor exited ($code)")
+            // Only fault if WE'RE still the live generation and didn't reach Ready — a
+            // retry() that killed this process has already bumped the generation, so
+            // setState here is a no-op and won't stomp the new bootstrap.
+            if (gen == generation && _state.value !is State.Ready) setState(State.Failed("tor exited ($code)"))
         } catch (t: Throwable) {
             Log.e(TAG, "tor start failed", t)
-            _state.value = State.Failed(t.message ?: t.toString())
+            setState(State.Failed(t.message ?: t.toString()))
         }
     }
 
@@ -102,6 +111,20 @@ object TorManager {
             if (f.exists()) return f
         }
         return libDir.listFiles()?.firstOrNull { it.name.contains("tor", ignoreCase = true) }
+    }
+
+    /** User-driven retry from the UI when Tor is stuck/failed (the status badge or a
+     *  login/splash error path). Tears down any current process and starts a fresh
+     *  bootstrap. Safe to call repeatedly: a Ready Tor is left alone; otherwise we
+     *  kill the old `tor` exec (whose log-reader loop in start() then unblocks and
+     *  returns) and re-run start(), which resets state to Bootstrapping(0). */
+    suspend fun retry(ctx: Context) = withContext(Dispatchers.IO) {
+        if (_state.value is State.Ready && process != null) return@withContext
+        Log.i(TAG, "Tor retry requested — restarting")
+        runCatching { process?.destroy() }
+        process = null
+        _state.value = State.Bootstrapping(0, "retrying")
+        start(ctx)
     }
 
     fun stop() {

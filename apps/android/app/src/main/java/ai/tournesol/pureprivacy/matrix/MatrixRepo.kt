@@ -17,6 +17,7 @@ import org.matrix.rustcomponents.sdk.Client
 import org.matrix.rustcomponents.sdk.EnableRecoveryProgress
 import org.matrix.rustcomponents.sdk.EnableRecoveryProgressListener
 import org.matrix.rustcomponents.sdk.EncryptedMessage
+import org.matrix.rustcomponents.sdk.EventSendState
 import org.matrix.rustcomponents.sdk.LatestEventValue
 import org.matrix.rustcomponents.sdk.RecoveryState
 import org.matrix.rustcomponents.sdk.ClientBuilder
@@ -52,14 +53,22 @@ import java.io.File
  * A row in the chat list.
  *  - [paired]   both people have scanned → a live, openable conversation.
  *  - [invited]  the other person scanned you; you haven't scanned them back yet
- *               (an incoming request — tap to scan them and complete the pairing).
- *  - neither    you scanned them; waiting for them to scan you back (outgoing).
+ *               (an INCOMING request — tap to scan them and complete the pairing).
+ *  - [outgoing] YOU scanned them (you created/joined the room) but the human peer
+ *               hasn't joined yet → waiting for them to scan your code. A persistent,
+ *               labelled "Pending" row, not a vanished snackbar.
+ *
+ * Exactly one of paired / invited / outgoing is true for a visible row. [peerId] is the
+ * contact's full @name:onion when known (for the read-back identity chip).
  */
 data class RoomSummary(
     val id: String,
     val name: String,
     val invited: Boolean = false,
     val paired: Boolean = false,
+    val outgoing: Boolean = false,
+    /** The contact's full @name:onion, when resolvable (heroes), for read-back. */
+    val peerId: String? = null,
     /** Short preview of the latest event ("You: hi", "📎 file.pdf", "📞 Call"). */
     val preview: String? = null,
     /** Timestamp of the latest event (ms); 0 if none. Used to sort the chat list. */
@@ -68,6 +77,11 @@ data class RoomSummary(
 /** Outcome of acting on a scanned/typed contact. [paired] is true only once both
  *  sides have scanned (a live conversation); false means the request is pending. */
 data class ConnectResult(val roomId: String, val paired: Boolean)
+/** Delivery state of an OWN message, read from the SDK timeline's local echo
+ *  (EventTimelineItem.localSendState). A remote message — anyone's already-sent
+ *  event — is always [Sent]. Lets the bubble show "sending…/✓/Not sent · retry"
+ *  so a slow Tor round-trip never reads as silent data loss. */
+enum class SendState { Sending, Sent, Failed }
 data class ChatMsg(
     val key: String, val sender: String, val body: String, val mine: Boolean, val ts: Long = 0L,
     // Set for file/image/video/audio messages: the SDK media handle to download, the
@@ -76,6 +90,8 @@ data class ChatMsg(
     val fileName: String? = null,
     val mime: String? = null,
     val isImage: Boolean = false,
+    /** Own-message delivery state from the SDK local echo. Remote msgs = [SendState.Sent]. */
+    val sendState: SendState = SendState.Sent,
 )
 /** A thing worth alerting the user about when they're not looking at the room. */
 data class Notif(
@@ -167,6 +183,11 @@ object MatrixRepo {
     // subscription (and pins the Room), so it survives roomHandles churn.
     private val callSubs = java.util.concurrent.ConcurrentHashMap<String, TaskHandle>()
     private val timelineItems = ArrayList<TimelineItem>()
+    // Local-echo resend handles, keyed by ChatMsg.key (the event/transaction id). The
+    // SDK hands a SendHandle off each own message's local echo; we stash it so a failed
+    // bubble can be tapped to retry via SendHandle.tryResend(). Rebuilt on every timeline
+    // diff (handles for now-sent/removed items are dropped). Bounded by the open room.
+    private val sendHandles = java.util.concurrent.ConcurrentHashMap<String, org.matrix.rustcomponents.sdk.SendHandle>()
 
     val isLoggedIn: Boolean get() = client != null
 
@@ -184,7 +205,14 @@ object MatrixRepo {
             .sessionPaths(session.absolutePath, cache.absolutePath)
             .proxy(TorManager.proxyUrl)                 // route every request through Tor
             .disableSslVerification()                   // onion box uses a self-signed/plain endpoint
-            .slidingSyncVersionBuilder(SlidingSyncVersionBuilder.DISCOVER_NATIVE)
+            // PIN native sliding sync — do NOT DISCOVER it. DISCOVER_NATIVE makes a
+            // homeserver round-trip DURING ClientBuilder.build(); over flaky Tor that
+            // call intermittently hangs forever (no timeout), so login/restore never
+            // completes and the app sits on "Restoring your session…" (seen live: box
+            // healthy + onion reachable + Tor 100%, yet build() never returned). Our box
+            // is always tuwunel, which always speaks native simplified sliding sync, so
+            // the discovery is pure risk with no upside — pin NATIVE and skip the call.
+            .slidingSyncVersionBuilder(SlidingSyncVersionBuilder.NATIVE)
             // Key backup + cross-signing (option A, see ensureKeyBackup): cross-signing
             // auto-trusts our own devices (no manual verification UX), backups let a
             // re-login / new device recover room keys. ONE_SHOT downloads the entire key
@@ -523,19 +551,29 @@ object MatrixRepo {
         rooms.value = handles.map { r ->
             val mem = runCatching { r.membership() }.getOrNull()
             val (preview, ts) = latestPreview(r)
+            // a live conversation = I'm in AND the human peer is in too — which only
+            // happens once both have scanned each other.
+            val peerIn = mem == Membership.JOINED && peerJoined(r)
             RoomSummary(
                 r.id(), roomName(r),
                 invited = mem == Membership.INVITED,
-                // a live conversation = I'm in AND the human peer is in too — which
-                // only happens once both have scanned each other.
-                paired = mem == Membership.JOINED && peerJoined(r),
+                paired = peerIn,
+                // I'm joined but the peer isn't (and they didn't invite me): I scanned
+                // them and I'm waiting for them to scan me back → a pending OUTGOING row.
+                outgoing = mem == Membership.JOINED && !peerIn,
+                peerId = peerId(r),
                 preview = preview,
                 ts = ts,
             )
-        // Invites first (actionable), then most-recently-active chats on top.
-        }.sortedWith(compareByDescending<RoomSummary> { it.invited }.thenByDescending { it.ts })
+        // Invites first (actionable), then pending outgoing, then most-recently-active.
+        }.sortedWith(
+            compareByDescending<RoomSummary> { it.invited }
+                .thenByDescending { it.outgoing }
+                .thenByDescending { it.ts }
+        )
         Log.i(TAG, "rebuildRooms: ${rooms.value.size} rooms (" +
-            "${rooms.value.count { it.paired }} paired, ${rooms.value.count { it.invited }} invited)")
+            "${rooms.value.count { it.paired }} paired, ${rooms.value.count { it.invited }} invited, " +
+            "${rooms.value.count { it.outgoing }} pending-outgoing)")
     }
 
     /** Cheap refresh of just the chat-list previews + timestamps (and re-sort) from the
@@ -731,6 +769,15 @@ object MatrixRepo {
      *  bob's. Falls back to the room's own display name for non-DM / unsummarised
      *  rooms. Cross-box the peer's profile name often isn't replicated, so we use
      *  their matrix-id localpart (which is exactly their username). */
+    /** The contact's full @name:onion for this room, from the heroes list (the non-me,
+     *  non-bot member). Null when the SDK hasn't populated heroes yet — the chip just
+     *  hides in that case. Used for the read-back identity chip on a pending row. */
+    private fun peerId(r: Room): String? =
+        runCatching { r.heroes() }.getOrDefault(emptyList())
+            .firstOrNull { it.userId != userId && !isServerBot(it.userId) }
+            ?.userId
+            ?.takeIf { it.startsWith("@") && it.contains(":") }
+
     private fun roomName(r: Room): String {
         val hero = runCatching { r.heroes() }.getOrDefault(emptyList())
             .firstOrNull { it.userId != userId && !isServerBot(it.userId) }
@@ -758,6 +805,7 @@ object MatrixRepo {
     suspend fun openRoom(roomId: String) {
         val rls = roomListService ?: error("no room list")
         timelineItems.clear()
+        sendHandles.clear()              // resend handles belong to the previous room's timeline
         messages.value = emptyList()
         val room = runCatching { rls.room(roomId) }.getOrNull()
             ?: roomHandles[roomId] ?: error("room not found")
@@ -827,7 +875,15 @@ object MatrixRepo {
                         { media = mt.content.source; fileName = mc.body; text = "🎵 ${mc.body}" }
                     else -> {}
                 }
-                return ChatMsg(key, sender, text, sender == me, ts, media, fileName, mime, isImage)
+                val mine = sender == me
+                // Delivery state of our OWN message, straight from the SDK local echo.
+                // localSendState is non-null only while a message is in the send queue
+                // (NotSentYet/SendingFailed) — once it round-trips and the server echoes
+                // it back it's a plain remote item (null state) → Sent. Remote (others')
+                // messages are always Sent. We never hand-roll a timer; this reflects the
+                // SDK's real queue state.
+                val sendState = if (mine) sendStateOf(ev, key) else SendState.Sent
+                return ChatMsg(key, sender, text, mine, ts, media, fileName, mime, isImage, sendState)
             }
             // An event we received but can't decrypt (missing the megolm room key —
             // e.g. the sender used a new device whose key never reached us). Surface a
@@ -843,6 +899,37 @@ object MatrixRepo {
             }
         }
         return null
+    }
+
+    /** Map the SDK's local-echo send state onto our [SendState], and stash the
+     *  message's resend handle so a failed bubble can be retried. The handle (off the
+     *  item's lazy provider) is the SDK's own resend path — no hand-rolled retry. A
+     *  Sent/round-tripped item drops its handle. Failures here default to Sending so a
+     *  transient read never paints a healthy message as failed. */
+    private fun sendStateOf(ev: org.matrix.rustcomponents.sdk.EventTimelineItem, key: String): SendState {
+        return when (ev.localSendState) {
+            is EventSendState.SendingFailed -> {
+                runCatching { ev.lazyProvider.getSendHandle() }.getOrNull()?.let { sendHandles[key] = it }
+                SendState.Failed
+            }
+            is EventSendState.NotSentYet -> {
+                runCatching { ev.lazyProvider.getSendHandle() }.getOrNull()?.let { sendHandles[key] = it }
+                SendState.Sending
+            }
+            // EventSendState.Sent, or null (a plain remote item that round-tripped) —
+            // delivered. Drop any resend handle we were holding for it.
+            else -> { sendHandles.remove(key); SendState.Sent }
+        }
+    }
+
+    /** Retry a failed own-message via the SDK's resend path (SendHandle.tryResend()).
+     *  The timeline will re-emit the item as NotSentYet → Sent (or Failed again),
+     *  which flows back through toChatMsg to the bubble. No-op if we hold no handle. */
+    suspend fun retrySend(key: String) {
+        val h = sendHandles[key] ?: return
+        runCatching { h.tryResend() }
+            .onSuccess { Log.i(TAG, "retrySend: re-queued $key") }
+            .onFailure { Log.w(TAG, "retrySend failed for $key: ${it.message}") }
     }
 
     suspend fun send(text: String) {
@@ -1112,7 +1199,7 @@ object MatrixRepo {
         timelineHandle = null; roomListResult = null; roomList = null
         client = null; syncService = null; roomListService = null; timeline = null
         currentRoom = null; currentRoomId = null; userId = ""; deviceId = ""
-        roomHandles.clear(); timelineItems.clear()
+        roomHandles.clear(); timelineItems.clear(); sendHandles.clear()
         lastSeen.clear(); notifyArmed = false; activeCallRooms.clear()
         rooms.value = emptyList(); messages.value = emptyList()
         wipeStore(ctx)                                  // remove crypto store too
