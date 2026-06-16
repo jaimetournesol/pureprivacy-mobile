@@ -58,6 +58,7 @@ class ElementCallActivity : ComponentActivity() {
     private val TAG = "PpCall"
     private lateinit var web: WebView
     private var ecOnion = ""
+    private var callRoomId: String? = null   // for clearing our RTC membership on leave
     // onion -> localhost  (applied to proxy bodies, toWidget messages, intercepts).
     private val ecRewrites: MutableMap<String, String> = java.util.concurrent.ConcurrentHashMap()
     // localhost -> onion  (applied to fromWidget messages so the call membership we
@@ -108,6 +109,7 @@ class ElementCallActivity : ComponentActivity() {
         applyScreenSecurity()
         val room = MatrixRepo.currentRoom
         if (room == null) { Log.w(TAG, "no current room — finishing"); finish(); return }
+        callRoomId = runCatching { room.id() }.getOrNull()
 
         val onion = MatrixRepo.userId.substringAfter(":")  // box homeserver onion
         ecOnion = onion
@@ -622,6 +624,13 @@ class ElementCallActivity : ComponentActivity() {
         connectTimeout?.cancel()
         peerLeftCheck?.cancel()
         Log.i(TAG, "call activity destroyed (connected=$ecConnected)")
+        // Retract OUR RTC membership on leave. Element Call is meant to do this (incl.
+        // via a delayed "leave" event), but over flaky Tor / an abrupt close it often
+        // doesn't — and a lingering own m.call.member is poison: our app then reads
+        // meInCall=true forever so the NEXT incoming call never rings, and the peer
+        // sees a ghost participant that makes Element Call refuse new calls. Runs on
+        // the repo's app-scope (survives this activity) over the SDK's own Tor path.
+        callRoomId?.let { MatrixRepo.clearMyCallMembership(it) }
         runCatching { web.destroy() }
         // Tear down the per-call Tor bridges/forwarders so they don't linger.
         runCatching { TorNet.stopAll() }
