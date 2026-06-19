@@ -406,6 +406,10 @@ object MatrixRepo {
                         syncRestartDelayMs = 0L
                         if (status.value != "Connected") status.value = "Connected"
                         scope.launch {
+                            // Re-read consent from account-data first so a removal (here
+                            // or on another device) propagates and the consent-gated hide
+                            // in rebuildRooms takes effect this cycle.
+                            runCatching { loadConsent() }
                             runCatching { autoAcceptMutual() }
                             runCatching { rebuildRooms() }
                             runCatching { reconcileCallSubs() }
@@ -578,10 +582,17 @@ object MatrixRepo {
             // a live conversation = I'm in AND the human peer is in too — which only
             // happens once both have scanned each other.
             val peerIn = mem == Membership.JOINED && peerJoined(r)
+            // Consent-gated hide: a peer we've silently removed is dropped from
+            // consentedOnions (account-data), so the row must disappear with no
+            // federated leave. The `null` fallback (heroes not warm yet) avoids
+            // hiding a live chat during hero warm-up — gating only kicks in once we
+            // can actually read the peer's onion.
+            val peerOnion = peerId(r)?.substringAfter(":", "")?.trim()
+            val paired = peerIn && (peerOnion == null || peerOnion in consentedOnions)
             RoomSummary(
                 r.id(), roomName(r),
                 invited = mem == Membership.INVITED,
-                paired = peerIn,
+                paired = paired,
                 // I'm joined but the peer isn't (and they didn't invite me): I scanned
                 // them and I'm waiting for them to scan me back → a pending OUTGOING row.
                 // Excludes the box's @conduit Admin Room / stray empty rooms (no human
@@ -679,7 +690,16 @@ object MatrixRepo {
      *  synchronized set, so a concurrent add() from both paths rings exactly once. */
     private suspend fun evaluateRoomCall(room: Room, hasCall: Boolean, participants: List<String>) {
         val id = runCatching { room.id() }.getOrNull() ?: return
-        val peerInCall = hasCall && participants.any { it != userId && !isServerBot(it) }
+        // Consent-gated ring: never ring for a peer we've removed (silently or by
+        // notify). Their onion is gone from consentedOnions, so the row is hidden —
+        // an incoming call from them must not resurface as a phantom ring. Gate on
+        // the human caller's onion; the `null` fallback (no human participant) keeps
+        // the existing "no one to ring for" behaviour.
+        val callerOnion = participants
+            .firstOrNull { it != userId && !isServerBot(it) }
+            ?.substringAfter(":", "")?.trim()
+        val peerConsented = callerOnion == null || callerOnion in consentedOnions
+        val peerInCall = hasCall && peerConsented && participants.any { it != userId && !isServerBot(it) }
         // Multi-device: if MY account is already in the call (this or another of my
         // devices answered), don't ring — and stop any ring in progress.
         val meInCall = participants.any { it == userId }
@@ -1034,13 +1054,22 @@ object MatrixRepo {
         }.getOrNull()
 
     /** Load our recorded consent (scanned-contact onions) from account data into
-     *  memory, so consent survives an app restart. Best-effort. */
+     *  memory, so consent survives an app restart. Account-data is the single source
+     *  of truth: REPLACE the in-memory set (clear + fill) rather than union/add-only,
+     *  so a removal on this or another device propagates here and a removed peer can't
+     *  be resurrected. Re-run on every RUNNING sync cycle. Best-effort — on a failed
+     *  read we keep the existing set (a transient Tor read must never drop consent). */
     private suspend fun loadConsent() {
         val c = client ?: return
         val raw = runCatching { c.accountData(PAIR_ACCOUNT_DATA) }.getOrNull() ?: return
         runCatching {
             val arr = org.json.JSONObject(raw).optJSONArray("onions") ?: return
-            for (i in 0 until arr.length()) consentedOnions.add(arr.getString(i))
+            val fresh = mutableSetOf<String>()
+            for (i in 0 until arr.length()) fresh.add(arr.getString(i))
+            synchronized(consentedOnions) {
+                consentedOnions.clear()
+                consentedOnions.addAll(fresh)
+            }
         }
     }
 
@@ -1052,7 +1081,10 @@ object MatrixRepo {
         val onion = peerUserId.substringAfter(":", "").trim()
         if (!onion.endsWith(".onion")) { Log.w(TAG, "recordPairing: '$onion' is not an onion"); return }
         if (onion in consentedOnions) return   // already recorded AND persisted
-        // Build the new set (existing server value ∪ what we know ∪ this onion).
+        // Build the new set from the FRESHLY-READ account-data array + this one onion
+        // only. Account-data is authoritative — do NOT union in the in-memory
+        // consentedOnions, or a peer just removed (and dropped from account-data on
+        // another device) would be resurrected here on the next add.
         val set = linkedSetOf<String>()
         runCatching { c.accountData(PAIR_ACCOUNT_DATA) }.getOrNull()?.let { raw ->
             runCatching {
@@ -1061,7 +1093,6 @@ object MatrixRepo {
                 }
             }
         }
-        set.addAll(consentedOnions)
         set.add(onion)
         val json = org.json.JSONObject().put("onions", org.json.JSONArray(set.toList())).toString()
         // The write goes to our box over Tor, which can be flaky and reqwest caches
@@ -1078,6 +1109,95 @@ object MatrixRepo {
             kotlinx.coroutines.delay(3000)
         }
         Log.e(TAG, "recordPairing: gave up persisting $onion after retries")
+    }
+
+    /** Inverse of [recordPairing]: drop a contact's onion from account-data (the
+     *  authoritative pairing set), so our box's reconcile cuts it from the federation
+     *  allowlist. Reads the current `…pairings` array, removes this onion, and writes
+     *  it back with the SAME 8× retry over flaky Tor. Drops the onion from the
+     *  in-memory consent set ONLY after a successful PUT — never leave account-data and
+     *  consent out of sync (a failed write must NOT silently revoke consent locally;
+     *  the chat must stay live and re-runnable). Returns true once it actually
+     *  persisted. */
+    private suspend fun removeOnionFromAccountData(onion: String): Boolean {
+        val c = client ?: return false
+        // Read the current array and build the kept set (minus this onion). If there's
+        // no account-data yet there's nothing to remove — and consent already lacks it.
+        val set = linkedSetOf<String>()
+        runCatching { c.accountData(PAIR_ACCOUNT_DATA) }.getOrNull()?.let { raw ->
+            runCatching {
+                org.json.JSONObject(raw).optJSONArray("onions")?.let { a ->
+                    for (i in 0 until a.length()) set.add(a.getString(i))
+                }
+            }
+        }
+        if (!set.remove(onion)) {
+            // Onion isn't in account-data: nothing to PUT. Keep consent in sync.
+            consentedOnions.remove(onion)
+            Log.i(TAG, "removeOnionFromAccountData: $onion not present; nothing to write")
+            return true
+        }
+        val json = org.json.JSONObject().put("onions", org.json.JSONArray(set.toList())).toString()
+        for (attempt in 1..8) {
+            val r = runCatching { c.setAccountData(PAIR_ACCOUNT_DATA, json) }
+            if (r.isSuccess) {
+                // Persisted: only NOW drop in-memory consent so the two never diverge.
+                consentedOnions.remove(onion)
+                Log.i(TAG, "removeOnionFromAccountData: removed $onion (attempt $attempt)")
+                return true
+            }
+            Log.w(TAG, "removeOnionFromAccountData: write attempt $attempt failed: ${r.exceptionOrNull()?.message}")
+            kotlinx.coroutines.delay(3000)
+        }
+        Log.e(TAG, "removeOnionFromAccountData: gave up removing $onion after retries")
+        return false
+    }
+
+    /** Remove a contact (@user:onion). Destructive by default — drops the peer's onion
+     *  from account-data so our box's reconcile cuts them from the federation allowlist
+     *  (their box can no longer reach ours). When [notify] is true we additionally
+     *  leave + forget the DM room(s), federating a "left" event so the still-paired peer
+     *  sees we're gone; when false the removal is silent (no leave event — they simply
+     *  become unreachable, not invisible).
+     *
+     *  Strict no-half-remove ordering: we ALWAYS persist the account-data drop (the real
+     *  federation cut) FIRST, and only on a confirmed write do we federate the "left"
+     *  event (notify) and drop in-memory consent. If the account-data write fails we
+     *  throw — consent stays intact, no "left" event fires, the chat stays live, and the
+     *  whole operation is fully re-runnable. This guarantees the federated "left" never
+     *  outraces the cut: the peer is never told we left while their box can still reach
+     *  ours. */
+    suspend fun removeContact(peer: String, notify: Boolean) {
+        val onion = peer.substringAfter(":").trim()
+        // Resolve the DM room(s) ONCE — one SDK/Tor round trip reused below.
+        val dms = runCatching { client?.getDmRooms(peer) }.getOrNull().orEmpty()
+        // Tear down any in-progress call in the DM room first, so a removed-but-hidden
+        // room can't keep ringing or leave a ghost call membership behind.
+        dms.forEach { r ->
+            val hasCall = runCatching { r.hasActiveRoomCall() }.getOrDefault(false)
+            if (hasCall) clearMyCallMembership(r.id())
+        }
+        // The real cut: drop the onion from account-data BEFORE anything user-visible
+        // federates. On failure (8× retry exhausted over flaky Tor) consent is left
+        // intact by removeOnionFromAccountData; throw so the UI surfaces a retry state
+        // and never reports a successful removal for a half-completed cut.
+        val cut = removeOnionFromAccountData(onion)
+        if (!cut) {
+            rebuildRooms()
+            throw java.io.IOException(
+                "Couldn't reach your box to cut them off — still connected; try again."
+            )
+        }
+        if (notify) {
+            // Only now that the cut is persisted do we federate the "left" event the peer
+            // sees. leave() then forget() — order matters: leaving federates the "left"
+            // event; forgetting drops the room from our list.
+            dms.forEach { r ->
+                runCatching { r.leave() }
+                runCatching { r.forget() }
+            }
+        }
+        rebuildRooms()
     }
 
     /** Auto-accept incoming invites from contacts we've ALSO scanned: mutual consent

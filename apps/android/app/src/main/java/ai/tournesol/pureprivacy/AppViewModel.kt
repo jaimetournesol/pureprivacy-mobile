@@ -232,6 +232,37 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** Remove a contact (@user:onion). Destructive by default: cuts them from our box's
+     *  federation allowlist (account-data drop → box reconcile). [notify] true also
+     *  federates a "left" event; false removes them silently. Mirrors [startChat]:
+     *  validate, mark busy, do the work off the main thread, surface notice/error. */
+    fun removeContact(peerId: String, notify: Boolean) {
+        val uid = peerId.trim()
+        if (!uid.startsWith("@") || !uid.contains(":")) {
+            error.value = "Enter a full address, e.g. @bob:xxxx.onion"
+            return
+        }
+        val server = uid.substringAfter(":")
+        if (!Regex("^[a-z2-7]{56}\\.onion$").matches(server)) {
+            error.value = "That doesn't look like a valid PurePrivacy address."
+            return
+        }
+        error.value = null
+        busy.value = true
+        val who = uid.removePrefix("@").substringBefore(":")
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                MatrixRepo.removeContact(uid, notify)
+                notice.value = "Removed $who."
+            } catch (t: Throwable) {
+                Log.w("AppVM", "removeContact failed", t)
+                error.value = mapError(t)
+            } finally {
+                busy.value = false
+            }
+        }
+    }
+
     /** A contact's code was scanned (or pasted). Normalize whatever the QR carried
      *  into a Matrix id and open/create the encrypted DM. */
     fun addContact(scanned: String?) {

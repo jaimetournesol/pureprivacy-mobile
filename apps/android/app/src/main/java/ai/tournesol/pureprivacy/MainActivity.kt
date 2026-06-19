@@ -12,6 +12,7 @@ import androidx.activity.viewModels
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -500,6 +501,10 @@ fun RoomsScreen(vm: AppViewModel) {
     var showSheet by remember { mutableStateOf(false) }
     var showNew by remember { mutableStateOf(false) }
     var peer by remember { mutableStateOf("") }
+    // The chat queued for removal (long-press → Remove), and whether to federate a
+    // "left" event (default OFF = silent: they become unreachable, not invisible).
+    var pendingRemove: RoomSummary? by remember { mutableStateOf(null) }
+    var notify by remember { mutableStateOf(false) }
     BackHandler { (ctx as? android.app.Activity)?.moveTaskToBack(true) }
 
     val scan = rememberScan { contents -> if (contents != null) vm.addContact(contents) }
@@ -556,6 +561,60 @@ fun RoomsScreen(vm: AppViewModel) {
         )
     }
 
+    pendingRemove?.let { target ->
+        val canRemove = target.peerId != null
+        AlertDialog(
+            onDismissRequest = { if (!busy) { pendingRemove = null; notify = false } },
+            containerColor = InkCard,
+            title = { Text("Remove ${target.name}?", color = Paper) },
+            text = {
+                Column {
+                    Text(
+                        "This cuts them off: their box can no longer reach yours, and " +
+                            "this chat disappears from your list. You can reconnect later by " +
+                            "scanning each other's code again.",
+                        color = PaperDim, fontSize = 13.sp
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.clickable(enabled = !busy) { notify = !notify }) {
+                        Checkbox(
+                            checked = notify, onCheckedChange = { notify = it }, enabled = !busy,
+                            colors = CheckboxDefaults.colors(
+                                checkedColor = Sunflower, uncheckedColor = Outline, checkmarkColor = Ink
+                            )
+                        )
+                        Spacer(Modifier.width(4.dp))
+                        Text("Let them know", color = Paper, fontSize = 14.sp)
+                    }
+                    Text(
+                        if (notify)
+                            "They'll see you left this chat."
+                        else
+                            "Silent: they won't be told. They'll just find you " +
+                                "unreachable — their box keeps failing to reach yours.",
+                        color = PaperDim, fontSize = 12.sp,
+                        modifier = Modifier.padding(start = 4.dp)
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        vm.removeContact(target.peerId ?: return@TextButton, notify)
+                        pendingRemove = null; notify = false
+                    },
+                    enabled = !busy && canRemove
+                ) { Text("Remove", color = Danger) }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingRemove = null; notify = false }, enabled = !busy) {
+                    Text("Cancel", color = PaperDim)
+                }
+            }
+        )
+    }
+
     Scaffold(
         containerColor = Ink,
         snackbarHost = { SnackbarHost(snackbar) },
@@ -608,6 +667,8 @@ fun RoomsScreen(vm: AppViewModel) {
                         // "Scan their code…" button (onScan) instead.
                         onOpen = { vm.openRoom(r.id, r.name) },
                         onScan = { scan.launch(scanOptions()) },
+                        // Long-press → Remove → confirm dialog (built below).
+                        onRemove = { pendingRemove = r },
                     )
                 }
             }
@@ -645,17 +706,38 @@ private fun relativeTime(ts: Long): String {
     }
 }
 
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
-private fun RoomRow(r: RoomSummary, onOpen: () -> Unit, onScan: () -> Unit) {
+private fun RoomRow(r: RoomSummary, onOpen: () -> Unit, onScan: () -> Unit, onRemove: () -> Unit) {
     val pending = !r.paired   // invited (incoming) or outgoing (waiting)
+    var menuOpen by remember { mutableStateOf(false) }
     Column(
-        // Only a live (paired) chat is tappable-to-open as a whole row. A pending row's
-        // action is the explicit labelled button below — tapping the row body does
-        // nothing surprising (no silent camera launch).
+        // Only a live (paired) chat is tappable-to-open as a whole row. Tap opens it;
+        // a long-press opens a menu (Open / Remove) — the entry point for removal. A
+        // pending row's action is the explicit labelled button below — tapping/long-
+        // pressing the row body does nothing surprising (no silent camera launch, no
+        // remove on a chat that isn't live yet).
         Modifier.fillMaxWidth()
-            .then(if (r.paired) Modifier.clickable(onClick = onOpen) else Modifier)
+            .then(
+                if (r.paired) Modifier.combinedClickable(
+                    onClick = onOpen,
+                    onLongClick = { menuOpen = true }
+                ) else Modifier
+            )
             .padding(horizontal = 18.dp, vertical = 14.dp)
     ) {
+        // Long-press menu anchored to the row. Only meaningful for a live chat (the
+        // long-press is gated on r.paired above).
+        DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+            DropdownMenuItem(
+                text = { Text("Open") },
+                onClick = { menuOpen = false; onOpen() }
+            )
+            DropdownMenuItem(
+                text = { Text("Remove", color = Danger) },
+                onClick = { menuOpen = false; onRemove() }
+            )
+        }
         Row(verticalAlignment = Alignment.CenterVertically) {
             Box(Modifier.size(44.dp).clip(RoundedCornerShape(12.dp)).background(InkCard), contentAlignment = Alignment.Center) {
                 Text(r.name.firstOrNull { it.isLetterOrDigit() }?.uppercase() ?: "#",
