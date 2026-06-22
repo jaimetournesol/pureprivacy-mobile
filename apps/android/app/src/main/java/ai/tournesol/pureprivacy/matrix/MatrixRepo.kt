@@ -1189,12 +1189,40 @@ object MatrixRepo {
             )
         }
         if (notify) {
+            // Resolve the ids BEFORE leave()/forget() touch the handles, so the prune's
+            // id set can't be perturbed by any leave/forget side effect. Room.id() is the
+            // handle's immutable id, but hoisting keeps the prune all-or-nothing-proof.
+            val leftIds = dms.map { it.id() }.toSet()
             // Only now that the cut is persisted do we federate the "left" event the peer
             // sees. leave() then forget() — order matters: leaving federates the "left"
             // event; forgetting drops the room from our list.
             dms.forEach { r ->
                 runCatching { r.leave() }
                 runCatching { r.forget() }
+            }
+            // Best-effort cosmetic cleanup: prune the rooms we just left from the
+            // `m.direct` account-data ({"<userId>":["<roomId>",...]}). A left+forgotten
+            // room can linger there and resurface as a ghost/dead DM from getDmRooms on a
+            // later re-add. Wrapped in runCatching so a prune failure NEVER fails the
+            // removal — the real cut already persisted above. Idempotent: re-running just
+            // finds nothing to remove.
+            runCatching {
+                val c = client ?: return@runCatching
+                val raw = c.accountData("m.direct") ?: return@runCatching
+                val obj = org.json.JSONObject(raw)
+                var changed = false
+                val keep = org.json.JSONObject()
+                for (uid in obj.keys()) {
+                    val arr = obj.optJSONArray(uid) ?: continue
+                    val kept = org.json.JSONArray()
+                    for (i in 0 until arr.length()) {
+                        val roomId = arr.getString(i)
+                        if (roomId in leftIds) changed = true else kept.put(roomId)
+                    }
+                    // Drop keys whose list became empty; keep the rest.
+                    if (kept.length() > 0) keep.put(uid, kept) else if (arr.length() > 0) changed = true
+                }
+                if (changed) c.setAccountData("m.direct", keep.toString())
             }
         }
         rebuildRooms()
