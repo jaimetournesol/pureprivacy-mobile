@@ -486,7 +486,16 @@ object MatrixRepo {
      *  the chat list / previews refresh immediately instead of after a slow tick. */
     fun onForeground(foreground: Boolean) {
         appForeground = foreground
-        if (foreground) scope.launch { runCatching { checkNotifs() }; runCatching { refreshPreviews() } }
+        if (foreground) scope.launch {
+            // Refresh consent from account-data on resume so a removal made on another
+            // device (or box-side) is reflected the moment the app is opened — then
+            // rebuild so the consent-gated hide/show takes effect. loadConsent keeps the
+            // existing set on a failed read, so a flaky Tor read never drops a contact.
+            // (Foreground-only — not per poll-tick — keeps this cheap.)
+            runCatching { loadConsent() }
+            runCatching { rebuildRooms() }
+            runCatching { checkNotifs() }; runCatching { refreshPreviews() }
+        }
     }
 
     private fun applyRoomUpdates(updates: List<RoomListEntriesUpdate>) {
