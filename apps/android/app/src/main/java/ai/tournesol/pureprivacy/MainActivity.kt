@@ -46,6 +46,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.semantics.Role
 import androidx.compose.runtime.produceState
 import ai.tournesol.pureprivacy.matrix.MatrixRepo
 import kotlinx.coroutines.Dispatchers
@@ -193,7 +194,14 @@ private fun TorBadge(modifier: Modifier = Modifier, onRetry: (() -> Unit)? = nul
     var showSheet by remember { mutableStateOf(false) }
 
     Row(
-        modifier.then(if (actionable) Modifier.clickable { showSheet = true } else Modifier),
+        // [QW-ui] When actionable (tap-to-retry), expose it as a Button to a11y and give
+        // it a 48dp min touch target so the small badge is comfortably tappable.
+        modifier.then(
+            if (actionable) Modifier
+                .sizeIn(minHeight = 48.dp)
+                .clickable(role = Role.Button) { showSheet = true }
+            else Modifier
+        ),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Icon(Icons.Filled.Lock, null, tint = color, modifier = Modifier.size(14.dp))
@@ -566,7 +574,9 @@ fun RoomsScreen(vm: AppViewModel) {
         AlertDialog(
             onDismissRequest = { if (!busy) { pendingRemove = null; notify = false } },
             containerColor = InkCard,
-            title = { Text("Remove ${target.name}?", color = Paper) },
+            // [QW-ui] A long contact name must not blow out the dialog title — cap at 2
+            // lines and ellipsize.
+            title = { Text("Remove ${target.name}?", color = Paper, maxLines = 2, overflow = TextOverflow.Ellipsis) },
             text = {
                 Column {
                     Text(
@@ -939,19 +949,30 @@ fun ChatScreen(vm: AppViewModel, roomId: String, roomName: String) {
                 IconButton(onClick = { pickFile.launch("*/*") }) {
                     Icon(Icons.Filled.AttachFile, "attach a file", tint = Sunflower)
                 }
+                // [QW-ui] A trimmed draft is the real payload; blank/whitespace never sends.
+                val canSend = draft.isNotBlank()
+                val doSend = {
+                    if (canSend) { vm.send(draft); draft = "" }
+                }
                 OutlinedTextField(
                     value = draft, onValueChange = { draft = it },
                     placeholder = { Text("Message", color = PaperDim) },
                     modifier = Modifier.weight(1f),
                     shape = RoundedCornerShape(22.dp),
+                    // [QW-ui] IME "Send" action submits the message from the keyboard.
+                    keyboardOptions = KeyboardOptions(imeAction = androidx.compose.ui.text.input.ImeAction.Send),
+                    keyboardActions = androidx.compose.foundation.text.KeyboardActions(onSend = { doSend() }),
                     colors = OutlinedTextFieldDefaults.colors(
                         focusedBorderColor = Sunflower, unfocusedBorderColor = Outline,
                         focusedTextColor = Paper, unfocusedTextColor = Paper, cursorColor = Sunflower
                     )
                 )
                 Spacer(Modifier.width(8.dp))
+                // [QW-ui] Enabled only when there's something to send (disabled = no-op +
+                // dimmed), so an empty tap can't fire a blank send.
                 FilledIconButton(
-                    onClick = { vm.send(draft); draft = "" },
+                    onClick = doSend,
+                    enabled = canSend,
                     colors = IconButtonDefaults.filledIconButtonColors(containerColor = Sunflower, contentColor = Ink)
                 ) { Icon(Icons.AutoMirrored.Filled.Send, "send") }
             }
@@ -1060,8 +1081,12 @@ private fun Bubble(m: ChatMsg, onAttachment: () -> Unit = {}, onRetry: () -> Uni
                     SendState.Sent ->
                         Icon(Icons.Filled.Check, "sent", tint = PaperDim, modifier = Modifier.size(12.dp))
                     SendState.Failed ->
+                        // [QW-ui] Retry exposed as a Button with a 48dp min touch target.
                         Text("Not sent · tap to retry", color = Danger, fontSize = 10.sp,
-                            modifier = Modifier.clickable { onRetry() })
+                            modifier = Modifier
+                                .sizeIn(minHeight = 48.dp)
+                                .clickable(role = Role.Button) { onRetry() }
+                                .wrapContentHeight())
                 }
             }
         }

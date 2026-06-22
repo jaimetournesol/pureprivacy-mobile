@@ -575,13 +575,42 @@ class ElementCallActivity : ComponentActivity() {
         }
     }
 
+    /** [C3] Loopback host? Our bridges all live on 127.0.0.1 (IPv4 loopback) /
+     *  localhost; the WebView's plain http/ws to them is the only legitimate
+     *  cleartext. Everything else must NOT egress on the real IP. */
+    private fun isLoopback(host: String): Boolean =
+        host == "127.0.0.1" || host.equals("localhost", ignoreCase = true) || host == "::1"
+
     private fun WebView.webViewClientInjectOnLoad() {
         webViewClient = object : WebViewClient() {
             override fun onReceivedSslError(view: WebView, handler: SslErrorHandler, error: SslError) {
-                handler.proceed()
+                // [C3] Scope the cert-error bypass to loopback ONLY. The box's
+                // self-signed onion certs are terminated by our local TorNet bridges
+                // (which the WebView reaches on plain http on 127.0.0.1), so the WebView
+                // itself should never see a real onion TLS endpoint. proceed() only for a
+                // loopback URL; cancel + log anything else so a hostile cert on a real
+                // host can't be silently accepted.
+                val host = runCatching { android.net.Uri.parse(error.url).host }.getOrNull()
+                if (host != null && isLoopback(host)) {
+                    handler.proceed()
+                } else {
+                    Log.w(TAG, "blocked SSL error for non-loopback host=$host url=${error.url}")
+                    handler.cancel()
+                }
             }
             override fun shouldInterceptRequest(view: WebView, request: android.webkit.WebResourceRequest): android.webkit.WebResourceResponse? {
-                val host = request.url.host ?: return null
+                // [C3] Non-network schemes (data:/blob:/about:) carry NO network egress,
+                // so they cannot deanonymize — allow them. Element Call uses inline
+                // `data:` documents internally; fail-closing on them (host==null) broke
+                // its rendering without preventing any IP leak. Only real network
+                // requests (a non-loopback host) are gated below. (Found by the live
+                // call test: EC issued a data:text/html document that was being 403'd.)
+                when (request.url.scheme?.lowercase()) {
+                    "data", "blob", "about" -> return null
+                }
+                val host = request.url.host ?: return blocked(request.url.toString())
+                // Loopback bridges (the only cleartext path) load normally.
+                if (isLoopback(host)) return null
                 // Intercept Element Call's direct .onion requests (e.g. server-name
                 // /.well-known discovery) — Chromium would block them; serve over Tor.
                 if (host == ecOnion && request.method == "GET") {
@@ -615,12 +644,31 @@ class ElementCallActivity : ComponentActivity() {
                         Log.i(TAG, "intercepted onion GET $path -> $code")
                         android.webkit.WebResourceResponse(ct, "utf-8", code, "OK", hdrs, java.io.ByteArrayInputStream(bytes))
                     } catch (t: Throwable) {
+                        // Transient Tor failure fetching OUR box's onion. Returning null
+                        // lets Chromium try the raw .onion, which it blocks natively — no
+                        // clearnet egress — so the call simply retries; safe to fall back.
                         Log.e(TAG, "intercept failed", t); null
                     }
                 }
-                return null
+                // [C3] FAIL CLOSED. Any request whose host is not loopback and not our
+                // box's onion (handled above) is blocked with a 403 instead of the old
+                // fail-OPEN return null — which would have let an external URL egress on
+                // the real IP (deanonymization). The legitimate call path only ever hits
+                // 127.0.0.1 bridges + our ecOnion, both handled above.
+                return blocked(request.url.toString())
             }
         }
+    }
+
+    /** [C3] A hard 403 for a request we refuse to let leave the WebView — the
+     *  fail-closed default. Logged so a genuinely-needed host shows up instead of
+     *  silently egressing. */
+    private fun blocked(url: String): android.webkit.WebResourceResponse {
+        Log.w(TAG, "BLOCKED non-loopback WebView egress: $url")
+        return android.webkit.WebResourceResponse(
+            "text/plain", "utf-8", 403, "Blocked",
+            emptyMap(), java.io.ByteArrayInputStream(ByteArray(0))
+        )
     }
 
     override fun onDestroy() {

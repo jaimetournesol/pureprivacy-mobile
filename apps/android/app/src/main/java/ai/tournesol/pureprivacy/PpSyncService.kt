@@ -13,11 +13,14 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import ai.tournesol.pureprivacy.matrix.MatrixRepo
 import ai.tournesol.pureprivacy.matrix.Notif
+import ai.tournesol.pureprivacy.tor.TorManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Keeps the matrix-rust-sdk sync (and embedded Tor) alive while the app is
@@ -28,13 +31,18 @@ import kotlinx.coroutines.launch
  */
 class PpSyncService : Service() {
     private val scope = CoroutineScope(Dispatchers.Main.immediate + SupervisorJob())
+    // [C4] Guards against two overlapping self-restore attempts (e.g. the OS redelivers
+    // onStartCommand while one is already running after a process kill).
+    private val reviving = AtomicBoolean(false)
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
         ensureChannels(this)
-        startForegroundCompat()
+        // [C4] Reflect the real state right away — after a process-kill restart we are NOT
+        // connected yet, so don't flash a misleading "Connected" before onStartCommand.
+        startForegroundCompat(if (MatrixRepo.isLoggedIn) "Connected over Tor" else "Reconnecting over Tor…")
         scope.launch { MatrixRepo.notifications.collect { post(it) } }
         // When a call ends (e.g. the caller hung up before answer), clear its ringing
         // notification so the callee stops being rung.
@@ -46,20 +54,73 @@ class PpSyncService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        startForegroundCompat()
+        // [C4] The service is START_STICKY, so the OS restarts it after a low-memory kill
+        // — but the process was torn down, so MatrixRepo.client is null and nothing is
+        // delivered, while this notification used to read a misleading "Connected". So:
+        // if we're NOT logged in but a saved session exists, re-run the same restore the
+        // app's cold start does (wait for Tor Ready -> tryRestore -> startSync), showing
+        // "Reconnecting…" until sync is actually Connected. A live session is left alone.
+        if (!MatrixRepo.isLoggedIn && MatrixRepo.hasSavedSession(this)) {
+            startForegroundCompat("Reconnecting over Tor…")
+            reviveSession()
+        } else {
+            startForegroundCompat(if (MatrixRepo.isLoggedIn) "Connected over Tor" else "Reconnecting over Tor…")
+        }
         return START_STICKY
     }
 
-    private fun startForegroundCompat() {
-        val n = NotificationCompat.Builder(this, CH_STATUS)
+    /** [C4] Re-establish the Matrix session after an OS process kill, mirroring
+     *  AppViewModel.startRestore: wait for Tor to be Ready (bounded), tryRestore, then
+     *  startSync. Keep the notification on "Reconnecting…" until sync reports Connected,
+     *  so the persistent notification never lies about the connection state. Single-flight
+     *  via [reviving]. Best-effort: on failure the notification stays "Reconnecting…" and
+     *  the next onStartCommand / app open retries. */
+    private fun reviveSession() {
+        if (!reviving.compareAndSet(false, true)) return
+        scope.launch {
+            try {
+                // Bounded wait for Tor (it starts via PpApp/AppViewModel); don't block forever.
+                var waited = 0
+                while (TorManager.state.value !is TorManager.State.Ready && waited < 120) {
+                    if (MatrixRepo.isLoggedIn) return@launch     // app restored it first
+                    delay(1000); waited++
+                }
+                if (TorManager.state.value !is TorManager.State.Ready) {
+                    updateStatus("Reconnecting over Tor…"); return@launch
+                }
+                if (MatrixRepo.isLoggedIn) return@launch          // app beat us to it
+                val ok = runCatching { MatrixRepo.tryRestore(this@PpSyncService) }.getOrDefault(false)
+                if (!ok) { updateStatus("Reconnecting over Tor…"); return@launch }
+                runCatching { MatrixRepo.startSync() }
+                // Reflect the real sync state: only show "Connected" once it actually is.
+                var settled = 0
+                while (MatrixRepo.status.value != "Connected" && settled < 30) { delay(1000); settled++ }
+                updateStatus(if (MatrixRepo.status.value == "Connected") "Connected over Tor" else "Reconnecting over Tor…")
+            } finally {
+                reviving.set(false)
+            }
+        }
+    }
+
+    private fun updateStatus(text: String) {
+        runCatching {
+            NotificationManagerCompat.from(this).notify(1, statusNotification(text))
+        }
+    }
+
+    private fun statusNotification(text: String) =
+        NotificationCompat.Builder(this, CH_STATUS)
             .setContentTitle("PurePrivacy")
-            .setContentText("Connected over Tor")
+            .setContentText(text)
             .setSmallIcon(R.drawable.ic_sunflower)
             .setOngoing(true)
             .setShowWhen(false)
             .setContentIntent(openApp(null, null))
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
+
+    private fun startForegroundCompat(text: String = "Connected over Tor") {
+        val n = statusNotification(text)
         if (Build.VERSION.SDK_INT >= 29)
             startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
         else startForeground(1, n)

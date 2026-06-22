@@ -65,6 +65,18 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         // Tor runs for the lifetime of the app; start() blocks reading its log.
         viewModelScope.launch(Dispatchers.IO) { TorManager.start(getApplication()) }
         startRestore()
+        // [H1] A HARD auth error (revoked token / dead session) flips MatrixRepo.authExpired;
+        // route the user to Login so they re-authenticate instead of staring at a stuck
+        // "Reconnecting" with a dead token. Transient/soft errors never set this.
+        viewModelScope.launch {
+            MatrixRepo.authExpired.collect { expired ->
+                if (expired && screen.value !is Screen.Login) {
+                    restoring = false
+                    error.value = "You were signed out. Please sign in again."
+                    screen.value = Screen.Login
+                }
+            }
+        }
     }
 
     /** Restore a saved session (if any) once Tor is up, and jump to the chats.

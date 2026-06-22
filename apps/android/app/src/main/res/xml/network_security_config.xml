@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  [C3] Fail-closed cleartext policy. Replaces the blanket android:usesCleartextTraffic="true"
+  in the manifest. The ONLY cleartext (plain http/ws) the platform networking stack ever
+  needs is to 127.0.0.1: the Element Call WebView talks to our loopback bridges over plain
+  http/ws (TorNet), and those bridges TLS-tunnel to the box's .onion over Tor on the far
+  side. Everything else (the box client API over Tor, the call.element.io bundle) is reached
+  by the native matrix-rust-sdk / OkHttp over https — none of it needs cleartext.
+
+  NB: the matrix-rust-sdk is a native (Rust/reqwest) library and is NOT governed by this
+  policy at all; its http://<onion>:8008 client-API calls go out over the Tor SOCKS proxy
+  and are unaffected by tightening the platform cleartext policy here.
+-->
+<network-security-config>
+    <!-- Default: NO cleartext to anywhere on the network. -->
+    <base-config cleartextTrafficPermitted="false" />
+
+    <!-- Loopback only: the call WebView <-> local Tor bridges (plain http/ws). -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
+    </domain-config>
+</network-security-config>

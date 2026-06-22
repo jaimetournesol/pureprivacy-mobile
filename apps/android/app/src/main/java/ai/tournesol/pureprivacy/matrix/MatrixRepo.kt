@@ -14,6 +14,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import org.matrix.rustcomponents.sdk.Client
+import org.matrix.rustcomponents.sdk.ClientDelegate
+import org.matrix.rustcomponents.sdk.ClientSessionDelegate
 import org.matrix.rustcomponents.sdk.EnableRecoveryProgress
 import org.matrix.rustcomponents.sdk.EnableRecoveryProgressListener
 import org.matrix.rustcomponents.sdk.EncryptedMessage
@@ -124,6 +126,11 @@ object MatrixRepo {
     private const val BACKGROUND_POLL_MS = 20000L  // gentle backstop in the background/doze
     /** Onions of contacts we've scanned (mirrors PAIR_ACCOUNT_DATA). */
     private val consentedOnions = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+    /** [QW-perf] When we last read consent from account-data (over Tor). Used to debounce
+     *  the onForeground read — a resume burst shouldn't fire a fresh Tor round-trip each
+     *  time. The authoritative per-sync-cycle loadConsent is NOT debounced. */
+    @Volatile private var lastConsentReadMs = 0L
+    private const val CONSENT_READ_DEBOUNCE_MS = 60_000L
 
     private var client: Client? = null
     private var syncService: SyncService? = null
@@ -159,6 +166,18 @@ object MatrixRepo {
     val rooms = MutableStateFlow<List<RoomSummary>>(emptyList())
     val messages = MutableStateFlow<List<ChatMsg>>(emptyList())
     val status = MutableStateFlow("")
+
+    /** [H1] Set true when the session is HARD-revoked (a non-soft-logout auth error, or
+     *  the sync retry loop exhausting its hard-failure budget). AppViewModel observes
+     *  this and routes to Login. Never set on a transient/soft error — those keep
+     *  retrying with a valid (possibly refreshed) token. */
+    val authExpired = MutableStateFlow(false)
+    /** Owns the ClientDelegate callback stream (didReceiveAuthError); dropping it stops
+     *  the callback, so we hold it for the client's lifetime. */
+    private var clientDelegateHandle: TaskHandle? = null
+    /** Consecutive sync hard-failures (ERROR/TERMINATED) since the last RUNNING. Past a
+     *  cap we treat the session as dead and route to Login instead of looping forever. */
+    @Volatile private var syncHardFailures = 0
 
     /** Background-notification stream — the foreground service collects this and
      *  posts Android notifications for messages / calls / invites. */
@@ -221,8 +240,44 @@ object MatrixRepo {
             .autoEnableCrossSigning(true)
             .autoEnableBackups(true)
             .backupDownloadStrategy(uniffi.matrix_sdk.BackupDownloadStrategy.ONE_SHOT)
+            // [H1] Re-persist on every token rotation. The SDK refreshes the access (and
+            // sometimes refresh) token in the background; without a session delegate the
+            // rotated token only lived in memory, so the NEXT cold restore replayed a
+            // stale token and 401'd. saveSessionInKeychain fires on each refresh — write
+            // it straight to the encrypted prefs so restore always uses the live token.
+            .setSessionDelegate(sessionDelegate(ctx))
         if (homeserverUrl != null) b = b.homeserverUrl(homeserverUrl)
         return b
+    }
+
+    /** [H1] The SDK's session/token-rotation delegate. saveSessionInKeychain is called
+     *  on every token refresh (and once at login) — we re-persist to the encrypted
+     *  prefs so a rotated token is never lost. retrieveSessionFromKeychain lets the
+     *  SDK's cross-process refresh read back the current session. We do NOT call
+     *  disableAutomaticTokenRefresh — we WANT the SDK to keep refreshing; this delegate
+     *  just makes the refresh durable. */
+    private fun sessionDelegate(ctx: Context): ClientSessionDelegate {
+        val app = ctx.applicationContext
+        return object : ClientSessionDelegate {
+            override fun saveSessionInKeychain(session: Session) {
+                runCatching { persist(app, session) }
+                    .onSuccess { Log.i(TAG, "session delegate: re-persisted rotated token") }
+                    .onFailure { Log.w(TAG, "session delegate: persist failed: ${it.message}") }
+            }
+            override fun retrieveSessionFromKeychain(userId: String): Session {
+                val p = sessionPrefs(app)
+                val at = p.getString("at", null)
+                    ?: throw IllegalStateException("no stored session for $userId")
+                val hs = p.getString("hs", null)
+                    ?: throw IllegalStateException("no stored homeserver for $userId")
+                val ssv = runCatching { SlidingSyncVersion.valueOf(p.getString("ssv", "NATIVE")!!) }
+                    .getOrDefault(SlidingSyncVersion.NATIVE)
+                return Session(
+                    at, p.getString("rt", null), p.getString("uid", userId)!!,
+                    p.getString("did", "")!!, hs, p.getString("oauth", null), ssv
+                )
+            }
+        }
     }
 
     /** Delete the on-disk Matrix session + crypto store. A stale store from a
@@ -230,6 +285,54 @@ object MatrixRepo {
      *  fresh login, so we always start a sign-in from clean state. */
     private fun wipeStore(ctx: Context) {
         runCatching { File(ctx.filesDir, "matrix").deleteRecursively() }
+    }
+
+    /** [H1] Register the client delegate so a HARD auth error (token revoked / account
+     *  invalidated server-side — anything that is NOT a recoverable soft-logout) tears
+     *  the session down and routes the user to Login instead of retrying a dead token
+     *  forever. A soft-logout (isSoftLogout=true) is the SDK's "your token rotated, I'll
+     *  refresh" path — we leave that alone, the session delegate keeps it persisted. */
+    private fun registerClientDelegate(ctx: Context, c: Client) {
+        val app = ctx.applicationContext
+        runCatching { clientDelegateHandle?.cancel() }
+        clientDelegateHandle = runCatching {
+            c.setDelegate(object : ClientDelegate {
+                override fun didReceiveAuthError(isSoftLogout: Boolean) {
+                    Log.w(TAG, "didReceiveAuthError(softLogout=$isSoftLogout)")
+                    if (isSoftLogout) {
+                        // Recoverable: the SDK refreshes the token; the session delegate
+                        // re-persists it. Do NOT wipe — that would log out a valid user.
+                        return
+                    }
+                    // Hard revoke: stop fighting it, clear the stored session, route to Login.
+                    handleHardAuthError(app)
+                }
+                override fun onBackgroundTaskErrorReport(
+                    taskName: String,
+                    error: uniffi.matrix_sdk_common.BackgroundTaskFailureReason
+                ) {
+                    Log.w(TAG, "background task error in $taskName: $error")
+                }
+            })
+        }.getOrElse { Log.w(TAG, "setDelegate failed: ${it.message}"); null }
+    }
+
+    /** [H1] A hard, unrecoverable auth failure: stop the sync retry loop, wipe the stored
+     *  session + crypto store, and flip [authExpired] so AppViewModel routes to Login.
+     *  Idempotent — guarded by authExpired so concurrent callers (delegate + retry-loop
+     *  escalation) don't double-tear-down. Never called for a transient/soft error. */
+    private fun handleHardAuthError(ctx: Context) {
+        if (authExpired.value) return
+        Log.w(TAG, "hard auth error — clearing session and routing to Login")
+        runCatching { syncStateHandle?.cancel() }; syncStateHandle = null
+        val ss = syncService                              // stop() is suspend — do it off-thread
+        runCatching { sessionPrefs(ctx).edit().clear().apply() }
+        runCatching { ctx.getSharedPreferences(SESSION_OLD, Context.MODE_PRIVATE).edit().clear().apply() }
+        wipeStore(ctx)                                    // [H1] also delete the on-disk crypto store so it matches the doc/report (login() also wipes it before re-auth)
+        client = null; syncService = null
+        scope.launch { runCatching { ss?.stop() } }
+        status.value = "Signed out — please sign in again."
+        authExpired.value = true
     }
 
     suspend fun login(ctx: Context, homeserverUrl: String, user: String, pass: String) {
@@ -241,6 +344,8 @@ object MatrixRepo {
         runCatching { sessionPrefs(ctx).edit().remove("rk").apply() }
         val c = builder(ctx, homeserverUrl).build()
         client = c
+        authExpired.value = false                       // [H1] fresh sign-in clears any prior expiry
+        registerClientDelegate(ctx, c)                  // [H1] watch for hard auth errors
         status.value = "Signing in…"
         c.login(user, pass, "PurePrivacy Android", null)
         userId = runCatching { c.userId() }.getOrDefault("@$user")
@@ -270,6 +375,8 @@ object MatrixRepo {
         )
         c.restoreSession(s)
         client = c
+        authExpired.value = false                       // [H1] a successful restore is a live session
+        registerClientDelegate(ctx, c)                  // [H1] watch for hard auth errors
         userId = s.userId
         deviceId = s.deviceId
         Log.i(TAG, "restored session for $userId (device $deviceId)")
@@ -404,6 +511,7 @@ object MatrixRepo {
                 when (state) {
                     org.matrix.rustcomponents.sdk.SyncServiceState.RUNNING -> {
                         syncRestartDelayMs = 0L
+                        syncHardFailures = 0                 // [H1] a healthy cycle resets the budget
                         if (status.value != "Connected") status.value = "Connected"
                         scope.launch {
                             // Re-read consent from account-data first so a removal (here
@@ -418,6 +526,21 @@ object MatrixRepo {
                     }
                     org.matrix.rustcomponents.sdk.SyncServiceState.ERROR,
                     org.matrix.rustcomponents.sdk.SyncServiceState.TERMINATED -> {
+                        // [H1] ERROR/TERMINATED is ALWAYS treated as transient and retried
+                        // with capped backoff — that's the self-heal this loop exists for.
+                        // We must NEVER wipe a valid session on a sync fault: the SDK
+                        // surfaces an unreachable box over Tor as ERROR/TERMINATED (not
+                        // OFFLINE), and the project's own notes document multi-minute Tor
+                        // federation stalls, so a fault-count escalation here would
+                        // destroy a perfectly valid session on a benign network outage.
+                        // The authoritative hard-auth signal is the delegate's
+                        // didReceiveAuthError(isSoftLogout=false) (revoked token / account
+                        // invalidated server-side), which is what tears the session down.
+                        // syncHardFailures is kept for diagnostics only (reset on RUNNING).
+                        syncHardFailures++
+                        if (syncHardFailures > 0 && syncHardFailures % 12 == 0) {
+                            Log.w(TAG, "sync still faulting after $syncHardFailures consecutive errors — continuing to retry over Tor")
+                        }
                         val delay = syncRestartDelayMs.coerceAtLeast(1000L)
                         syncRestartDelayMs = (delay * 2).coerceAtMost(30000L)
                         status.value = "Reconnecting over Tor…"
@@ -492,7 +615,11 @@ object MatrixRepo {
             // rebuild so the consent-gated hide/show takes effect. loadConsent keeps the
             // existing set on a failed read, so a flaky Tor read never drops a contact.
             // (Foreground-only — not per poll-tick — keeps this cheap.)
-            runCatching { loadConsent() }
+            // [QW-perf] Debounce: skip the Tor read if we read consent < ~60s ago (a
+            // resume burst / rapid app switching shouldn't fire a fresh round-trip each
+            // time). The authoritative per-sync-cycle loadConsent is unaffected.
+            if (System.currentTimeMillis() - lastConsentReadMs >= CONSENT_READ_DEBOUNCE_MS)
+                runCatching { loadConsent() }
             runCatching { rebuildRooms() }
             runCatching { checkNotifs() }; runCatching { refreshPreviews() }
         }
@@ -540,7 +667,15 @@ object MatrixRepo {
         // nobody, fall through to members() (which fetches over Tor). Without this a
         // reinstall / second device would never re-surface an existing chat.
         if (scanForJoinedPeer(runCatching { r.membersNoSync() }.getOrNull())) return true
-        return scanForJoinedPeer(runCatching { r.members() }.getOrNull())
+        // [QW-perf] members() is a NETWORKED fetch over Tor — bound it so a hung circuit
+        // can't stall rebuildRooms (and the whole visible chat list) indefinitely. On a
+        // timeout we just fall back to "peer not seen joined yet" (false); the next sync
+        // cycle / rebuild re-tries, so a slow circuit degrades gracefully instead of
+        // freezing the list.
+        val networked = kotlinx.coroutines.withTimeoutOrNull(15_000) {
+            runCatching { r.members() }.getOrNull()
+        }
+        return scanForJoinedPeer(networked)
     }
 
     /** True if [iter] yields a joined member who is neither me nor the server bot. */
@@ -987,8 +1122,34 @@ object MatrixRepo {
             .onFailure { Log.w(TAG, "retrySend failed for $key: ${it.message}") }
     }
 
+    /** [H4] Is this room CONFIRMED to be unencrypted? Conservative on purpose: we only
+     *  return true when the SDK affirmatively reports the room is NOT encrypted. We use
+     *  latestEncryptionState() — a 3-state enum (ENCRYPTED / NOT_ENCRYPTED / UNKNOWN) —
+     *  and block ONLY on NOT_ENCRYPTED. UNKNOWN (state not yet synced over Tor, e.g. an
+     *  invite whose stripped m.room.encryption hasn't warmed) and any read error fall
+     *  through to false so we NEVER block a legitimate encrypted room — our normal DMs
+     *  are all created with isEncrypted=true. NB: room.isEncrypted() collapses UNKNOWN
+     *  to false, which would mis-classify an un-warmed encrypted invite as unencrypted
+     *  and transiently skip its auto-join; latestEncryptionState() avoids that. The
+     *  point is purely to refuse sending cleartext into a room that genuinely has no
+     *  encryption (e.g. a malformed/injected room), never silently. */
+    private suspend fun isConfirmedUnencrypted(room: Room): Boolean {
+        val state = runCatching { room.latestEncryptionState() }.getOrNull() ?: return false
+        return state == uniffi.matrix_sdk_base.EncryptionState.NOT_ENCRYPTED
+    }
+
     suspend fun send(text: String) {
         val tl = timeline ?: return
+        // [H4] Never send cleartext: if the open room is confirmed unencrypted, refuse
+        // and surface a clear error rather than leaking the message in the clear. A
+        // no-op for our normal E2EE DMs (latestEncryptionState() == ENCRYPTED).
+        currentRoom?.let { room ->
+            if (isConfirmedUnencrypted(room)) {
+                Log.w(TAG, "refusing to send into a non-encrypted room ${runCatching { room.id() }.getOrNull()}")
+                status.value = "Not sent — this chat isn't encrypted."
+                return
+            }
+        }
         tl.send(messageEventContentFromMarkdown(text))
     }
 
@@ -1080,6 +1241,7 @@ object MatrixRepo {
                 consentedOnions.addAll(fresh)
             }
         }
+        lastConsentReadMs = System.currentTimeMillis()   // [QW-perf] stamp the successful read
     }
 
     /** Record consent for a scanned contact: remember their box's onion (the server
@@ -1249,6 +1411,15 @@ object MatrixRepo {
             val inviter = runCatching { r.inviter() }.getOrNull()?.userId ?: continue
             val onion = inviter.substringAfter(":", "")
             if (onion in consentedOnions) {
+                // [H4] Don't auto-join a room we can CONFIRM is unencrypted — refuse and
+                // log rather than silently entering a cleartext room from an invite.
+                // isConfirmedUnencrypted is false on unknown/unresolved state, so a
+                // genuinely-encrypted invite (state not yet warm) still auto-joins as
+                // before: this is a no-op for our normal E2EE DMs.
+                if (isConfirmedUnencrypted(r)) {
+                    Log.w(TAG, "refusing auto-join of non-encrypted room ${r.id()} from $inviter")
+                    continue
+                }
                 runCatching { c.joinRoomById(r.id()) }
             }
         }
@@ -1378,6 +1549,8 @@ object MatrixRepo {
         runCatching { ctx.getSharedPreferences(SESSION_OLD, Context.MODE_PRIVATE).edit().clear().apply() }
         runCatching { timelineHandle?.cancel() }
         runCatching { syncStateHandle?.cancel() }; syncStateHandle = null; syncRestartDelayMs = 0L
+        runCatching { clientDelegateHandle?.cancel() }; clientDelegateHandle = null   // [H1]
+        syncHardFailures = 0; authExpired.value = false                               // [H1]
         runCatching { callSubs.values.forEach { it.cancel() } }; callSubs.clear()
         timelineHandle = null; roomListResult = null; roomList = null
         client = null; syncService = null; roomListService = null; timeline = null

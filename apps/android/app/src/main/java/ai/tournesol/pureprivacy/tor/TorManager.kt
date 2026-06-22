@@ -58,9 +58,12 @@ object TorManager {
                 AvoidDiskWrites 1
                 CookieAuthentication 0
                 ControlPort 0
-                SafeLogging 0
                 Log notice stdout
                 """.trimIndent()
+                // [H8] Do NOT set "SafeLogging 0": Tor's default SafeLogging 1 scrubs
+                // onion addresses / IPs from its logs. Disabling it leaked the box onion
+                // (and circuit peers) into logcat. The raw notice mirror below is also
+                // DEBUG-gated so release builds never echo unscrubbed Tor lines.
             )
 
             Log.i(TAG, "exec ${torExe.absolutePath} -f ${torrc.absolutePath}")
@@ -75,7 +78,10 @@ object TorManager {
             proc.inputStream.bufferedReader().use { reader ->
                 while (true) {
                     val line = reader.readLine() ?: break
-                    Log.d(TAG, line)
+                    // [H8] Gate the raw Tor notice mirror behind DEBUG: with SafeLogging
+                    // at its default (1) Tor already scrubs onions/IPs, but the raw line
+                    // can still carry sensitive detail — never echo it in release builds.
+                    if (ai.tournesol.pureprivacy.BuildConfig.DEBUG) Log.d(TAG, line)
                     val m = Regex("""Bootstrapped (\d+)%[^:]*:?\s*(.*)""").find(line)
                     if (m != null) {
                         val pct = m.groupValues[1].toIntOrNull() ?: 0
