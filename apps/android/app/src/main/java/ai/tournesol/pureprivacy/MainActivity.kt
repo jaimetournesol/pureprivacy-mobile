@@ -990,7 +990,13 @@ fun ChatScreen(vm: AppViewModel, roomId: String, roomName: String) {
         } else {
             LazyColumn(
                 Modifier.fillMaxSize().padding(pad).padding(horizontal = 12.dp),
-                state = listState
+                state = listState,
+                // Anchor the conversation to the bottom: a short thread sits glued to
+                // the input bar (not floating at the top), and the newest message stays
+                // just above the composer. With windowSoftInputMode=adjustResize the
+                // window shrinks for the keyboard, so the latest message rides up with
+                // it instead of hiding behind the keyboard until it's dismissed.
+                verticalArrangement = Arrangement.Bottom
             ) {
                 items(messages, key = { it.key }) { m ->
                     Bubble(m, onAttachment = { vm.saveAttachment(m) }, onRetry = { vm.retrySend(m.key) })
