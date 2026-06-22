@@ -37,6 +37,8 @@ import androidx.compose.material.icons.filled.QrCode
 import androidx.compose.material.icons.filled.QrCode2
 import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material.icons.filled.Videocam
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -470,11 +472,26 @@ private fun middleTruncate(s: String, head: Int = 14, tail: Int = 10): String =
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun PpField(value: String, onChange: (String) -> Unit, label: String, password: Boolean = false) {
+    // Let a password field reveal its text — typing a long box password blind is
+    // error-prone (and an onion box has no "forgot password" reset). Defaults hidden.
+    var revealed by remember { mutableStateOf(false) }
     OutlinedTextField(
         value = value, onValueChange = onChange,
         label = { Text(label) },
         singleLine = true,
-        visualTransformation = if (password) PasswordVisualTransformation() else androidx.compose.ui.text.input.VisualTransformation.None,
+        visualTransformation = if (password && !revealed) PasswordVisualTransformation()
+            else androidx.compose.ui.text.input.VisualTransformation.None,
+        trailingIcon = if (!password) null else {
+            {
+                IconButton(onClick = { revealed = !revealed }) {
+                    Icon(
+                        if (revealed) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
+                        contentDescription = if (revealed) "Hide password" else "Show password",
+                        tint = PaperDim,
+                    )
+                }
+            }
+        },
         // Onion address, username and password are all case-sensitive lowercase ASCII —
         // never let the IME autocapitalize the first letter or autocorrect them.
         keyboardOptions = KeyboardOptions(
