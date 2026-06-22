@@ -113,24 +113,20 @@ data class Notif(
 object MatrixRepo {
     private const val TAG = "PpMatrix"
 
-    /** Account-data event where we record the onions of contacts we've scanned.
-     *  Two jobs: (1) our box's desktop app reads it and allowlists those onions for
-     *  federation — this is how a phone QR exchange pairs the two boxes; (2) it's our
-     *  record of consent, so an incoming invite from someone we've also scanned is
-     *  auto-accepted (a chat appears only once BOTH sides have scanned). */
-    private const val PAIR_ACCOUNT_DATA = "ai.tournesol.pureprivacy.pairings"
     private const val SESSION_ENC = "pp_session_enc"   // encrypted token store
     private const val SESSION_OLD = "pp_session"       // legacy plaintext (migrated away)
     private const val RECOVERY_ACCOUNT_DATA = "ai.tournesol.pureprivacy.recovery"
     private const val FOREGROUND_POLL_MS = 2500L   // snappy while the app is on screen
     private const val BACKGROUND_POLL_MS = 20000L  // gentle backstop in the background/doze
-    /** Onions of contacts we've scanned (mirrors PAIR_ACCOUNT_DATA). */
-    private val consentedOnions = java.util.Collections.synchronizedSet(mutableSetOf<String>())
-    /** [QW-perf] When we last read consent from account-data (over Tor). Used to debounce
-     *  the onForeground read — a resume burst shouldn't fire a fresh Tor round-trip each
-     *  time. The authoritative per-sync-cycle loadConsent is NOT debounced. */
-    @Volatile private var lastConsentReadMs = 0L
+    /** [QW-perf] Debounce for the onForeground consent read — a resume burst shouldn't
+     *  fire a fresh Tor round-trip each time. The authoritative per-sync-cycle
+     *  loadConsent is NOT debounced. */
     private const val CONSENT_READ_DEBOUNCE_MS = 60_000L
+
+    /** Consent (scanned-contact onions) + the `…pairings` account-data ops that our
+     *  box reconciles into its federation allowlist. Extracted so the consent state
+     *  lives in one cohesive place instead of threading through the repo (W3-T3). */
+    private val consent = ConsentRepository()
 
     private var client: Client? = null
     private var syncService: SyncService? = null
@@ -618,7 +614,7 @@ object MatrixRepo {
             // [QW-perf] Debounce: skip the Tor read if we read consent < ~60s ago (a
             // resume burst / rapid app switching shouldn't fire a fresh round-trip each
             // time). The authoritative per-sync-cycle loadConsent is unaffected.
-            if (System.currentTimeMillis() - lastConsentReadMs >= CONSENT_READ_DEBOUNCE_MS)
+            if (System.currentTimeMillis() - consent.lastReadMs >= CONSENT_READ_DEBOUNCE_MS)
                 runCatching { loadConsent() }
             runCatching { rebuildRooms() }
             runCatching { checkNotifs() }; runCatching { refreshPreviews() }
@@ -727,12 +723,12 @@ object MatrixRepo {
             // happens once both have scanned each other.
             val peerIn = mem == Membership.JOINED && peerJoined(r)
             // Consent-gated hide: a peer we've silently removed is dropped from
-            // consentedOnions (account-data), so the row must disappear with no
+            // the consent set (account-data), so the row must disappear with no
             // federated leave. The `null` fallback (heroes not warm yet) avoids
             // hiding a live chat during hero warm-up — gating only kicks in once we
             // can actually read the peer's onion.
             val peerOnion = peerId(r)?.substringAfter(":", "")?.trim()
-            val paired = peerIn && (peerOnion == null || peerOnion in consentedOnions)
+            val paired = peerIn && (peerOnion == null || peerOnion in consent)
             RoomSummary(
                 r.id(), roomName(r),
                 invited = mem == Membership.INVITED,
@@ -835,14 +831,14 @@ object MatrixRepo {
     private suspend fun evaluateRoomCall(room: Room, hasCall: Boolean, participants: List<String>) {
         val id = runCatching { room.id() }.getOrNull() ?: return
         // Consent-gated ring: never ring for a peer we've removed (silently or by
-        // notify). Their onion is gone from consentedOnions, so the row is hidden —
+        // notify). Their onion is gone from the consent set, so the row is hidden —
         // an incoming call from them must not resurface as a phantom ring. Gate on
         // the human caller's onion; the `null` fallback (no human participant) keeps
         // the existing "no one to ring for" behaviour.
         val callerOnion = participants
             .firstOrNull { it != userId && !isServerBot(it) }
             ?.substringAfter(":", "")?.trim()
-        val peerConsented = callerOnion == null || callerOnion in consentedOnions
+        val peerConsented = callerOnion == null || callerOnion in consent
         val peerInCall = hasCall && peerConsented && participants.any { it != userId && !isServerBot(it) }
         // Multi-device: if MY account is already in the call (this or another of my
         // devices answered), don't ring — and stop any ring in progress.
@@ -1230,18 +1226,7 @@ object MatrixRepo {
      *  be resurrected. Re-run on every RUNNING sync cycle. Best-effort — on a failed
      *  read we keep the existing set (a transient Tor read must never drop consent). */
     private suspend fun loadConsent() {
-        val c = client ?: return
-        val raw = runCatching { c.accountData(PAIR_ACCOUNT_DATA) }.getOrNull() ?: return
-        runCatching {
-            val arr = org.json.JSONObject(raw).optJSONArray("onions") ?: return
-            val fresh = mutableSetOf<String>()
-            for (i in 0 until arr.length()) fresh.add(arr.getString(i))
-            synchronized(consentedOnions) {
-                consentedOnions.clear()
-                consentedOnions.addAll(fresh)
-            }
-        }
-        lastConsentReadMs = System.currentTimeMillis()   // [QW-perf] stamp the successful read
+        client?.let { consent.load(it) }
     }
 
     /** Record consent for a scanned contact: remember their box's onion (the server
@@ -1251,35 +1236,7 @@ object MatrixRepo {
         val c = client ?: return
         val onion = peerUserId.substringAfter(":", "").trim()
         if (!onion.endsWith(".onion")) { Log.w(TAG, "recordPairing: '$onion' is not an onion"); return }
-        if (onion in consentedOnions) return   // already recorded AND persisted
-        // Build the new set from the FRESHLY-READ account-data array + this one onion
-        // only. Account-data is authoritative — do NOT union in the in-memory
-        // consentedOnions, or a peer just removed (and dropped from account-data on
-        // another device) would be resurrected here on the next add.
-        val set = linkedSetOf<String>()
-        runCatching { c.accountData(PAIR_ACCOUNT_DATA) }.getOrNull()?.let { raw ->
-            runCatching {
-                org.json.JSONObject(raw).optJSONArray("onions")?.let { a ->
-                    for (i in 0 until a.length()) set.add(a.getString(i))
-                }
-            }
-        }
-        set.add(onion)
-        val json = org.json.JSONObject().put("onions", org.json.JSONArray(set.toList())).toString()
-        // The write goes to our box over Tor, which can be flaky and reqwest caches
-        // a failed connect — so retry. Only mark consent once it actually persisted,
-        // otherwise a failed write would silently never reach the box's allowlist.
-        for (attempt in 1..8) {
-            val r = runCatching { c.setAccountData(PAIR_ACCOUNT_DATA, json) }
-            if (r.isSuccess) {
-                consentedOnions.addAll(set)
-                Log.i(TAG, "recordPairing: persisted $onion (attempt $attempt)")
-                return
-            }
-            Log.w(TAG, "recordPairing: write attempt $attempt failed: ${r.exceptionOrNull()?.message}")
-            kotlinx.coroutines.delay(3000)
-        }
-        Log.e(TAG, "recordPairing: gave up persisting $onion after retries")
+        consent.record(c, onion)
     }
 
     /** Inverse of [recordPairing]: drop a contact's onion from account-data (the
@@ -1292,36 +1249,7 @@ object MatrixRepo {
      *  persisted. */
     private suspend fun removeOnionFromAccountData(onion: String): Boolean {
         val c = client ?: return false
-        // Read the current array and build the kept set (minus this onion). If there's
-        // no account-data yet there's nothing to remove — and consent already lacks it.
-        val set = linkedSetOf<String>()
-        runCatching { c.accountData(PAIR_ACCOUNT_DATA) }.getOrNull()?.let { raw ->
-            runCatching {
-                org.json.JSONObject(raw).optJSONArray("onions")?.let { a ->
-                    for (i in 0 until a.length()) set.add(a.getString(i))
-                }
-            }
-        }
-        if (!set.remove(onion)) {
-            // Onion isn't in account-data: nothing to PUT. Keep consent in sync.
-            consentedOnions.remove(onion)
-            Log.i(TAG, "removeOnionFromAccountData: $onion not present; nothing to write")
-            return true
-        }
-        val json = org.json.JSONObject().put("onions", org.json.JSONArray(set.toList())).toString()
-        for (attempt in 1..8) {
-            val r = runCatching { c.setAccountData(PAIR_ACCOUNT_DATA, json) }
-            if (r.isSuccess) {
-                // Persisted: only NOW drop in-memory consent so the two never diverge.
-                consentedOnions.remove(onion)
-                Log.i(TAG, "removeOnionFromAccountData: removed $onion (attempt $attempt)")
-                return true
-            }
-            Log.w(TAG, "removeOnionFromAccountData: write attempt $attempt failed: ${r.exceptionOrNull()?.message}")
-            kotlinx.coroutines.delay(3000)
-        }
-        Log.e(TAG, "removeOnionFromAccountData: gave up removing $onion after retries")
-        return false
+        return consent.remove(c, onion)
     }
 
     /** Remove a contact (@user:onion). Destructive by default — drops the peer's onion
@@ -1410,7 +1338,7 @@ object MatrixRepo {
             if (!invited) continue
             val inviter = runCatching { r.inviter() }.getOrNull()?.userId ?: continue
             val onion = inviter.substringAfter(":", "")
-            if (onion in consentedOnions) {
+            if (onion in consent) {
                 // [H4] Don't auto-join a room we can CONFIRM is unencrypted — refuse and
                 // log rather than silently entering a cleartext room from an invite.
                 // isConfirmedUnencrypted is false on unknown/unresolved state, so a
