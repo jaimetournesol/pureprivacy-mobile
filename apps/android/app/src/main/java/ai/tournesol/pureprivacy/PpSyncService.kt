@@ -196,6 +196,13 @@ class PpSyncService : Service() {
             if (Build.VERSION.SDK_INT >= 26) ctx.startForegroundService(i) else ctx.startService(i)
         }
 
+        /** Stop the foreground sync service (and drop its persistent "Connected over Tor"
+         *  notification). Used by Pause ("go dark") and by "erase this phone" — the app
+         *  is intentionally going offline, so START_STICKY should not resurrect it. */
+        fun stop(ctx: Context) {
+            runCatching { ctx.stopService(Intent(ctx, PpSyncService::class.java)) }
+        }
+
         fun ensureChannels(ctx: Context) {
             if (Build.VERSION.SDK_INT < 26) return
             val nm = ctx.getSystemService(NotificationManager::class.java)

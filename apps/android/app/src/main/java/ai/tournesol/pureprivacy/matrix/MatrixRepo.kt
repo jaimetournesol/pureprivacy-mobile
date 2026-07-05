@@ -512,6 +512,17 @@ object MatrixRepo {
         }
     }
 
+    /** Go offline WITHOUT signing out: stop the sync stream + its state watcher and
+     *  cancel the live timeline, but KEEP the client + persisted session so [startSync]
+     *  can resume. Backs the Pause ("go dark") control together with TorManager.stop()
+     *  and PpSyncService.stop(). Session, keys and consent are all left intact. */
+    suspend fun pauseSync() {
+        runCatching { syncStateHandle?.cancel() }; syncStateHandle = null; syncRestartDelayMs = 0L
+        runCatching { timelineHandle?.cancel() }; timelineHandle = null
+        runCatching { syncService?.stop() }
+        status.value = ""
+    }
+
     suspend fun startSync() {
         val c = client ?: error("not logged in")
         runCatching { loadConsent() }   // restore who we've already scanned

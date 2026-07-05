@@ -14,7 +14,13 @@ class PpApp : Application() {
         // killed session is re-established without the user opening the app. Guarded: only
         // when a session exists (never pre-login), and wrapped — a background-start that
         // Android 12+ refuses must not crash the app; the next app open will start it.
-        if (runCatching { MatrixRepo.hasSavedSession(this) }.getOrDefault(false)) {
+        // Respect an explicit Pause ("go dark"): if the user paused, stay offline on a
+        // cold process start — don't resurrect the sync service (which would boot Tor and
+        // reconnect). Resume from the Paused screen brings it all back.
+        val paused = runCatching {
+            getSharedPreferences("pp_app", MODE_PRIVATE).getBoolean("paused", false)
+        }.getOrDefault(false)
+        if (!paused && runCatching { MatrixRepo.hasSavedSession(this) }.getOrDefault(false)) {
             runCatching { PpSyncService.start(this) }
                 .onFailure { Log.w("PpApp", "could not start sync service from onCreate: ${it.message}") }
         }

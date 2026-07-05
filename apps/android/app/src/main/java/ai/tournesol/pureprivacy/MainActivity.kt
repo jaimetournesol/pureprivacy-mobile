@@ -26,8 +26,12 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.AccountCircle
 import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.DeleteForever
+import androidx.compose.material.icons.filled.PauseCircleOutline
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Lock
@@ -124,6 +128,7 @@ class MainActivity : ComponentActivity() {
                         is Screen.Login -> LoginScreen(vm)
                         is Screen.Rooms -> RoomsScreen(vm)
                         is Screen.Profile -> ProfileScreen(vm)
+                        is Screen.Paused -> PausedScreen(vm)
                         is Screen.Chat -> ChatScreen(vm, s.roomId, s.roomName)
                     }
                 }
@@ -656,7 +661,7 @@ fun RoomsScreen(vm: AppViewModel) {
                 title = { Column { Text("Chats", color = Paper, fontWeight = FontWeight.Bold); TorBadge(onRetry = vm::retryTor) } },
                 actions = {
                     IconButton(onClick = { vm.showProfile() }) {
-                        Icon(Icons.Filled.QrCode, "my code", tint = Sunflower)
+                        Icon(Icons.Filled.AccountCircle, "profile — my code, pause, sign out", tint = Sunflower)
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = InkSoft)
@@ -846,15 +851,52 @@ fun ProfileScreen(vm: AppViewModel) {
 
     val scan = rememberScan { contents -> if (contents != null) vm.addContact(contents) }
 
+    // Sign-out sheet — two levels: a plain sign-out vs a destructive full device wipe.
+    // Cancel is the safe default (confirm slot); Erase is a distinct destructive action.
+    var showSignOut by remember { mutableStateOf(false) }
+    if (showSignOut) {
+        AlertDialog(
+            onDismissRequest = { showSignOut = false },
+            containerColor = InkCard,
+            icon = { Icon(Icons.AutoMirrored.Filled.Logout, null, tint = Sunflower) },
+            title = { Text("Sign out?", color = Paper, fontWeight = FontWeight.Bold) },
+            text = {
+                Column {
+                    Text(
+                        "Your box and your chats live on your computer — signing back in restores them.",
+                        color = PaperDim, fontSize = 13.sp, lineHeight = 18.sp
+                    )
+                    Spacer(Modifier.height(16.dp))
+                    TextButton(
+                        onClick = { showSignOut = false; vm.logout() },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.AutoMirrored.Filled.Logout, null, tint = Sunflower); Spacer(Modifier.width(8.dp))
+                        Text("Sign out", color = Sunflower, fontWeight = FontWeight.SemiBold)
+                    }
+                    TextButton(
+                        onClick = { showSignOut = false; vm.eraseDevice() },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Filled.DeleteForever, null, tint = Danger); Spacer(Modifier.width(8.dp))
+                        Text("Erase this phone", color = Danger, fontWeight = FontWeight.SemiBold)
+                    }
+                    Text("Erase also wipes Tor data + caches — nothing left on this device.",
+                        color = PaperDim, fontSize = 11.sp, lineHeight = 15.sp)
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showSignOut = false }) { Text("Cancel", color = PaperDim) }
+            }
+        )
+    }
+
     Scaffold(
         containerColor = Ink,
         topBar = {
             TopAppBar(
                 navigationIcon = { IconButton(onClick = { vm.openRooms() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, null, tint = Paper) } },
-                title = { Text("My code", color = Paper, fontWeight = FontWeight.Bold) },
-                actions = {
-                    IconButton(onClick = { vm.logout() }) { Icon(Icons.AutoMirrored.Filled.Logout, "sign out", tint = PaperDim) }
-                },
+                title = { Text("Profile", color = Paper, fontWeight = FontWeight.Bold) },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = InkSoft)
             )
         }
@@ -926,6 +968,62 @@ fun ProfileScreen(vm: AppViewModel) {
                 color = PaperDim, fontSize = 12.sp, textAlign = TextAlign.Center,
                 lineHeight = 17.sp
             )
+
+            // ── Account ─────────────────────────────────────────────────────────
+            Spacer(Modifier.height(28.dp))
+            HorizontalDivider(color = InkCard)
+            Spacer(Modifier.height(16.dp))
+            // Pause / go dark: tear down Tor + sync, hide the chats, appear offline.
+            OutlinedButton(
+                onClick = { vm.pause() },
+                modifier = Modifier.fillMaxWidth().height(52.dp), shape = RoundedCornerShape(14.dp),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = Paper),
+                border = androidx.compose.foundation.BorderStroke(1.dp, InkCard)
+            ) {
+                Icon(Icons.Filled.PauseCircleOutline, null, tint = Sunflower); Spacer(Modifier.width(8.dp))
+                Text("Pause — go offline", fontWeight = FontWeight.SemiBold)
+            }
+            Spacer(Modifier.height(6.dp))
+            Text("Stops Tor and hides your chats. Messages wait on your box until you resume.",
+                color = PaperDim, fontSize = 12.sp, textAlign = TextAlign.Center, lineHeight = 16.sp)
+
+            Spacer(Modifier.height(16.dp))
+            TextButton(onClick = { showSignOut = true }, modifier = Modifier.fillMaxWidth()) {
+                Icon(Icons.AutoMirrored.Filled.Logout, null, tint = Danger); Spacer(Modifier.width(8.dp))
+                Text("Sign out", color = Danger, fontWeight = FontWeight.SemiBold)
+            }
+            Spacer(Modifier.height(24.dp))
+        }
+    }
+}
+
+/** Full-screen "go dark" wall shown while [Screen.Paused]. Tor + sync are down and the
+ *  chat list is hidden — a calm, unambiguous offline state with a single Resume action. */
+@Composable
+fun PausedScreen(vm: AppViewModel) {
+    Scaffold(containerColor = Ink) { pad ->
+        Column(
+            Modifier.fillMaxSize().padding(pad).padding(32.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Icon(Icons.Filled.PauseCircleOutline, null, tint = Sunflower, modifier = Modifier.size(56.dp))
+            Spacer(Modifier.height(20.dp))
+            Text("Paused — you're offline", color = Paper, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(10.dp))
+            Text(
+                "No messages go in or out, and Tor is off. Your box holds anything sent to you until you resume.",
+                color = PaperDim, fontSize = 14.sp, textAlign = TextAlign.Center, lineHeight = 20.sp
+            )
+            Spacer(Modifier.height(28.dp))
+            Button(
+                onClick = { vm.resume() },
+                colors = ButtonDefaults.buttonColors(containerColor = Sunflower, contentColor = Ink),
+                modifier = Modifier.fillMaxWidth().height(52.dp), shape = RoundedCornerShape(14.dp)
+            ) {
+                Icon(Icons.Filled.PlayArrow, null); Spacer(Modifier.width(8.dp))
+                Text("Resume", fontWeight = FontWeight.SemiBold)
+            }
         }
     }
 }

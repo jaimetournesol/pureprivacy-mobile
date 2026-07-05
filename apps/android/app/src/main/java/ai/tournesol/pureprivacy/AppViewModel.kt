@@ -18,6 +18,10 @@ sealed class Screen {
     data object Login : Screen()
     data object Rooms : Screen()
     data object Profile : Screen()
+    /** "Go dark": Tor + sync are torn down and the chat list is hidden behind a calm
+     *  offline wall. A privacy control — nothing goes in or out until Resume. Survives
+     *  app restarts (persisted), so re-opening the app while paused stays dark. */
+    data object Paused : Screen()
     data class Chat(val roomId: String, val roomName: String) : Screen()
 }
 
@@ -62,9 +66,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     @Volatile private var restoring = false
 
     init {
-        // Tor runs for the lifetime of the app; start() blocks reading its log.
-        viewModelScope.launch(Dispatchers.IO) { TorManager.start(getApplication()) }
-        startRestore()
+        if (isPaused) {
+            // Stay dark on launch: don't boot Tor or restore the session, and hide the
+            // chat list. The user explicitly paused; honour it until they Resume.
+            screen.value = Screen.Paused
+        } else {
+            // Tor runs for the lifetime of the app; start() blocks reading its log.
+            viewModelScope.launch(Dispatchers.IO) { TorManager.start(getApplication()) }
+            startRestore()
+        }
         // [H1] A HARD auth error (revoked token / dead session) flips MatrixRepo.authExpired;
         // route the user to Login so they re-authenticate instead of staring at a stuck
         // "Reconnecting" with a dead token. Transient/soft errors never set this.
@@ -365,9 +375,73 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun showProfile() { error.value = null; screen.value = Screen.Profile }
     fun openRooms() { error.value = null; screen.value = Screen.Rooms }
 
+    /** Persisted "paused" flag so a Pause survives an app restart (privacy: re-opening
+     *  the app while paused must stay dark, not silently reconnect). */
+    private fun appPrefs() =
+        getApplication<Application>().getSharedPreferences("pp_app", android.content.Context.MODE_PRIVATE)
+    private var isPaused: Boolean
+        get() = appPrefs().getBoolean("paused", false)
+        set(v) { appPrefs().edit().putBoolean("paused", v).apply() }
+    val paused = MutableStateFlow(false).also { it.value = isPaused }
+
+    /** Pause / "go dark": tear down sync + Tor and hide the chat list, WITHOUT signing
+     *  out (session + keys stay). Peers' messages queue on your box (your computer) and
+     *  arrive on Resume. Persisted so it holds across app restarts. */
+    fun pause() {
+        isPaused = true; paused.value = true
+        val app = getApplication<Application>()
+        screen.value = Screen.Paused
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { MatrixRepo.pauseSync() }   // stop the sync stream, keep the session
+            runCatching { PpSyncService.stop(app) }  // drop the foreground service + its notification
+            runCatching { TorManager.stop() }        // go offline — no circuits, nothing in or out
+        }
+    }
+
+    /** Resume from [pause]: bring Tor back up, restore/resume the session, restart the
+     *  background service, and return to the chats. Mirrors the cold-start restore. */
+    fun resume() {
+        isPaused = false; paused.value = false
+        val app = getApplication<Application>()
+        restorePhase.value = RestorePhase.Working
+        screen.value = Screen.Splash
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { TorManager.start(app) }        // blocks until tor exits; fire-and-forget below
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            // Wait (bounded) for Tor to be Ready, then restore the session + resume sync.
+            var waited = 0
+            while (TorManager.state.value !is TorManager.State.Ready && waited < 90) { kotlinx.coroutines.delay(1000); waited++ }
+            if (!MatrixRepo.isLoggedIn) runCatching { MatrixRepo.tryRestore(app) }
+            runCatching { MatrixRepo.startSync() }
+            runCatching { PpSyncService.start(app) }
+            screen.value = if (MatrixRepo.isLoggedIn) Screen.Rooms else Screen.Login
+        }
+    }
+
     fun logout() {
         viewModelScope.launch(Dispatchers.IO) {
             runCatching { MatrixRepo.logout(getApplication()) }
+            isPaused = false; paused.value = false
+            screen.value = Screen.Login
+        }
+    }
+
+    /** "Erase this phone": everything [logout] wipes (session + crypto store) PLUS the
+     *  Tor data dir (guards / onion-descriptor cache) and app caches — a true local wipe
+     *  that leaves no trace on the device. Your box + chats live on your computer, so a
+     *  fresh sign-in restores them. Destructive; the UI gates it behind a confirm. */
+    fun eraseDevice() {
+        val app = getApplication<Application>()
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { PpSyncService.stop(app) }
+            runCatching { MatrixRepo.logout(app) }          // session + crypto store
+            runCatching { TorManager.stop() }
+            runCatching { java.io.File(app.filesDir, "tor").deleteRecursively() }   // guards + descriptor cache
+            runCatching { app.cacheDir.deleteRecursively() }                        // any cached media/thumbs
+            isPaused = false; paused.value = false
+            // Re-boot Tor for the next sign-in (its data dir was just wiped → fresh guards).
+            viewModelScope.launch(Dispatchers.IO) { runCatching { TorManager.start(app) } }
             screen.value = Screen.Login
         }
     }
