@@ -16,25 +16,39 @@ package ai.tournesol.pureprivacy.util
  * different classes depending on which layer (auth, client build, plain IO over the
  * SOCKS proxy) noticed it first, and the keywords are stable across SDK bumps.
  */
-fun mapError(t: Throwable): String {
-    // Flatten the message + every cause + class names into one lowercase haystack.
-    val haystack = buildString {
-        var cur: Throwable? = t
-        var hops = 0
-        while (cur != null && hops < 8) {
-            val e = cur
-            append(e.javaClass.simpleName).append(' ')
-            e.message?.let { append(it).append(' ') }
-            // The SDK's MatrixApi error carries the M_… code on a `code` property; pull
-            // it in too so we can match on the Matrix error code, not just the message.
-            runCatching {
-                e.javaClass.methods.firstOrNull { it.name == "getCode" && it.parameterCount == 0 }
-                    ?.invoke(e)?.let { append(it).append(' ') }
-            }
-            cur = e.cause.takeIf { it !== e }
-            hops++
+/** Flatten a throwable's message + every cause + class names (and the SDK's M_… code)
+ *  into one lowercase haystack for keyword matching. Shared by [mapError] and
+ *  [isAuthError] so both classify off the exact same text. */
+private fun haystackOf(t: Throwable): String = buildString {
+    var cur: Throwable? = t
+    var hops = 0
+    while (cur != null && hops < 8) {
+        val e = cur
+        append(e.javaClass.simpleName).append(' ')
+        e.message?.let { append(it).append(' ') }
+        // The SDK's MatrixApi error carries the M_… code on a `code` property; pull
+        // it in too so we can match on the Matrix error code, not just the message.
+        runCatching {
+            e.javaClass.methods.firstOrNull { it.name == "getCode" && it.parameterCount == 0 }
+                ?.invoke(e)?.let { append(it).append(' ') }
         }
-    }.lowercase()
+        cur = e.cause.takeIf { it !== e }
+        hops++
+    }
+}.lowercase()
+
+/** True when [t] is a wrong-username/password (auth) failure — which retrying will
+ *  NEVER fix. Login uses this to surface bad credentials immediately instead of looping
+ *  its internal cold-Tor retry; everything else (Tor warm-up, unreachable box, flaky
+ *  circuit) is transient and worth another attempt. */
+fun isAuthError(t: Throwable): Boolean =
+    haystackOf(t).let { h ->
+        listOf("m_forbidden", "forbidden", "invalid username", "invalid password",
+            "m_unauthorized", "wrong password", "unauthorized").any { h.contains(it) }
+    }
+
+fun mapError(t: Throwable): String {
+    val haystack = haystackOf(t)
 
     fun has(vararg needles: String) = needles.any { haystack.contains(it) }
 

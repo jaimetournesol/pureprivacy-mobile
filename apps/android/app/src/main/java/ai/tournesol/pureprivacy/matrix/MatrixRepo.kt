@@ -118,6 +118,10 @@ object MatrixRepo {
     private const val RECOVERY_ACCOUNT_DATA = "ai.tournesol.pureprivacy.recovery"
     private const val FOREGROUND_POLL_MS = 2500L   // snappy while the app is on screen
     private const val BACKGROUND_POLL_MS = 20000L  // gentle backstop in the background/doze
+    // Cold-Tor first-login smoothing: retry a transient reach-failure up to this many
+    // times, spacing attempts so a just-published onion's circuit has time to build.
+    private const val LOGIN_ATTEMPTS = 4
+    private const val LOGIN_RETRY_DELAY_MS = 4000L
     /** [QW-perf] Debounce for the onForeground consent read — a resume burst shouldn't
      *  fire a fresh Tor round-trip each time. The authoritative per-sync-cycle
      *  loadConsent is NOT debounced. */
@@ -343,7 +347,27 @@ object MatrixRepo {
         authExpired.value = false                       // [H1] fresh sign-in clears any prior expiry
         registerClientDelegate(ctx, c)                  // [H1] watch for hard auth errors
         status.value = "Signing in…"
-        c.login(user, pass, "PurePrivacy Android", null)
+        // First sign-in on a freshly-provisioned box hits a COLD Tor circuit to a just-
+        // published onion descriptor: the POST /login intermittently times out on the
+        // first attempt or two even though the box is perfectly healthy (seen live — the
+        // box answered /login in ~2s from a warm circuit, yet the app's first try failed
+        // and the user had to tap Retry / relaunch). Retry a transient reach-failure a
+        // few times over the slow circuit before surfacing it, so a friend's very first
+        // sign-in "just works". A wrong password (isAuthError) is NOT transient — rethrow
+        // it at once so we never loop on bad credentials.
+        var attempt = 0
+        while (true) {
+            attempt++
+            try {
+                c.login(user, pass, "PurePrivacy Android", null)
+                break
+            } catch (t: Throwable) {
+                if (ai.tournesol.pureprivacy.util.isAuthError(t) || attempt >= LOGIN_ATTEMPTS) throw t
+                Log.w(TAG, "login attempt $attempt failed (transient over Tor), retrying: ${t.message}")
+                status.value = "Signing in… still connecting over Tor"
+                kotlinx.coroutines.delay(LOGIN_RETRY_DELAY_MS)
+            }
+        }
         userId = runCatching { c.userId() }.getOrDefault("@$user")
         runCatching {
             val s = c.session()
@@ -970,6 +994,27 @@ object MatrixRepo {
             ?.userId
             ?.takeIf { it.startsWith("@") && it.contains(":") }
 
+    /** The DM's intended peer as recorded in `m.direct` ({"<userId>":["<roomId>",…]}),
+     *  independent of who is actually a *member*. [peerId] reads `heroes()`, which is
+     *  EMPTY for a room that only we ever joined — exactly the broken half-invite case
+     *  (we created the DM and "invited" a peer whose box hadn't allowlisted us yet, so
+     *  the invite PDU was 403'd and never committed; the room is left with only us in
+     *  it). Without this the room can never be identified as a DM-with-@peer, so the
+     *  self-heal re-invite [reInviteStalePeers] skips it forever and the pairing wedges.
+     *  Returns the (first) userId whose `m.direct` room-list contains [roomId]. */
+    private suspend fun directPeerOf(roomId: String): String? = runCatching {
+        val raw = client?.accountData("m.direct") ?: return@runCatching null
+        val obj = org.json.JSONObject(raw)
+        for (uid in obj.keys()) {
+            if (uid == userId || isServerBot(uid)) continue
+            val arr = obj.optJSONArray(uid) ?: continue
+            for (i in 0 until arr.length()) if (arr.getString(i) == roomId) {
+                return@runCatching uid.takeIf { it.startsWith("@") && it.contains(":") }
+            }
+        }
+        null
+    }.getOrNull()
+
     private fun roomName(r: Room): String {
         val hero = runCatching { r.heroes() }.getOrDefault(emptyList())
             .firstOrNull { it.userId != userId && !isServerBot(it.userId) }
@@ -1373,8 +1418,13 @@ object MatrixRepo {
             val joined = runCatching { r.membership() == Membership.JOINED }.getOrDefault(false)
             if (!joined) continue
             if (peerJoined(r)) continue          // both in → live already
-            if (lacksHumanPeer(r)) continue      // @conduit admin room / no human peer
-            val peer = peerId(r) ?: continue
+            // Resolve the intended peer. peerId (heroes) is EMPTY for a creator-only
+            // broken-invite room, so fall back to m.direct — which still records this as
+            // a DM-with-@peer even when the peer never became a member. If NEITHER
+            // resolves a peer, it's a genuinely peerless room (e.g. the @conduit admin
+            // room) → skip. This replaces the old `lacksHumanPeer` guard, which skipped
+            // creator-only rooms and left broken invites permanently wedged.
+            val peer = peerId(r) ?: directPeerOf(r.id()) ?: continue
             if (peer.substringAfter(":", "") !in consent) continue
             // Skip if the peer is already a member (Join or Invite) — the invite landed and
             // we're just waiting on their auto-accept; re-issuing would be needless churn.

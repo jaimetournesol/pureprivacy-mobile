@@ -2,6 +2,8 @@ package ai.tournesol.pureprivacy.matrix
 
 import android.util.Log
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
 import org.json.JSONObject
 import org.matrix.rustcomponents.sdk.Client
@@ -34,6 +36,15 @@ class ConsentRepository {
     /** Onions of contacts we've scanned (mirrors [ACCOUNT_DATA_TYPE]). */
     private val onions = Collections.synchronizedSet(mutableSetOf<String>())
 
+    /** Serializes the read-modify-write of the authoritative account-data array.
+     *  Without it, two near-simultaneous adds (e.g. scanning several friends in a
+     *  row, or replaying queued deep-links) each read the array, each append their
+     *  own onion, and the second PUT clobbers the first — the earlier pairing is
+     *  silently lost with NO error shown (observed live: a phone's first add of a
+     *  peer vanished while later adds stuck). record/remove take this lock so the
+     *  read and the write are one atomic critical section. */
+    private val ioLock = Mutex()
+
     /** Wall-clock ms of the last successful [load], for the caller's read debounce. */
     @Volatile
     var lastReadMs: Long = 0L
@@ -65,14 +76,16 @@ class ConsentRepository {
      *  another device would be resurrected). Marks consent locally only after a
      *  successful PUT (retried over flaky Tor). Returns true once persisted, or if it
      *  was already recorded. */
-    suspend fun record(c: Client, onion: String): Boolean {
-        if (contains(onion)) return true // already recorded AND persisted
+    suspend fun record(c: Client, onion: String): Boolean = ioLock.withLock {
+        if (contains(onion)) return@withLock true // already recorded AND persisted
         // Build the write from a SUCCESSFUL read only — a failed read must never become an
         // empty base set, or we'd PUT {this-onion-only} and the box would drop every other
-        // paired contact from its federation allowlist.
+        // paired contact from its federation allowlist. The read happens INSIDE ioLock, so a
+        // concurrent record/remove can't slip a write in between our read and our PUT (which
+        // would make us clobber their change — the lost-update bug this lock fixes).
         val set = readArrayWithRetry(c) ?: run {
             Log.e(TAG, "record: could not read account-data over Tor; NOT writing $onion (would clobber pairings)")
-            return false
+            return@withLock false
         }
         set.add(onion)
         val json = JSONObject().put("onions", JSONArray(set.toList())).toString()
@@ -80,13 +93,13 @@ class ConsentRepository {
             if (runCatching { c.setAccountData(ACCOUNT_DATA_TYPE, json) }.isSuccess) {
                 onions.addAll(set)
                 Log.i(TAG, "recorded $onion (attempt $attempt)")
-                return true
+                return@withLock true
             }
             Log.w(TAG, "record write attempt $attempt failed")
             delay(RETRY_DELAY_MS)
         }
         Log.e(TAG, "gave up persisting $onion after retries")
-        return false
+        return@withLock false
     }
 
     /** Inverse of [record]: drop [onion] from account-data (so the box's reconcile
@@ -94,33 +107,34 @@ class ConsentRepository {
      *  successful PUT — never leave account-data and consent out of sync (a failed
      *  write must NOT silently revoke consent locally; the op must stay re-runnable).
      *  Returns true once persisted, or if the onion was already absent. */
-    suspend fun remove(c: Client, onion: String): Boolean {
+    suspend fun remove(c: Client, onion: String): Boolean = ioLock.withLock {
         // Read with retry; a FAILED read must NOT be treated as "absent" — that would report
         // success + drop local consent while never PUTting the removal, so federation is
         // never actually cut (a half-remove). Only a SUCCESSFUL read that lacks the onion
-        // is genuinely "already absent".
+        // is genuinely "already absent". Read+write are under ioLock so a concurrent add
+        // can't interleave and resurrect the onion we're removing (or vice-versa).
         val set = readArrayWithRetry(c) ?: run {
             Log.e(TAG, "remove: could not read account-data over Tor; NOT completing remove of $onion")
-            return false
+            return@withLock false
         }
         if (!set.remove(onion)) {
             // Confirmed absent from a good read: nothing to PUT. Keep the in-memory set in sync.
             synchronized(onions) { onions.remove(onion) }
             Log.i(TAG, "$onion not present; nothing to write")
-            return true
+            return@withLock true
         }
         val json = JSONObject().put("onions", JSONArray(set.toList())).toString()
         for (attempt in 1..WRITE_RETRIES) {
             if (runCatching { c.setAccountData(ACCOUNT_DATA_TYPE, json) }.isSuccess) {
                 synchronized(onions) { onions.remove(onion) }
                 Log.i(TAG, "removed $onion (attempt $attempt)")
-                return true
+                return@withLock true
             }
             Log.w(TAG, "remove write attempt $attempt failed")
             delay(RETRY_DELAY_MS)
         }
         Log.e(TAG, "gave up removing $onion after retries")
-        return false
+        return@withLock false
     }
 
     /** Read the current `onions` array from account-data.
