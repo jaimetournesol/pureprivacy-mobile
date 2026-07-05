@@ -515,6 +515,7 @@ object MatrixRepo {
                             // in rebuildRooms takes effect this cycle.
                             runCatching { loadConsent() }
                             runCatching { autoAcceptMutual() }
+                            runCatching { reInviteStalePeers() }
                             runCatching { rebuildRooms() }
                             runCatching { reconcileCallSubs() }
                             runCatching { checkNotifs() }
@@ -593,6 +594,11 @@ object MatrixRepo {
                     // (cached membership) and matters even backgrounded, so the chat is
                     // already live when the app is opened.
                     runCatching { autoAcceptMutual() }
+                    // Keep re-driving any outgoing invite that hasn't landed yet (a fresh
+                    // peer's box can take longer than ensureInvited's initial burst to become
+                    // reachable over Tor). Idempotent + survives restarts. Matters even
+                    // backgrounded so pairing converges without the app open.
+                    runCatching { reInviteStalePeers() }
                     // The full rebuild (which recomputes "paired" + refreshes previews)
                     // only matters while the list is on screen.
                     if (appForeground) runCatching { rebuildRooms() }
@@ -1353,6 +1359,40 @@ object MatrixRepo {
         }
     }
 
+    /** Re-drive outgoing invites that haven't landed yet. `startChat`'s one-shot
+     *  `ensureInvited` gives up after ~2.4 min, but a fresh peer's box can take longer than
+     *  that to become reachable over Tor — so re-invite every sync cycle, unbounded, until
+     *  the peer is a member. Idempotent (skips peers already Join/Invite, so no spam) and —
+     *  unlike the fire-once launch — this survives an app restart. Only for peers whose onion
+     *  we've consented to; never touches the @conduit admin room. This is the receiver-agnostic
+     *  half of "pairing eventually converges even over a slow/flaky first-contact circuit." */
+    private suspend fun reInviteStalePeers() {
+        val c = client ?: return
+        val handles = synchronized(roomHandles) { roomHandles.values.toList() }
+        for (r in handles) {
+            val joined = runCatching { r.membership() == Membership.JOINED }.getOrDefault(false)
+            if (!joined) continue
+            if (peerJoined(r)) continue          // both in → live already
+            if (lacksHumanPeer(r)) continue      // @conduit admin room / no human peer
+            val peer = peerId(r) ?: continue
+            if (peer.substringAfter(":", "") !in consent) continue
+            // Skip if the peer is already a member (Join or Invite) — the invite landed and
+            // we're just waiting on their auto-accept; re-issuing would be needless churn.
+            val present = runCatching {
+                when (r.member(peer).membership) {
+                    is MembershipState.Join, is MembershipState.Invite -> true
+                    else -> false
+                }
+            }.getOrDefault(false)
+            if (present) continue
+            val res = runCatching {
+                kotlinx.coroutines.withTimeoutOrNull(20_000) { r.inviteUserById(peer) }
+            }
+            if (res.isFailure) Log.w(TAG, "reInvite: $peer -> ${r.id()} failed: ${res.exceptionOrNull()?.message}")
+            else Log.i(TAG, "reInvite: (re)sent invite to $peer for ${r.id()}")
+        }
+    }
+
     /** Find a room we've been INVITED to whose inviter is [peer] — a DM the peer
      *  created and is waiting for us to join. Lets a mutual QR-scan converge on the
      *  peer's room instead of spawning a competing one. */
@@ -1460,12 +1500,19 @@ object MatrixRepo {
                     }
                 }.getOrDefault(false)
                 if (present) { Log.i(TAG, "ensureInvited: $peer present in $roomId (attempt $attempt)"); return }
-                val r = runCatching { room.inviteUserById(peer) }
+                // Bound the invite: it blocks on our box's SYNCHRONOUS federated invite, which
+                // over a cold Tor circuit can hang far past the 6s cadence. Time it out so the
+                // retry loop keeps its rhythm.
+                val r = runCatching {
+                    kotlinx.coroutines.withTimeoutOrNull(20_000) { room.inviteUserById(peer) }
+                }
                 if (r.isFailure) Log.w(TAG, "ensureInvited attempt $attempt: ${r.exceptionOrNull()?.message}")
             }
             kotlinx.coroutines.delay(6000)
         }
-        Log.e(TAG, "ensureInvited: gave up inviting $peer to $roomId")
+        // Not a dead end: the per-sync-cycle reInviteStalePeers keeps re-inviting unbounded
+        // until the peer's box becomes reachable over Tor (and survives an app restart).
+        Log.i(TAG, "ensureInvited: initial burst done for $peer; sync reconcile will keep re-inviting")
     }
 
     /** Sign out: best-effort server logout, then wipe the local session so the
