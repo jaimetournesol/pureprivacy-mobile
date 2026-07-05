@@ -785,7 +785,12 @@ private fun RoomRow(r: RoomSummary, onOpen: () -> Unit, onScan: () -> Unit, onRe
                 // (you scanned them, waiting). A live chat shows its last message preview.
                 when {
                     r.invited -> Text("Wants to connect", color = Sunflower, fontSize = 12.sp)
-                    r.outgoing -> Text("Pending · waiting for them to scan your code",
+                    // "outgoing" = I've scanned them and joined; we're waiting on the
+                    // other box. That's EITHER they haven't scanned me back yet OR their
+                    // box is still reachable-over-Tor catching up (a first-time pair can
+                    // take a minute). Say so honestly instead of the misleading (and
+                    // re-scan-inducing) "waiting for them to scan your code".
+                    r.outgoing -> Text("Connecting over Tor — can take a minute · they may need to scan you too",
                         color = PaperDim, fontSize = 12.sp)
                     r.preview != null -> Text(r.preview!!, color = PaperDim, fontSize = 13.sp,
                         maxLines = 1, overflow = TextOverflow.Ellipsis)
