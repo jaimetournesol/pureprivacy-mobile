@@ -122,6 +122,8 @@ object MatrixRepo {
     // times, spacing attempts so a just-published onion's circuit has time to build.
     private const val LOGIN_ATTEMPTS = 4
     private const val LOGIN_RETRY_DELAY_MS = 4000L
+    // [UTD-recovery] Don't restart the sync more than once per this window.
+    private const val UTD_RECOVERY_COOLDOWN_MS = 20_000L
     /** [QW-perf] Debounce for the onForeground consent read — a resume burst shouldn't
      *  fire a fresh Tor round-trip each time. The authoritative per-sync-cycle
      *  loadConsent is NOT debounced. */
@@ -152,6 +154,16 @@ object MatrixRepo {
     // owns the state-observer stream task (drop it -> the observer stops firing).
     private var syncStateHandle: TaskHandle? = null
     @Volatile private var syncRestartDelayMs = 0L
+
+    // [UTD-recovery] Megolm sessions we've already tried to recover via a sync restart.
+    // A UTD usually means the room key reached our box over to-device but the long-
+    // running sync didn't APPLY it (seen live over flaky Tor) — a fresh sync re-applies
+    // it and decrypts the message + all later ones in that session. We restart the sync
+    // ONCE per session (this set bounds it) so a genuinely-lost key can't loop forever,
+    // and no more than once per cooldown (debounces a burst of UTDs into one restart).
+    private val utdRecoveredSessions = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+    @Volatile private var lastUtdRecoveryMs = 0L
+    private val utdLock = Any()
 
     var userId: String = ""
         private set
@@ -521,6 +533,34 @@ object MatrixRepo {
         runCatching { timelineHandle?.cancel() }; timelineHandle = null
         runCatching { syncService?.stop() }
         status.value = ""
+    }
+
+    /** [UTD-recovery] A message we couldn't decrypt almost always means the megolm room
+     *  key DID reach our box over to-device, but our long-running sync didn't apply it
+     *  (observed live over flaky Tor: charlie stuck on "can't decrypt" from bob, and a
+     *  plain app restart re-synced and decrypted everything). So on the FIRST UTD for a
+     *  session we haven't handled yet, restart the sync stream — a fresh SyncService
+     *  re-fetches + re-applies pending room keys, decrypting that message and every later
+     *  one in the session, turning "stuck forever" into "heals itself in ~10s".
+     *
+     *  Bounded so it can't thrash: at most one restart per [UTD_RECOVERY_COOLDOWN_MS]
+     *  (debounces a burst of UTDs into a single restart), and each session is only ever
+     *  retried once (a genuinely-lost key — e.g. a peer that wiped its device — must not
+     *  loop). Fire-and-forget; safe to call from rebuildRooms/toChatMsg. */
+    private fun maybeRecoverFromUtd(sessionId: String?) {
+        val sid = sessionId ?: return
+        if (sid in utdRecoveredSessions) return          // already tried this session — don't loop
+        val now = System.currentTimeMillis()
+        val go = synchronized(utdLock) {
+            if (now - lastUtdRecoveryMs < UTD_RECOVERY_COOLDOWN_MS) false
+            else { lastUtdRecoveryMs = now; utdRecoveredSessions.add(sid); true }
+        }
+        if (!go) return
+        scope.launch {
+            Log.i(TAG, "UTD recovery: restarting sync to re-apply room keys (session $sid)")
+            runCatching { syncService?.stop() }
+            runCatching { startSync() }
+        }
     }
 
     suspend fun startSync() {
@@ -1142,6 +1182,7 @@ object MatrixRepo {
                 val ts = runCatching { ev.timestamp.toLong() }.getOrDefault(0L)
                 val sid = (kind.msg as? EncryptedMessage.MegolmV1AesSha2)?.sessionId
                 Log.w(TAG, "UTD event from $sender ts=$ts session=$sid")
+                maybeRecoverFromUtd(sid)   // [UTD-recovery] re-sync to re-apply the missing key
                 val key = runCatching { ev.eventOrTransactionId.toString() }.getOrDefault("utd:$sender:$ts")
                 return ChatMsg(key, sender, "🔒 Can't decrypt this message", sender == me, ts)
             }
