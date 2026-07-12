@@ -562,6 +562,10 @@ class ElementCallActivity : ComponentActivity() {
             runCatching {
                 TorNet.startHttpProxy(JWT_PEER, "https://$host:8443", TorManager.HTTP_PORT, ecRewrites)
                 TorNet.startTlsForwarder(SFU_PEER, host, 7443, TorManager.SOCKS_PORT)
+                // Pre-build the circuit to the peer focus so the first JWT/SFU hop to it
+                // doesn't race a cold circuit (same cold-onion fix as the own-box prewarm).
+                TorNet.prewarm(host, 8443, TorManager.SOCKS_PORT)   // peer lk-jwt
+                TorNet.prewarm(host, 7443, TorManager.SOCKS_PORT)   // peer LiveKit SFU
             }.onFailure { Log.e(TAG, "peer bridge start failed", it) }
             // NB: we deliberately do NOT set turnOnion here. A foci_preferred in a
             // member's state is only a *candidate* focus, not the one this call landed

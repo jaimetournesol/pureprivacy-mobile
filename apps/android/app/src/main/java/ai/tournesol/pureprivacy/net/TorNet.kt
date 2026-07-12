@@ -30,6 +30,14 @@ import kotlin.concurrent.thread
 object TorNet {
     private const val TAG = "PpTorNet"
 
+    // Cold-onion resilience: the FIRST fetch after a call starts often hits a Tor
+    // circuit to the box's onion that's still building (10-30s for a fresh hidden
+    // service). A single hard failure there makes Element Call receive an error for the
+    // SFU JWT, destructure an undefined config, and crash the whole call ("first call
+    // fails, retry works"). Retry connection failures a few times so the JWT arrives.
+    private const val UPSTREAM_ATTEMPTS = 4
+    private const val UPSTREAM_RETRY_MS = 2000L
+
     private val trustAll = arrayOf<javax.net.ssl.TrustManager>(object : X509TrustManager {
         override fun checkClientTrusted(c: Array<out X509Certificate>?, a: String?) {}
         override fun checkServerTrusted(c: Array<out X509Certificate>?, a: String?) {}
@@ -95,7 +103,14 @@ object TorNet {
                         val body = files["postData"] ?: ""
                         reqB.method(m, body.toRequestBody(session.headers["content-type"]?.toMediaTypeOrNull()))
                     } else reqB.method(m, null)
-                    client.newCall(reqB.build()).execute().use { resp ->
+                    // Retry the upstream fetch on a cold-circuit connection failure (see
+                    // UPSTREAM_ATTEMPTS): a failed JWT fetch would otherwise crash the call.
+                    val builtReq = reqB.build()
+                    var upstreamErr: java.io.IOException? = null
+                    var built: Response? = null
+                    for (attempt in 1..UPSTREAM_ATTEMPTS) {
+                      try {
+                        built = client.newCall(builtReq).execute().use { resp ->
                         Log.i(TAG, "  upstream ${session.uri} -> ${resp.code}")
                         val ctType = resp.header("content-type") ?: "application/octet-stream"
                         val status = object : Response.IStatus {
@@ -130,7 +145,15 @@ object TorNet {
                             ) out.addHeader(k, v)
                         }
                         cors(out); out
+                        }
+                        break
+                      } catch (io: java.io.IOException) {
+                        upstreamErr = io
+                        Log.d(TAG, "upstream $localPort ${session.uri} attempt $attempt/$UPSTREAM_ATTEMPTS: ${io.message}")
+                        if (attempt < UPSTREAM_ATTEMPTS) Thread.sleep(UPSTREAM_RETRY_MS)
+                      }
                     }
+                    built ?: throw (upstreamErr ?: java.io.IOException("upstream unreachable"))
                 } catch (t: Throwable) {
                     Log.e(TAG, "proxy $localPort error", t)
                     newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "err:${t.message}")
