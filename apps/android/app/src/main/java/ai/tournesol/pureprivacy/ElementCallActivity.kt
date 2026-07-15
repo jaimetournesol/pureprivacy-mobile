@@ -101,6 +101,10 @@ class ElementCallActivity : ComponentActivity() {
         const val JWT_PEER = 18444   // -> FOCUS (peer) lk-jwt, discovered from call state
         const val SFU_PEER = 17444   // -> FOCUS (peer) SFU
         const val TURN_LOCAL = 13478 // -> coturn (onion:3478, TCP TURN) for media over Tor
+        /** Intent extra: start an AUDIO-ONLY call (no camera). Forces getUserMedia to
+         *  drop video, so no video track is ever captured — a fraction of the Tor
+         *  bandwidth of a video call (also eases the call-starves-federation problem). */
+        const val EXTRA_AUDIO_ONLY = "pp_audio_only"
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -115,7 +119,8 @@ class ElementCallActivity : ComponentActivity() {
 
         val onion = MatrixRepo.userId.substringAfter(":")  // box homeserver onion
         ecOnion = onion
-        Log.i(TAG, "call start: room=${runCatching { room.id() }.getOrNull()} box=$onion tor=${TorManager.state.value}")
+        val audioOnly = intent.getBooleanExtra(EXTRA_AUDIO_ONLY, false)
+        Log.i(TAG, "call start: room=${runCatching { room.id() }.getOrNull()} box=$onion audioOnly=$audioOnly tor=${TorManager.state.value}")
 
         // Local bridges: the WebView only ever talks to 127.0.0.1; we tunnel to the
         // onion over Tor (Chromium refuses .onion directly) and rewrite .onion URLs
@@ -177,11 +182,23 @@ class ElementCallActivity : ComponentActivity() {
               try { console.log('[pp] RTCPeerConnection patched -> relay via 127.0.0.1:$TURN_LOCAL'); } catch(e){}
             })();</script>
         """.trimIndent()
+        // Audio-only: force every getUserMedia to drop video, so no camera track is
+        // ever captured. EC then renders us as an audio participant, and we send a
+        // fraction of a video call's bytes over Tor (also eases federation starvation).
+        val audioPatch = if (audioOnly) """
+            <script>(function(){
+              var md = navigator.mediaDevices; if (!md || md.__ppAudioOnly) return;
+              var g = md.getUserMedia && md.getUserMedia.bind(md);
+              if (g) md.getUserMedia = function(c){ c = c || {}; c.video = false; return g(c); };
+              md.__ppAudioOnly = true;
+              try { console.log('[pp] audio-only: getUserMedia video disabled'); } catch(e){}
+            })();</script>
+        """.trimIndent() else ""
         // Serve Element Call itself from localhost (over Tor) so its origin is
         // 127.0.0.1 — a secure, PRIVATE origin in Chromium. Then all its calls to
         // our other 127.0.0.1 bridges are private->private (no Private Network
         // Access block) and localhost is a secure context (getUserMedia works).
-        TorNet.startHttpProxy(EC_LOCAL, "https://call.element.io", TorManager.HTTP_PORT, ecRewrites, turnPatch)
+        TorNet.startHttpProxy(EC_LOCAL, "https://call.element.io", TorManager.HTTP_PORT, ecRewrites, turnPatch + audioPatch)
         TorNet.startHttpProxy(HS_LOCAL, "https://$onion:8009", TorManager.HTTP_PORT, ecRewrites)
         TorNet.startHttpProxy(JWT_LOCAL, "https://$onion:8443", TorManager.HTTP_PORT, ecRewrites)
         TorNet.startTlsForwarder(SFU_LOCAL, onion, 7443, TorManager.SOCKS_PORT)

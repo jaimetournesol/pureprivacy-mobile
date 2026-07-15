@@ -28,6 +28,7 @@ import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.AccountCircle
 import androidx.compose.material.icons.filled.AttachFile
+import androidx.compose.material.icons.filled.Call
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.DeleteForever
 import androidx.compose.material.icons.filled.PauseCircleOutline
@@ -1054,9 +1055,15 @@ fun ChatScreen(vm: AppViewModel, roomId: String, roomName: String) {
                 },
                 title = { Column { Text(roomName, color = Paper, fontWeight = FontWeight.Bold, maxLines = 1); TorBadge(onRetry = vm::retryTor) } },
                 actions = {
+                    // Audio-only call (phone icon): no camera — a light voice call over Tor.
+                    IconButton(onClick = {
+                        ctx.startActivity(android.content.Intent(ctx, ElementCallActivity::class.java)
+                            .putExtra(ElementCallActivity.EXTRA_AUDIO_ONLY, true))
+                    }) { Icon(Icons.Filled.Call, "audio call", tint = Sunflower) }
+                    // Video call (camera icon).
                     IconButton(onClick = {
                         ctx.startActivity(android.content.Intent(ctx, ElementCallActivity::class.java))
-                    }) { Icon(Icons.Filled.Videocam, "call", tint = Sunflower) }
+                    }) { Icon(Icons.Filled.Videocam, "video call", tint = Sunflower) }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = InkSoft)
             )
