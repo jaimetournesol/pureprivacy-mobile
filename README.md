@@ -1,10 +1,27 @@
-# PurePrivacy Mobile
+# PurePrivacy Mobile — the portal to your box
 
-The branded PurePrivacy phone client — a privacy-first Matrix messenger built on
-**Element X's exact engine** (`matrix-rust-sdk`, E2EE + native sliding sync) that
-runs an **embedded Tor inside the app** and talks **only to your own personal
-`.onion` box** (the [PurePrivacy desktop](../pureprivacy-desktop) appliance).
-No central server, no Google/FCM push, no Orbot, no VPN.
+> **Take your data back.** The phone is your portal into your own private server —
+> your *box* — that hosts your apps over Tor, end-to-end encrypted, with no
+> corporation in the middle.
+
+Your messages, your friends, your calls — right now they live on corporate servers,
+harvested for profit and surveillance. **PurePrivacy is how you take them back.**
+This app talks **only to your own `.onion` box** (the
+[PurePrivacy desktop](../pureprivacy-desktop) appliance): every request — login,
+messages, calls — runs through an **embedded Tor inside the app**, built on Element
+X's exact engine (`matrix-rust-sdk`, E2EE + native sliding sync). No central server,
+no Google/FCM push, no Orbot, no VPN, no third party in the path.
+
+## The portal to your box
+
+Your box is a platform, not just a messenger — an always-on private cloud that hosts
+your apps. The phone is how you reach them:
+
+- **✅ Messaging + calls (working today)** — end-to-end encrypted chat and
+  voice/video over Tor, box-to-box.
+- **🚧 Social, files, personal agents (planned)** — as your box gains apps, the
+  phone becomes the **launcher**: a home screen of everything your box runs, each
+  opening over the same onion + E2EE rails.
 
 > **Status: Phase-2 client, in development.** The Android client is real and working
 > (login, contacts, chat, and voice/video calls all run over Tor — see below). iOS
