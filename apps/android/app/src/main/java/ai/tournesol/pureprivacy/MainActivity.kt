@@ -29,6 +29,9 @@ import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.AccountCircle
 import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.Call
+import androidx.compose.material.icons.automirrored.filled.CallMade
+import androidx.compose.material.icons.automirrored.filled.CallMissed
+import androidx.compose.material.icons.automirrored.filled.CallReceived
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.DeleteForever
 import androidx.compose.material.icons.filled.PauseCircleOutline
@@ -1126,7 +1129,8 @@ fun ChatScreen(vm: AppViewModel, roomId: String, roomName: String) {
                 verticalArrangement = Arrangement.Bottom
             ) {
                 items(messages, key = { it.key }) { m ->
-                    Bubble(m, onAttachment = { vm.saveAttachment(m) }, onRetry = { vm.retrySend(m.key) })
+                    Bubble(m, onAttachment = { vm.saveAttachment(m) }, onRetry = { vm.retrySend(m.key) },
+                        onCallBack = { ctx.startActivity(android.content.Intent(ctx, ElementCallActivity::class.java)) })
                 }
             }
         }
@@ -1134,7 +1138,23 @@ fun ChatScreen(vm: AppViewModel, roomId: String, roomName: String) {
 }
 
 @Composable
-private fun Bubble(m: ChatMsg, onAttachment: () -> Unit = {}, onRetry: () -> Unit = {}) {
+private fun Bubble(m: ChatMsg, onAttachment: () -> Unit = {}, onRetry: () -> Unit = {}, onCallBack: () -> Unit = {}) {
+    // Call-log entry: a centered chip recording that a call happened, tap to call back.
+    if (m.isCall) {
+        val declined = m.body.contains("decline", ignoreCase = true)
+        val icon = when { m.mine -> Icons.AutoMirrored.Filled.CallMade; declined -> Icons.AutoMirrored.Filled.CallMissed; else -> Icons.AutoMirrored.Filled.CallReceived }
+        val tint = if (declined) Danger else PaperDim
+        Row(
+            Modifier.fillMaxWidth().padding(vertical = 6.dp).clip(RoundedCornerShape(12.dp)).clickable { onCallBack() }
+                .padding(vertical = 4.dp),
+            horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(icon, null, tint = tint, modifier = Modifier.size(15.dp))
+            Spacer(Modifier.width(6.dp))
+            Text("${m.body} · tap to call back", color = tint, fontSize = 12.sp)
+        }
+        return
+    }
     val align = if (m.mine) Alignment.End else Alignment.Start
     val isAttachment = m.media != null
     val failed = m.mine && m.sendState == SendState.Failed

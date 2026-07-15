@@ -94,6 +94,10 @@ data class ChatMsg(
     val isImage: Boolean = false,
     /** Own-message delivery state from the SDK local echo. Remote msgs = [SendState.Sent]. */
     val sendState: SendState = SendState.Sent,
+    /** True for a call-log entry (a call happened in this room). [body] holds the label
+     *  ("Outgoing call" / "Incoming call" / "Declined call"); [mine] = outgoing. Rendered
+     *  as a centered chip with a tap-to-call-back. */
+    val isCall: Boolean = false,
 )
 /** A thing worth alerting the user about when they're not looking at the room. */
 data class Notif(
@@ -1186,6 +1190,29 @@ object MatrixRepo {
                 val key = runCatching { ev.eventOrTransactionId.toString() }.getOrDefault("utd:$sender:$ts")
                 return ChatMsg(key, sender, "🔒 Can't decrypt this message", sender == me, ts)
             }
+        }
+        // Call events become a persistent call-log row (with a tap to call back). The
+        // RtcNotification (MatrixRTC ring) carries who DECLINED; CallInvite is the legacy
+        // 1:1 invite. Direction is sender-based (mine = outgoing).
+        val callLabel: String? = when (content) {
+            is TimelineItemContent.RtcNotification -> {
+                val mine = ev.sender == me
+                val declined = runCatching { content.declinedBy }.getOrDefault(emptyList())
+                when {
+                    mine && declined.isNotEmpty() -> "Outgoing call · declined"
+                    mine -> "Outgoing call"
+                    me in declined -> "Declined call"      // I declined this incoming call
+                    else -> "Incoming call"
+                }
+            }
+            is TimelineItemContent.CallInvite -> if (ev.sender == me) "Outgoing call" else "Incoming call"
+            else -> null
+        }
+        if (callLabel != null) {
+            val sender = ev.sender
+            val ts = runCatching { ev.timestamp.toLong() }.getOrDefault(0L)
+            val key = runCatching { ev.eventOrTransactionId.toString() }.getOrDefault("call:$sender:$ts")
+            return ChatMsg(key = key, sender = sender, body = callLabel, mine = sender == me, ts = ts, isCall = true)
         }
         return null
     }
