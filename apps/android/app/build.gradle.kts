@@ -14,14 +14,14 @@ kotlin {
 
 android {
     namespace = "ai.tournesol.pureprivacy"
-    compileSdk = 34
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "ai.tournesol.pureprivacy"
         minSdk = 26
         targetSdk = 34
-        versionCode = 29
-        versionName = "0.1.28"
+        versionCode = 30
+        versionName = "0.1.29"
         // matrix-rust-sdk + tor ship arm64-v8a + x86_64 (+ 32-bit). Keep all so it
         // runs on the x86_64 emulator AND real arm64 phones.
         ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
@@ -85,7 +85,9 @@ dependencies {
     implementation("org.matrix.rustcomponents:sdk-android:26.06.11")
     implementation("net.java.dev.jna:jna:5.14.0@aar")
 
-    // Embedded Tor (libtor.so) — no Orbot dependency. 0.4.9.5 is the newest build
-    // whose AAR doesn't demand compileSdk 36/37 (keeps us on stable AGP 8.6/SDK 34).
-    implementation("info.guardianproject:tor-android:0.4.9.5")
+    // Embedded Tor (libtor.so) — no Orbot dependency. Bumped to a current-series tor
+    // (0.4.9.6, needs compileSdk 36 / Android 16). Older tor (0.4.8.x) is EOL and dropped
+    // from the network. The newest AARs (0.4.9.8+) require compileSdk 37 (a preview SDK) —
+    // deferred until 37 is a stable, non-preview platform.
+    implementation("info.guardianproject:tor-android:0.4.9.6")
 }
