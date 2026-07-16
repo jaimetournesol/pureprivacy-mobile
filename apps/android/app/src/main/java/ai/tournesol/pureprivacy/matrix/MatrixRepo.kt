@@ -147,6 +147,11 @@ object MatrixRepo {
     private const val SESSION_ENC = "pp_session_enc"   // encrypted token store
     private const val SESSION_OLD = "pp_session"       // legacy plaintext (migrated away)
     private const val RECOVERY_ACCOUNT_DATA = "ai.tournesol.pureprivacy.recovery"
+    // Auto-accepting a freshly-scanned contact's invite is a federated round-trip to
+    // their box; the FIRST contact over a cold Tor circuit routinely fails. Retry the
+    // join this many times (warming the circuit) before leaving it for the next cycle.
+    private const val JOIN_ATTEMPTS = 3
+    private const val JOIN_RETRY_MS = 1500L
     private const val FOREGROUND_POLL_MS = 2500L   // snappy while the app is on screen
     private const val BACKGROUND_POLL_MS = 20000L  // gentle backstop in the background/doze
     // Cold-Tor first-login smoothing: retry a transient reach-failure up to this many
@@ -1690,19 +1695,37 @@ object MatrixRepo {
         for (r in handles) {
             val invited = runCatching { r.membership() == Membership.INVITED }.getOrDefault(false)
             if (!invited) continue
-            val inviter = runCatching { r.inviter() }.getOrNull()?.userId ?: continue
-            val onion = inviter.substringAfter(":", "")
-            if (onion in consent) {
-                // [H4] Don't auto-join a room we can CONFIRM is unencrypted — refuse and
-                // log rather than silently entering a cleartext room from an invite.
-                // isConfirmedUnencrypted is false on unknown/unresolved state, so a
-                // genuinely-encrypted invite (state not yet warm) still auto-joins as
-                // before: this is a no-op for our normal E2EE DMs.
-                if (isConfirmedUnencrypted(r)) {
-                    Log.w(TAG, "refusing auto-join of non-encrypted room ${r.id()} from $inviter")
-                    continue
+            // Resolve the inviting peer's onion. Prefer the inviter's user id, but fall
+            // back to the ROOM-ID DOMAIN: a DM invite's room lives on the inviter's box,
+            // so its server_name IS their onion. That fallback is essential when the
+            // invite's stripped state is sparse (missing the inviter's own m.room.member)
+            // — which leaves r.inviter() null and used to make auto-accept skip the room
+            // entirely, wedging a freshly-scanned contact on "invited" forever.
+            val inviterOnion = runCatching { r.inviter()?.userId }.getOrNull()
+                ?.substringAfter(":", "")?.takeIf { it.isNotEmpty() }
+            val roomOnion = runCatching { r.id().substringAfter(":", "") }.getOrNull()?.takeIf { it.isNotEmpty() }
+            val peerOnion = inviterOnion ?: roomOnion ?: continue
+            if (peerOnion !in consent) continue
+            // [H4] Don't auto-join a room we can CONFIRM is unencrypted — refuse rather
+            // than silently entering a cleartext room. isConfirmedUnencrypted is false on
+            // unknown/unresolved state, so a genuinely-encrypted invite (state not yet
+            // warm) still auto-joins: a no-op for our normal E2EE DMs.
+            if (isConfirmedUnencrypted(r)) {
+                Log.w(TAG, "refusing auto-join of non-encrypted room ${r.id()} (peer $peerOnion)")
+                continue
+            }
+            // The join federates to the peer's box; first contact over a cold Tor circuit
+            // routinely fails. Retry (warming the circuit) and LOG the outcome — the old
+            // silent `runCatching { join }` left cold-Tor failures invisible and the chat
+            // stuck. If all attempts fail this cycle, the next sync cycle retries (visibly).
+            for (attempt in 1..JOIN_ATTEMPTS) {
+                val res = runCatching { c.joinRoomById(r.id()) }
+                if (res.isSuccess) {
+                    Log.i(TAG, "auto-joined ${r.id()} (peer $peerOnion, attempt $attempt)")
+                    break
                 }
-                runCatching { c.joinRoomById(r.id()) }
+                Log.w(TAG, "auto-join ${r.id()} attempt $attempt/$JOIN_ATTEMPTS failed: ${res.exceptionOrNull()?.message}")
+                if (attempt < JOIN_ATTEMPTS) kotlinx.coroutines.delay(attempt * JOIN_RETRY_MS)
             }
         }
     }
