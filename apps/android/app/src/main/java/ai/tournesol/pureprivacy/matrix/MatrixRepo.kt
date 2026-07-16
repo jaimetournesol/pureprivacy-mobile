@@ -1485,6 +1485,18 @@ object MatrixRepo {
         val tmp = File(dir, name)
         runCatching { cr.openInputStream(uri)?.use { i -> tmp.outputStream().use { o -> i.copyTo(o) } } }
         if (!tmp.exists() || tmp.length() == 0L) { runCatching { dir.deleteRecursively() }; return }
+        // Images go out at FULL QUALITY. Only a genuinely huge one (long edge past
+        // ImageUtil.SEND_MAX_PX) gets capped — normal phone photos are sent untouched.
+        // (Purely a send-size guard; how images are *displayed* is downsampled separately
+        // and never affects the bytes a recipient receives or can save.)
+        if (mime.startsWith("image/")) {
+            val raw = runCatching { tmp.readBytes() }.getOrNull()
+            val capped = raw?.let { ai.tournesol.pureprivacy.util.ImageUtil.downscaleIfLarger(it) }
+            if (capped != null) {
+                runCatching { tmp.writeBytes(capped) }
+                Log.i(TAG, "sent image capped to ${ai.tournesol.pureprivacy.util.ImageUtil.SEND_MAX_PX}px (${raw.size}B → ${capped.size}B)")
+            }
+        }
         // UploadParameters(source, caption, formattedCaption, mentions, inReplyTo) —
         // the trailing arg is a reply event-id, NOT the filename. Pass null or the SDK
         // throws InvalidRepliedToEventId. The filename rides on UploadSource.File's path.

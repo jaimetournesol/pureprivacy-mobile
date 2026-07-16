@@ -435,6 +435,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     val micPermissionNeeded = MutableStateFlow(false)
     /** Key of the voice note currently playing (drives the play/pause icon), or null. */
     val playingVoice = MutableStateFlow<String?>(null)
+    /** Key of the voice note currently downloading over Tor (drives a spinner on the play
+     *  button) — the first tap fetches the clip, which can take a moment over Tor. */
+    val loadingVoice = MutableStateFlow<String?>(null)
     private var recordTicker: kotlinx.coroutines.Job? = null
 
     fun canRecordVoice(): Boolean = voiceRecorder.supported()
@@ -484,15 +487,21 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Play (or stop, if already playing) a received voice note — downloads the clip over
-     *  Tor then plays it, updating [playingVoice] so the bubble flips its icon. */
+    /** Play (or stop, if already playing) a received voice note. The first tap downloads
+     *  the clip over Tor — which can take a moment — so we surface a [loadingVoice] spinner
+     *  meanwhile (the bytes are cached, so replays are instant). Then [playingVoice] flips
+     *  the icon to a stop control. */
     fun playVoice(m: ai.tournesol.pureprivacy.matrix.ChatMsg) {
         val media = m.media ?: return
+        // Ignore repeat taps while it's already fetching this clip.
+        if (loadingVoice.value == m.key) return
         viewModelScope.launch(Dispatchers.IO) {
             if (ai.tournesol.pureprivacy.audio.AudioPlayer.currentKey == m.key) {
                 ai.tournesol.pureprivacy.audio.AudioPlayer.stop(); playingVoice.value = null; return@launch
             }
+            loadingVoice.value = m.key
             val bytes = runCatching { MatrixRepo.mediaBytes(m.key, media) }.getOrNull()
+            loadingVoice.value = null
             if (bytes == null) { notice.value = "Couldn't load voice note"; return@launch }
             playingVoice.value = m.key
             ai.tournesol.pureprivacy.audio.AudioPlayer.toggle(getApplication(), m.key, bytes) {

@@ -1152,6 +1152,7 @@ fun ChatScreen(vm: AppViewModel, roomId: String, roomName: String) {
     val recordElapsed by vm.recordElapsed.collectAsState()
     val micNeeded by vm.micPermissionNeeded.collectAsState()
     val playingVoice by vm.playingVoice.collectAsState()
+    val loadingVoice by vm.loadingVoice.collectAsState()
     val askMic = rememberLauncherForActivityResult(
         androidx.activity.result.contract.ActivityResultContracts.RequestPermission()
     ) { granted -> vm.onMicPermission(granted) }
@@ -1294,6 +1295,7 @@ fun ChatScreen(vm: AppViewModel, roomId: String, roomName: String) {
                         onDelete = { m.eventId?.let { vm.deleteMessage(it) } },
                         onReact = { e -> m.eventId?.let { vm.toggleReaction(it, e) } },
                         isPlaying = playingVoice == m.key,
+                        isLoadingVoice = loadingVoice == m.key,
                         onPlayVoice = { vm.playVoice(m) })
                 }
             }
@@ -1313,6 +1315,7 @@ private fun Bubble(
     onDelete: () -> Unit = {},
     onReact: (String) -> Unit = {},
     isPlaying: Boolean = false,
+    isLoadingVoice: Boolean = false,
     onPlayVoice: () -> Unit = {},
 ) {
     // A deleted (redacted) message: a muted tombstone, no bubble, no actions.
@@ -1366,29 +1369,48 @@ private fun Bubble(
                 // Voice note: a play/pause control + duration. Tapping the disc downloads
                 // the clip over Tor (cached) and plays it; tap again to stop.
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(
-                        if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
-                        if (isPlaying) "stop" else "play voice note",
-                        tint = if (m.mine) Ink else Sunflower,
-                        modifier = Modifier.size(34.dp).clip(CircleShape)
-                            .background(if (m.mine) Sunflower else InkCard).padding(5.dp)
-                            .clickable { onPlayVoice() }
-                    )
+                    Box(
+                        Modifier.size(34.dp).clip(CircleShape)
+                            .background(if (m.mine) Sunflower else InkCard)
+                            .clickable(enabled = !isLoadingVoice) { onPlayVoice() },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        if (isLoadingVoice) {
+                            // Downloading the clip over Tor — narrate the wait, don't look stuck.
+                            CircularProgressIndicator(
+                                color = if (m.mine) Ink else Sunflower,
+                                strokeWidth = 2.dp, modifier = Modifier.size(18.dp))
+                        } else {
+                            Icon(
+                                if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                                if (isPlaying) "stop" else "play voice note",
+                                tint = if (m.mine) Ink else Sunflower,
+                                modifier = Modifier.size(24.dp))
+                        }
+                    }
                     Spacer(Modifier.width(10.dp))
                     Icon(Icons.Filled.GraphicEq, null, tint = if (m.mine) Ink.copy(alpha = 0.7f) else PaperDim,
                         modifier = Modifier.size(22.dp))
                     Spacer(Modifier.width(10.dp))
                     val secs = (m.voiceMs / 1000).toInt()
-                    Text(if (secs > 0) "%d:%02d".format(secs / 60, secs % 60) else "Voice",
+                    Text(
+                        when {
+                            isLoadingVoice -> "Loading over Tor…"
+                            secs > 0 -> "%d:%02d".format(secs / 60, secs % 60)
+                            else -> "Voice"
+                        },
                         color = if (m.mine) Ink else Paper, fontSize = 13.sp)
                 }
             } else if (m.isImage && m.media != null) {
                 // Inline thumbnail: fetch the image bytes over Tor (cached by key) and
-                // render them; fall back to the chip while loading / on failure.
+                // render them; fall back to the chip while loading / on failure. Decode
+                // DOWNSAMPLED to a thumbnail size — a full-res decode of a big photo is what
+                // used to OOM-crash the app (#39). The original is untouched: "Tap to save"
+                // re-fetches the full bytes.
                 val bmp by produceState<ImageBitmap?>(null, m.key) {
                     value = withContext(Dispatchers.IO) {
                         MatrixRepo.mediaBytes(m.key, m.media!!)?.let { b ->
-                            runCatching { android.graphics.BitmapFactory.decodeByteArray(b, 0, b.size)?.asImageBitmap() }.getOrNull()
+                            ai.tournesol.pureprivacy.util.ImageUtil.decodeSampled(b, 1024)?.asImageBitmap()
                         }
                     }
                 }
