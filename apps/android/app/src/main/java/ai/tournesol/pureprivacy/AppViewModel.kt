@@ -414,6 +414,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         notice.value = if (n.isEmpty()) "Name cleared" else "Name updated"
     }
 
+    /** Our own avatar (mxc:// URL) for the Profile header; peers see the same via federation. */
+    val myAvatar = MatrixRepo.myAvatar
+    fun setAvatar(uri: android.net.Uri) {
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { MatrixRepo.setAvatar(getApplication(), uri) }
+                .onSuccess { notice.value = "Profile picture updated" }
+                .onFailure { error.value = "Couldn't set profile picture" }
+        }
+    }
+
     // ── Voice notes ─────────────────────────────────────────────────────────────
     private val voiceRecorder by lazy { ai.tournesol.pureprivacy.audio.VoiceRecorder(getApplication()) }
     /** True while recording — the composer shows the recording bar instead of the input. */

@@ -76,6 +76,8 @@ data class RoomSummary(
     val preview: String? = null,
     /** Timestamp of the latest event (ms); 0 if none. Used to sort the chat list. */
     val ts: Long = 0L,
+    /** The peer's avatar (mxc:// URL) for a DM, if they've set one — rendered in the row. */
+    val avatarUrl: String? = null,
 )
 /** Outcome of acting on a scanned/typed contact. [paired] is true only once both
  *  sides have scanned (a live conversation); false means the request is pending. */
@@ -623,6 +625,7 @@ object MatrixRepo {
                             runCatching { rebuildRooms() }
                             runCatching { reconcileCallSubs() }
                             runCatching { checkNotifs() }
+                            runCatching { refreshMyAvatar() }
                         }
                     }
                     org.matrix.rustcomponents.sdk.SyncServiceState.ERROR,
@@ -851,6 +854,7 @@ object MatrixRepo {
                 peerId = peerId(r),
                 preview = preview,
                 ts = ts,
+                avatarUrl = runCatching { r.avatarUrl() }.getOrNull(),
             )
         // Invites first (actionable), then pending outgoing, then most-recently-active.
         }.sortedWith(
@@ -1421,6 +1425,42 @@ object MatrixRepo {
         runCatching { c.setDisplayName(name) }
             .onSuccess { Log.i(TAG, "display name set (${name.length} chars)") }
             .onFailure { Log.w(TAG, "setDisplayName failed: ${it.message}") }
+    }
+
+    /** Our own avatar as an mxc:// URL (null if unset) — drives the Profile header. */
+    val myAvatar = MutableStateFlow<String?>(null)
+
+    /** Re-read our avatar from the server into [myAvatar]. Called on each RUNNING cycle
+     *  and right after we upload a new one. */
+    suspend fun refreshMyAvatar() {
+        val c = client ?: return
+        myAvatar.value = runCatching { c.avatarUrl() }.getOrNull()
+    }
+
+    /** Pick → downscale → upload a new avatar (federates to paired peers like the display
+     *  name). Re-encodes to a small JPEG first so we never ship a full-res photo over Tor. */
+    suspend fun setAvatar(ctx: Context, uri: android.net.Uri) {
+        val c = client ?: return
+        val raw = runCatching { ctx.contentResolver.openInputStream(uri)?.use { it.readBytes() } }.getOrNull()
+        if (raw == null || raw.isEmpty()) return
+        val jpeg = ai.tournesol.pureprivacy.util.ImageUtil.toAvatarJpeg(raw) ?: return
+        runCatching { c.uploadAvatar("image/jpeg", jpeg) }
+            .onSuccess { Log.i(TAG, "avatar set (${jpeg.size}B)"); refreshMyAvatar() }
+            .onFailure { Log.w(TAG, "uploadAvatar failed: ${it.message}") }
+    }
+
+    private val avatarCache = java.util.concurrent.ConcurrentHashMap<String, ByteArray>()
+
+    /** Fetch an avatar's bytes over Tor from its mxc:// URL, cached by URL. Used to render
+     *  contact + own avatars without re-downloading on every recomposition. */
+    suspend fun avatarBytes(mxcUrl: String): ByteArray? {
+        avatarCache[mxcUrl]?.let { return it }
+        val c = client ?: return null
+        val src = runCatching { org.matrix.rustcomponents.sdk.MediaSource.fromUrl(mxcUrl) }.getOrNull() ?: return null
+        val bytes = runCatching { c.getMediaContent(src) }.getOrNull() ?: return null
+        if (avatarCache.size > 40) avatarCache.clear()
+        avatarCache[mxcUrl] = bytes
+        return bytes
     }
 
     /** Toggle an emoji reaction on [eventId] — adds it, or removes it if we already

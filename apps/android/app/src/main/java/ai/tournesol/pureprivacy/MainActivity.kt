@@ -38,6 +38,7 @@ import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.DoneAll
 import androidx.compose.material.icons.filled.GraphicEq
+import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.DeleteForever
@@ -423,6 +424,34 @@ fun LoginScreen(vm: AppViewModel) {
     }
 }
 
+/** A contact/own avatar: fetches the mxc image over Tor (downsampled + cached) and shows
+ *  it clipped to [shape]; falls back to the first letter of [fallback] while loading or
+ *  when no avatar is set. */
+@Composable
+private fun AvatarImage(
+    mxcUrl: String?,
+    fallback: String,
+    sizeDp: Int,
+    shape: androidx.compose.ui.graphics.Shape = CircleShape,
+) {
+    val bmp by produceState<ImageBitmap?>(null, mxcUrl) {
+        value = if (mxcUrl.isNullOrBlank()) null else withContext(Dispatchers.IO) {
+            MatrixRepo.avatarBytes(mxcUrl)?.let {
+                ai.tournesol.pureprivacy.util.ImageUtil.decodeSampled(it, sizeDp * 3)?.asImageBitmap()
+            }
+        }
+    }
+    val img = bmp
+    Box(Modifier.size(sizeDp.dp).clip(shape).background(InkCard), contentAlignment = Alignment.Center) {
+        if (img != null) {
+            Image(img, "avatar", contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
+        } else {
+            Text(fallback.firstOrNull { it.isLetterOrDigit() }?.uppercase() ?: "#",
+                color = Sunflower, fontWeight = FontWeight.Bold, fontSize = (sizeDp * 0.42f).sp)
+        }
+    }
+}
+
 @Composable
 private fun SunflowerMark(size: Int = 72) {
     Box(Modifier.size(size.dp).clip(RoundedCornerShape((size / 3.6).dp)).background(InkCard), contentAlignment = Alignment.Center) {
@@ -782,10 +811,7 @@ private fun RoomRow(r: RoomSummary, onOpen: () -> Unit, onScan: () -> Unit, onRe
             )
         }
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Box(Modifier.size(44.dp).clip(RoundedCornerShape(12.dp)).background(InkCard), contentAlignment = Alignment.Center) {
-                Text(r.name.firstOrNull { it.isLetterOrDigit() }?.uppercase() ?: "#",
-                    color = if (pending) PaperDim else Sunflower, fontWeight = FontWeight.Bold)
-            }
+            AvatarImage(r.avatarUrl, r.name, 44, RoundedCornerShape(12.dp))
             Spacer(Modifier.width(14.dp))
             Column(Modifier.weight(1f)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -861,6 +887,10 @@ fun ProfileScreen(vm: AppViewModel) {
     val qr = remember(id) { if (ready) runCatching { Qr.bitmap("pureprivacy:$id", 640) }.getOrNull() else null }
 
     val scan = rememberScan { contents -> if (contents != null) vm.addContact(contents) }
+    val myAvatar by vm.myAvatar.collectAsState()
+    val pickAvatar = rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.GetContent()
+    ) { uri -> if (uri != null) vm.setAvatar(uri) }
 
     // Sign-out sheet — two levels: a plain sign-out vs a destructive full device wipe.
     // Cancel is the safe default (confirm slot); Erase is a distinct destructive action.
@@ -917,13 +947,23 @@ fun ProfileScreen(vm: AppViewModel) {
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             Spacer(Modifier.height(8.dp))
-            Box(Modifier.size(64.dp).clip(RoundedCornerShape(20.dp)).background(InkCard), contentAlignment = Alignment.Center) {
-                val initial = name.firstOrNull()?.uppercase()
-                if (initial != null) {
-                    Text(initial, color = Sunflower, fontSize = 30.sp, fontWeight = FontWeight.Bold)
-                } else {
-                    // No name yet (id still blank) — show the brand mark, never a stray glyph.
-                    Image(androidx.compose.ui.res.painterResource(R.drawable.ic_sunflower), null, modifier = Modifier.size(36.dp))
+            // Tappable avatar → pick an image → upload. A small camera badge signals it's
+            // editable; a contact's-eye-view of what your paired peers will see.
+            Box(contentAlignment = Alignment.BottomEnd) {
+                Box(Modifier.clip(RoundedCornerShape(20.dp)).clickable { pickAvatar.launch("image/*") }) {
+                    if (!myAvatar.isNullOrBlank() || name.isNotBlank()) {
+                        AvatarImage(myAvatar, name, 76, RoundedCornerShape(20.dp))
+                    } else {
+                        // No name/id yet — show the brand mark, never a stray glyph.
+                        Box(Modifier.size(76.dp).clip(RoundedCornerShape(20.dp)).background(InkCard),
+                            contentAlignment = Alignment.Center) {
+                            Image(androidx.compose.ui.res.painterResource(R.drawable.ic_sunflower), null, modifier = Modifier.size(40.dp))
+                        }
+                    }
+                }
+                Box(Modifier.size(26.dp).clip(CircleShape).background(Sunflower).clickable { pickAvatar.launch("image/*") },
+                    contentAlignment = Alignment.Center) {
+                    Icon(Icons.Filled.PhotoCamera, "change photo", tint = Ink, modifier = Modifier.size(15.dp))
                 }
             }
             Spacer(Modifier.height(12.dp))
