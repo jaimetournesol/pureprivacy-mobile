@@ -463,6 +463,38 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch(Dispatchers.IO) { runCatching { MatrixRepo.send(text) } }
     }
 
+    // Compose target: when set, the input bar shows a "Replying…" / "Editing…" banner and
+    // the send action routes to reply/edit instead of a new message. Mutually exclusive.
+    val replyTarget = MutableStateFlow<ai.tournesol.pureprivacy.matrix.ChatMsg?>(null)
+    val editTarget = MutableStateFlow<ai.tournesol.pureprivacy.matrix.ChatMsg?>(null)
+    fun startReply(m: ai.tournesol.pureprivacy.matrix.ChatMsg) { editTarget.value = null; replyTarget.value = m }
+    fun startEdit(m: ai.tournesol.pureprivacy.matrix.ChatMsg) { replyTarget.value = null; editTarget.value = m }
+    fun cancelCompose() { replyTarget.value = null; editTarget.value = null }
+
+    /** Send the composer text — an EDIT if editing, a REPLY if replying, else a new
+     *  message. Clears the compose target afterwards. */
+    fun composeSend(text: String) {
+        val t = text.trim(); if (t.isEmpty()) return
+        val edit = editTarget.value; val reply = replyTarget.value
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                when {
+                    edit?.eventId != null -> MatrixRepo.editMessage(edit.eventId, t)
+                    reply?.eventId != null -> MatrixRepo.replyToMessage(reply.eventId, t)
+                    else -> MatrixRepo.send(t)
+                }
+            }
+        }
+        replyTarget.value = null; editTarget.value = null
+    }
+
+    fun deleteMessage(key: String) {
+        viewModelScope.launch(Dispatchers.IO) { runCatching { MatrixRepo.deleteMessage(key) } }
+    }
+    fun toggleReaction(key: String, emoji: String) {
+        viewModelScope.launch(Dispatchers.IO) { runCatching { MatrixRepo.toggleReaction(key, emoji) } }
+    }
+
     /** Re-send a message whose local echo is in the Failed state — tap-to-retry on a
      *  "Not sent" bubble. Drives the SDK's own resend path; the timeline re-emits the
      *  item (sending → sent / failed), so the bubble updates itself. */

@@ -98,7 +98,19 @@ data class ChatMsg(
      *  ("Outgoing call" / "Incoming call" / "Declined call"); [mine] = outgoing. Rendered
      *  as a centered chip with a tap-to-call-back. */
     val isCall: Boolean = false,
+    /** Emoji reactions aggregated on this message (empty if none). */
+    val reactions: List<MsgReaction> = emptyList(),
+    /** True if this message was deleted (redacted) — shown as a "message deleted" note. */
+    val redacted: Boolean = false,
+    /** The RAW Matrix event id ("$…"), for message actions (redact/react/edit/reply).
+     *  Null for a not-yet-sent local echo (which carries only a transaction id and can't
+     *  be acted on yet). Distinct from [key], which is an opaque list/cache identity. */
+    val eventId: String? = null,
 )
+
+/** One emoji reaction bucket on a message: the emoji, how many people reacted, and
+ *  whether WE are one of them (so the chip highlights and a tap toggles it off). */
+data class MsgReaction(val emoji: String, val count: Int, val mine: Boolean)
 /** A thing worth alerting the user about when they're not looking at the room. */
 data class Notif(
     val roomId: String,
@@ -1147,6 +1159,16 @@ object MatrixRepo {
         val content = ev.content
         if (content is TimelineItemContent.MsgLike) {
             val kind = content.content.kind
+            // Emoji reactions (aggregated per emoji, with who reacted) — rendered as chips
+            // under the bubble; a tap toggles our own.
+            val reactions = runCatching {
+                content.content.reactions.mapNotNull { r ->
+                    val senders = runCatching { r.senders.map { it.senderId } }.getOrDefault(emptyList())
+                    if (senders.isEmpty()) null else MsgReaction(r.key, senders.size, me in senders)
+                }
+            }.getOrDefault(emptyList())
+            // Raw "$…" event id for actions (null for a local echo carrying only a txn id).
+            val eventId = (ev.eventOrTransactionId as? org.matrix.rustcomponents.sdk.EventOrTransactionId.EventId)?.eventId
             if (kind is MsgLikeKind.Message) {
                 val mc = kind.content
                 val sender = ev.sender
@@ -1175,7 +1197,15 @@ object MatrixRepo {
                 // messages are always Sent. We never hand-roll a timer; this reflects the
                 // SDK's real queue state.
                 val sendState = if (mine) sendStateOf(ev, key) else SendState.Sent
-                return ChatMsg(key, sender, text, mine, ts, media, fileName, mime, isImage, sendState)
+                return ChatMsg(key, sender, text, mine, ts, media, fileName, mime, isImage, sendState, reactions = reactions, eventId = eventId)
+            }
+            // A message the sender deleted (Matrix redaction) — show a tombstone, not
+            // nothing, so both sides see it was removed. Any reactions carry over.
+            if (kind is MsgLikeKind.Redacted) {
+                val sender = ev.sender
+                val ts = runCatching { ev.timestamp.toLong() }.getOrDefault(0L)
+                val key = runCatching { ev.eventOrTransactionId.toString() }.getOrDefault("redacted:$sender:$ts")
+                return ChatMsg(key, sender, "Message deleted", sender == me, ts, reactions = reactions, redacted = true, eventId = eventId)
             }
             // An event we received but can't decrypt (missing the megolm room key —
             // e.g. the sender used a new device whose key never reached us). Surface a
@@ -1277,6 +1307,57 @@ object MatrixRepo {
             }
         }
         tl.send(messageEventContentFromMarkdown(text))
+    }
+
+    /** True + surfaces an error if the open room is confirmed unencrypted (never edit/
+     *  reply cleartext into it). No-op for our normal E2EE DMs. */
+    private suspend fun refuseIfUnencrypted(): Boolean {
+        currentRoom?.let { room ->
+            if (isConfirmedUnencrypted(room)) {
+                status.value = "Not sent — this chat isn't encrypted."
+                return true
+            }
+        }
+        return false
+    }
+
+    /** Delete a message for BOTH sides (Matrix redaction). Redacting your own always
+     *  works; redacting the peer's needs power level, so a failure is logged, not fatal.
+     *  The timeline re-emits the event as Redacted → the bubble becomes "message deleted".
+     *  [eventId] is the raw "$…" event id (ChatMsg.eventId), not the opaque list key. */
+    suspend fun deleteMessage(eventId: String) {
+        val room = currentRoom ?: return
+        runCatching { room.redact(eventId, null) }
+            .onSuccess { Log.i(TAG, "redacted $eventId") }
+            .onFailure { Log.w(TAG, "redact $eventId failed: ${it.message}") }
+    }
+
+    /** Reply to [eventId] with [text] — federates a proper m.in_reply_to relation. */
+    suspend fun replyToMessage(eventId: String, text: String) {
+        val tl = timeline ?: return
+        if (refuseIfUnencrypted()) return
+        runCatching { tl.sendReply(messageEventContentFromMarkdown(text), eventId) }
+            .onFailure { Log.w(TAG, "reply to $eventId failed: ${it.message}") }
+    }
+
+    /** Edit our own message [eventId] to [newText] (federates an m.replace edit). */
+    suspend fun editMessage(eventId: String, newText: String) {
+        val tl = timeline ?: return
+        if (refuseIfUnencrypted()) return
+        runCatching {
+            tl.edit(
+                org.matrix.rustcomponents.sdk.EventOrTransactionId.EventId(eventId),
+                org.matrix.rustcomponents.sdk.EditedContent.RoomMessage(messageEventContentFromMarkdown(newText)),
+            )
+        }.onFailure { Log.w(TAG, "edit $eventId failed: ${it.message}") }
+    }
+
+    /** Toggle an emoji reaction on [eventId] — adds it, or removes it if we already
+     *  reacted with [emoji]. The timeline re-emits the item with updated reactions. */
+    suspend fun toggleReaction(eventId: String, emoji: String) {
+        val tl = timeline ?: return
+        runCatching { tl.toggleReaction(org.matrix.rustcomponents.sdk.EventOrTransactionId.EventId(eventId), emoji) }
+            .onFailure { Log.w(TAG, "reaction $emoji on $eventId failed: ${it.message}") }
     }
 
     /** Send a file/attachment from a content URI — uploaded E2EE by the SDK and

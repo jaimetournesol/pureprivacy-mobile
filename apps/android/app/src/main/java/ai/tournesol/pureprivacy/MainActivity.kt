@@ -25,6 +25,8 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Logout
+import androidx.compose.material.icons.automirrored.filled.Reply
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.AccountCircle
 import androidx.compose.material.icons.filled.AttachFile
@@ -1039,6 +1041,8 @@ fun ChatScreen(vm: AppViewModel, roomId: String, roomName: String) {
     val ctx = LocalContext.current
     val messages by vm.messages.collectAsState()
     val notice by vm.notice.collectAsState()
+    val replyTarget by vm.replyTarget.collectAsState()
+    val editTarget by vm.editTarget.collectAsState()
     var draft by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
     val snackbar = remember { SnackbarHostState() }
@@ -1072,8 +1076,26 @@ fun ChatScreen(vm: AppViewModel, roomId: String, roomName: String) {
             )
         },
         bottomBar = {
+          Column(Modifier.background(InkSoft)) {
+            // Reply / edit banner: shows what you're replying to or editing, with a cancel.
+            if (replyTarget != null || editTarget != null) {
+                Row(Modifier.fillMaxWidth().padding(start = 12.dp, end = 8.dp, top = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically) {
+                    Icon(if (editTarget != null) Icons.Filled.Edit else Icons.AutoMirrored.Filled.Reply,
+                        null, tint = Sunflower, modifier = Modifier.size(15.dp))
+                    Spacer(Modifier.width(8.dp))
+                    val label = if (editTarget != null) "Editing message" else replyTarget!!.let { r ->
+                        val who = if (r.mine) "yourself" else r.sender.removePrefix("@").substringBefore(":")
+                        "Replying to $who· ${r.body.take(40)}"
+                    }
+                    Text(label, color = PaperDim, fontSize = 12.sp, maxLines = 1, modifier = Modifier.weight(1f))
+                    IconButton(onClick = { vm.cancelCompose(); draft = "" }) {
+                        Icon(Icons.Filled.Close, "cancel", tint = PaperDim, modifier = Modifier.size(18.dp))
+                    }
+                }
+            }
             Row(
-                Modifier.fillMaxWidth().background(InkSoft).padding(10.dp),
+                Modifier.fillMaxWidth().padding(10.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 IconButton(onClick = { pickFile.launch("*/*") }) {
@@ -1082,7 +1104,7 @@ fun ChatScreen(vm: AppViewModel, roomId: String, roomName: String) {
                 // [QW-ui] A trimmed draft is the real payload; blank/whitespace never sends.
                 val canSend = draft.isNotBlank()
                 val doSend = {
-                    if (canSend) { vm.send(draft); draft = "" }
+                    if (canSend) { vm.composeSend(draft); draft = "" }
                 }
                 OutlinedTextField(
                     value = draft, onValueChange = { draft = it },
@@ -1106,6 +1128,7 @@ fun ChatScreen(vm: AppViewModel, roomId: String, roomName: String) {
                     colors = IconButtonDefaults.filledIconButtonColors(containerColor = Sunflower, contentColor = Ink)
                 ) { Icon(Icons.AutoMirrored.Filled.Send, "send") }
             }
+          }   // close the composer Column (reply/edit banner + input row)
         }
     ) { pad ->
         if (messages.isEmpty()) {
@@ -1130,15 +1153,39 @@ fun ChatScreen(vm: AppViewModel, roomId: String, roomName: String) {
             ) {
                 items(messages, key = { it.key }) { m ->
                     Bubble(m, onAttachment = { vm.saveAttachment(m) }, onRetry = { vm.retrySend(m.key) },
-                        onCallBack = { ctx.startActivity(android.content.Intent(ctx, ElementCallActivity::class.java)) })
+                        onCallBack = { ctx.startActivity(android.content.Intent(ctx, ElementCallActivity::class.java)) },
+                        onReply = { vm.startReply(m) },
+                        onEdit = { vm.startEdit(m); draft = m.body },
+                        onDelete = { m.eventId?.let { vm.deleteMessage(it) } },
+                        onReact = { e -> m.eventId?.let { vm.toggleReaction(it, e) } })
                 }
             }
         }
     }
 }
 
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
-private fun Bubble(m: ChatMsg, onAttachment: () -> Unit = {}, onRetry: () -> Unit = {}, onCallBack: () -> Unit = {}) {
+private fun Bubble(
+    m: ChatMsg,
+    onAttachment: () -> Unit = {},
+    onRetry: () -> Unit = {},
+    onCallBack: () -> Unit = {},
+    onReply: () -> Unit = {},
+    onEdit: () -> Unit = {},
+    onDelete: () -> Unit = {},
+    onReact: (String) -> Unit = {},
+) {
+    // A deleted (redacted) message: a muted tombstone, no bubble, no actions.
+    if (m.redacted) {
+        Column(Modifier.fillMaxWidth().padding(vertical = 5.dp),
+            horizontalAlignment = if (m.mine) Alignment.End else Alignment.Start) {
+            Text("🚫 Message deleted", color = PaperDim, fontSize = 13.sp,
+                fontStyle = androidx.compose.ui.text.font.FontStyle.Italic,
+                modifier = Modifier.padding(horizontal = 12.dp))
+        }
+        return
+    }
     // Call-log entry: a centered chip recording that a call happened, tap to call back.
     if (m.isCall) {
         val declined = m.body.contains("decline", ignoreCase = true)
@@ -1158,21 +1205,20 @@ private fun Bubble(m: ChatMsg, onAttachment: () -> Unit = {}, onRetry: () -> Uni
     val align = if (m.mine) Alignment.End else Alignment.Start
     val isAttachment = m.media != null
     val failed = m.mine && m.sendState == SendState.Failed
+    var menuOpen by remember { mutableStateOf(false) }
     Column(Modifier.fillMaxWidth().padding(vertical = 5.dp), horizontalAlignment = align) {
         if (!m.mine) Text(m.sender.removePrefix("@").substringBefore(":"), color = Sunflower, fontSize = 11.sp,
             modifier = Modifier.padding(start = 8.dp, bottom = 2.dp))
+      Box {   // anchor for the long-press action menu
         Box(
             Modifier.widthIn(max = 280.dp)
                 .clip(RoundedCornerShape(16.dp))
                 .background(if (m.mine) BubbleMine else BubbleTheirs)
-                // A failed own message is tappable to RE-SEND (SDK resend path). An
-                // attachment stays tappable to save; failed-retry takes precedence.
-                .then(
-                    when {
-                        failed -> Modifier.clickable { onRetry() }
-                        isAttachment -> Modifier.clickable { onAttachment() }
-                        else -> Modifier
-                    }
+                // Tap: retry a failed send, or save an attachment. Long-press: message
+                // actions (react / reply / edit / delete).
+                .combinedClickable(
+                    onClick = { if (failed) onRetry() else if (isAttachment) onAttachment() },
+                    onLongClick = { menuOpen = true },
                 )
                 .padding(horizontal = 14.dp, vertical = 9.dp)
         ) {
@@ -1206,6 +1252,41 @@ private fun Bubble(m: ChatMsg, onAttachment: () -> Unit = {}, onRetry: () -> Uni
                 }
             } else {
                 Text(m.body, color = Paper, fontSize = 15.sp)
+            }
+        }
+        // Long-press action menu (quick-reactions row + reply/edit/delete), anchored to the bubble.
+        DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }, containerColor = InkCard) {
+            Row(Modifier.padding(horizontal = 6.dp)) {
+                listOf("👍", "❤️", "😂", "😮", "😢", "🙏").forEach { e ->
+                    Text(e, fontSize = 22.sp, modifier = Modifier.padding(6.dp).clickable { menuOpen = false; onReact(e) })
+                }
+            }
+            HorizontalDivider(color = Ink)
+            DropdownMenuItem(text = { Text("Reply", color = Paper) },
+                leadingIcon = { Icon(Icons.AutoMirrored.Filled.Reply, null, tint = Paper) },
+                onClick = { menuOpen = false; onReply() })
+            if (m.mine && !isAttachment) DropdownMenuItem(text = { Text("Edit", color = Paper) },
+                leadingIcon = { Icon(Icons.Filled.Edit, null, tint = Paper) },
+                onClick = { menuOpen = false; onEdit() })
+            if (m.mine) DropdownMenuItem(text = { Text("Delete", color = Danger) },
+                leadingIcon = { Icon(Icons.Filled.DeleteForever, null, tint = Danger) },
+                onClick = { menuOpen = false; onDelete() })
+        }
+      }   // close anchor Box
+        // Reaction chips under the bubble — tap toggles our own.
+        if (m.reactions.isNotEmpty()) {
+            Row(Modifier.padding(top = 3.dp, start = 4.dp, end = 4.dp)) {
+                m.reactions.forEach { r ->
+                    Row(
+                        Modifier.padding(end = 4.dp).clip(RoundedCornerShape(10.dp))
+                            .background(if (r.mine) Sunflower.copy(alpha = 0.25f) else InkCard)
+                            .clickable { onReact(r.emoji) }.padding(horizontal = 7.dp, vertical = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(r.emoji, fontSize = 12.sp)
+                        if (r.count > 1) { Spacer(Modifier.width(3.dp)); Text("${r.count}", color = if (r.mine) Sunflower else PaperDim, fontSize = 11.sp) }
+                    }
+                }
             }
         }
         // Footer: timestamp, plus — for OUR messages — the real delivery state read
