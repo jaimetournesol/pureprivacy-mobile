@@ -35,6 +35,7 @@ import androidx.compose.material.icons.automirrored.filled.CallMade
 import androidx.compose.material.icons.automirrored.filled.CallMissed
 import androidx.compose.material.icons.automirrored.filled.CallReceived
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.DoneAll
 import androidx.compose.material.icons.filled.DeleteForever
 import androidx.compose.material.icons.filled.PauseCircleOutline
 import androidx.compose.material.icons.filled.PlayArrow
@@ -975,6 +976,56 @@ fun ProfileScreen(vm: AppViewModel) {
                 lineHeight = 17.sp
             )
 
+            // ── Your name ───────────────────────────────────────────────────────
+            Spacer(Modifier.height(28.dp))
+            HorizontalDivider(color = InkCard)
+            Spacer(Modifier.height(16.dp))
+            val savedName by vm.displayName.collectAsState()
+            var nameDraft by remember(savedName) { mutableStateOf(savedName) }
+            Column(Modifier.fillMaxWidth()) {
+                Text("Your display name", color = Paper, fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
+                Text("Paired contacts see this above your messages instead of your onion address. Leave blank to stay anonymous.",
+                    color = PaperDim, fontSize = 12.sp, lineHeight = 16.sp)
+                Spacer(Modifier.height(8.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    OutlinedTextField(
+                        value = nameDraft, onValueChange = { nameDraft = it.take(64) },
+                        singleLine = true, placeholder = { Text(name, color = PaperDim) },
+                        modifier = Modifier.weight(1f),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = Paper, unfocusedTextColor = Paper,
+                            focusedBorderColor = Sunflower, unfocusedBorderColor = InkCard,
+                            cursorColor = Sunflower)
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Button(
+                        onClick = { vm.setDisplayName(nameDraft) },
+                        enabled = nameDraft.trim() != savedName,
+                        colors = ButtonDefaults.buttonColors(containerColor = Sunflower, contentColor = Ink),
+                        shape = RoundedCornerShape(12.dp)
+                    ) { Text("Save", fontWeight = FontWeight.SemiBold) }
+                }
+            }
+
+            // ── Privacy ─────────────────────────────────────────────────────────
+            Spacer(Modifier.height(28.dp))
+            HorizontalDivider(color = InkCard)
+            Spacer(Modifier.height(16.dp))
+            val receipts by vm.readReceipts.collectAsState()
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f).padding(end = 12.dp)) {
+                    Text("Send read receipts", color = Paper, fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
+                    Text("Let contacts see when you've read their messages — and see when they've read yours. Off keeps your reading private.",
+                        color = PaperDim, fontSize = 12.sp, lineHeight = 16.sp)
+                }
+                Switch(
+                    checked = receipts, onCheckedChange = { vm.setReadReceipts(it) },
+                    colors = SwitchDefaults.colors(
+                        checkedThumbColor = Ink, checkedTrackColor = Sunflower,
+                        uncheckedThumbColor = PaperDim, uncheckedTrackColor = InkCard)
+                )
+            }
+
             // ── Account ─────────────────────────────────────────────────────────
             Spacer(Modifier.height(28.dp))
             HorizontalDivider(color = InkCard)
@@ -1085,7 +1136,7 @@ fun ChatScreen(vm: AppViewModel, roomId: String, roomName: String) {
                         null, tint = Sunflower, modifier = Modifier.size(15.dp))
                     Spacer(Modifier.width(8.dp))
                     val label = if (editTarget != null) "Editing message" else replyTarget!!.let { r ->
-                        val who = if (r.mine) "yourself" else r.sender.removePrefix("@").substringBefore(":")
+                        val who = if (r.mine) "yourself" else r.senderName.ifBlank { r.sender.removePrefix("@").substringBefore(":") }
                         "Replying to $who· ${r.body.take(40)}"
                     }
                     Text(label, color = PaperDim, fontSize = 12.sp, maxLines = 1, modifier = Modifier.weight(1f))
@@ -1207,7 +1258,8 @@ private fun Bubble(
     val failed = m.mine && m.sendState == SendState.Failed
     var menuOpen by remember { mutableStateOf(false) }
     Column(Modifier.fillMaxWidth().padding(vertical = 5.dp), horizontalAlignment = align) {
-        if (!m.mine) Text(m.sender.removePrefix("@").substringBefore(":"), color = Sunflower, fontSize = 11.sp,
+        if (!m.mine) Text(m.senderName.ifBlank { m.sender.removePrefix("@").substringBefore(":") },
+            color = Sunflower, fontSize = 11.sp,
             modifier = Modifier.padding(start = 8.dp, bottom = 2.dp))
       Box {   // anchor for the long-press action menu
         Box(
@@ -1313,7 +1365,14 @@ private fun Bubble(
                         Text("sending…", color = PaperDim, fontSize = 10.sp)
                     }
                     SendState.Sent ->
-                        Icon(Icons.Filled.Check, "sent", tint = PaperDim, modifier = Modifier.size(12.dp))
+                        // A double-check "Read" (only when both sides opted in to receipts)
+                        // else a single ✓ for "delivered to the server / federated".
+                        if (m.readByPeer) {
+                            Icon(Icons.Filled.DoneAll, "read", tint = Sunflower, modifier = Modifier.size(13.dp))
+                            Spacer(Modifier.width(3.dp)); Text("Read", color = Sunflower, fontSize = 10.sp)
+                        } else {
+                            Icon(Icons.Filled.Check, "sent", tint = PaperDim, modifier = Modifier.size(12.dp))
+                        }
                     SendState.Failed ->
                         // [QW-ui] Retry exposed as a Button with a 48dp min touch target.
                         Text("Not sent · tap to retry", color = Danger, fontSize = 10.sp,

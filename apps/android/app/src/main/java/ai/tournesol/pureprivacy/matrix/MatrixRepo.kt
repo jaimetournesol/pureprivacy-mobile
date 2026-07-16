@@ -21,6 +21,7 @@ import org.matrix.rustcomponents.sdk.EnableRecoveryProgressListener
 import org.matrix.rustcomponents.sdk.EncryptedMessage
 import org.matrix.rustcomponents.sdk.EventSendState
 import org.matrix.rustcomponents.sdk.LatestEventValue
+import org.matrix.rustcomponents.sdk.ReceiptType
 import org.matrix.rustcomponents.sdk.RecoveryState
 import org.matrix.rustcomponents.sdk.ClientBuilder
 import org.matrix.rustcomponents.sdk.CreateRoomParameters
@@ -106,6 +107,13 @@ data class ChatMsg(
      *  Null for a not-yet-sent local echo (which carries only a transaction id and can't
      *  be acted on yet). Distinct from [key], which is an opaque list/cache identity. */
     val eventId: String? = null,
+    /** True for OUR messages the paired peer has read (their federated read receipt sits
+     *  at or after this message). Only ever set when both sides opt in to read receipts —
+     *  drives the "Read" tick. Always false for the peer's own messages. */
+    val readByPeer: Boolean = false,
+    /** Friendly sender label — the peer's set display name if they have one, else the
+     *  onion localpart. Shown above their bubbles. Empty for our own messages. */
+    val senderName: String = "",
 )
 
 /** One emoji reaction bucket on a message: the emoji, how many people reacted, and
@@ -1131,7 +1139,30 @@ object MatrixRepo {
             }
         })
         runCatching { tl.paginateBackwards(50u.toUShort()) }
+        maybeMarkRead()   // opening a room counts as reading it (if opted in)
     }
+
+    /** True if the user opted in to sending read receipts (Profile → "Send read
+     *  receipts"). OFF by default — a privacy choice: a contact only learns you've read
+     *  their message if you turn this on. Read fresh each time so a toggle takes effect
+     *  immediately without threading a flag through. */
+    private fun readReceiptsOn(): Boolean =
+        appContext?.getSharedPreferences("pp_app", Context.MODE_PRIVATE)
+            ?.getBoolean("send_read_receipts", false) ?: false
+
+    /** If opted in, mark the OPEN room read up to its latest event — federates a public
+     *  `m.read` receipt to the paired peer (and is what lights up their "Read" tick).
+     *  No-op when the toggle is off or no room is open. */
+    private fun maybeMarkRead() {
+        if (!readReceiptsOn()) return
+        val tl = timeline ?: return
+        scope.launch { runCatching { tl.markAsRead(ReceiptType.READ) } }
+    }
+
+    /** Called when the Profile toggle flips: if it was just turned ON, immediately send a
+     *  receipt for whatever's on screen so the peer's tick updates without waiting for the
+     *  next message. */
+    fun onReadReceiptsToggled() { maybeMarkRead() }
 
     private fun applyTimelineDiffs(diffs: List<TimelineDiff>) {
         synchronized(timelineItems) {
@@ -1150,11 +1181,23 @@ object MatrixRepo {
                     is TimelineDiff.Truncate -> while (timelineItems.size > d.length.toInt()) timelineItems.removeAt(timelineItems.size - 1)
                 }
             }
-            messages.value = timelineItems.mapNotNull { it.toChatMsg(userId) }
+            // The peer's read horizon: the newest item carrying a read receipt from
+            // someone other than us. Matrix receipts are "read up to and including", so
+            // OUR messages at or before it have been read by the peer. Only ever non-empty
+            // when the peer also opted in to receipts — the "Read" tick is mutual by design.
+            var readHorizon = -1
+            timelineItems.forEachIndexed { i, item ->
+                val ev = runCatching { item.asEvent() }.getOrNull() ?: return@forEachIndexed
+                val peerRead = runCatching { ev.readReceipts.keys.any { it != userId } }.getOrDefault(false)
+                if (peerRead) readHorizon = i
+            }
+            messages.value = timelineItems.mapIndexedNotNull { i, item -> item.toChatMsg(userId, i <= readHorizon) }
         }
+        // If we've opted in, mark the open room read (federates our receipt to the peer).
+        maybeMarkRead()
     }
 
-    private fun TimelineItem.toChatMsg(me: String): ChatMsg? {
+    private fun TimelineItem.toChatMsg(me: String, peerHasRead: Boolean = false): ChatMsg? {
         val ev = runCatching { this.asEvent() }.getOrNull() ?: return null
         val content = ev.content
         if (content is TimelineItemContent.MsgLike) {
@@ -1172,6 +1215,11 @@ object MatrixRepo {
             if (kind is MsgLikeKind.Message) {
                 val mc = kind.content
                 val sender = ev.sender
+                // The peer's set display name (federated in their sender profile) if any,
+                // else the onion localpart — so friends read as names, not @base32 blobs.
+                val senderName = (ev.senderProfile as? org.matrix.rustcomponents.sdk.ProfileDetails.Ready)
+                    ?.displayName?.trim()?.takeIf { it.isNotEmpty() }
+                    ?: sender.removePrefix("@").substringBefore(":")
                 val key = runCatching { ev.eventOrTransactionId.toString() }
                     .getOrDefault("$sender:${mc.body}:${System.identityHashCode(this)}")
                 val ts = runCatching { ev.timestamp.toLong() }.getOrDefault(0L)
@@ -1197,7 +1245,7 @@ object MatrixRepo {
                 // messages are always Sent. We never hand-roll a timer; this reflects the
                 // SDK's real queue state.
                 val sendState = if (mine) sendStateOf(ev, key) else SendState.Sent
-                return ChatMsg(key, sender, text, mine, ts, media, fileName, mime, isImage, sendState, reactions = reactions, eventId = eventId)
+                return ChatMsg(key, sender, text, mine, ts, media, fileName, mime, isImage, sendState, reactions = reactions, eventId = eventId, readByPeer = mine && peerHasRead, senderName = senderName)
             }
             // A message the sender deleted (Matrix redaction) — show a tombstone, not
             // nothing, so both sides see it was removed. Any reactions carry over.
@@ -1350,6 +1398,16 @@ object MatrixRepo {
                 org.matrix.rustcomponents.sdk.EditedContent.RoomMessage(messageEventContentFromMarkdown(newText)),
             )
         }.onFailure { Log.w(TAG, "edit $eventId failed: ${it.message}") }
+    }
+
+    /** Set our own display name — federates to paired peers, who then see it above our
+     *  messages instead of our onion localpart. Passing a blank string clears it (peers
+     *  fall back to the localpart). Only ever visible to boxes we're paired with. */
+    suspend fun setDisplayName(name: String) {
+        val c = client ?: return
+        runCatching { c.setDisplayName(name) }
+            .onSuccess { Log.i(TAG, "display name set (${name.length} chars)") }
+            .onFailure { Log.w(TAG, "setDisplayName failed: ${it.message}") }
     }
 
     /** Toggle an emoji reaction on [eventId] — adds it, or removes it if we already

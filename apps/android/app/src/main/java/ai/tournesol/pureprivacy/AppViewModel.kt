@@ -384,6 +384,35 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         set(v) { appPrefs().edit().putBoolean("paused", v).apply() }
     val paused = MutableStateFlow(false).also { it.value = isPaused }
 
+    /** Opt-in read receipts. OFF by default — a deliberate privacy stance: a contact
+     *  only learns you've read their message if you turn this on (and only then do you
+     *  see when they've read yours). MatrixRepo reads the same pref to decide whether to
+     *  federate an `m.read` receipt. */
+    private var sendReceipts: Boolean
+        get() = appPrefs().getBoolean("send_read_receipts", false)
+        set(v) { appPrefs().edit().putBoolean("send_read_receipts", v).apply() }
+    val readReceipts = MutableStateFlow(false).also { it.value = sendReceipts }
+    fun setReadReceipts(on: Boolean) {
+        sendReceipts = on; readReceipts.value = on
+        // Turning it on: send a receipt for whatever's on screen right now, so the peer's
+        // "Read" tick updates immediately instead of waiting for the next message.
+        if (on) viewModelScope.launch(Dispatchers.IO) { runCatching { MatrixRepo.onReadReceiptsToggled() } }
+    }
+
+    /** Human display name shown to paired peers above your messages (instead of your
+     *  onion localpart). Cached locally to prefill the editor; the source of truth peers
+     *  see is the federated profile set via [MatrixRepo.setDisplayName]. Blank = localpart. */
+    private var displayNamePref: String
+        get() = appPrefs().getString("display_name", "") ?: ""
+        set(v) { appPrefs().edit().putString("display_name", v).apply() }
+    val displayName = MutableStateFlow("").also { it.value = displayNamePref }
+    fun setDisplayName(name: String) {
+        val n = name.trim().take(64)
+        displayNamePref = n; displayName.value = n
+        viewModelScope.launch(Dispatchers.IO) { runCatching { MatrixRepo.setDisplayName(n) } }
+        notice.value = if (n.isEmpty()) "Name cleared" else "Name updated"
+    }
+
     /** Pause / "go dark": tear down sync + Tor and hide the chat list, WITHOUT signing
      *  out (session + keys stay). Peers' messages queue on your box (your computer) and
      *  arrive on Resume. Persisted so it holds across app restarts. */
