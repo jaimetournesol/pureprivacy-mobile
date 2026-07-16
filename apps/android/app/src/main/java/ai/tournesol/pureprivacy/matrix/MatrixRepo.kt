@@ -114,6 +114,11 @@ data class ChatMsg(
     /** Friendly sender label — the peer's set display name if they have one, else the
      *  onion localpart. Shown above their bubbles. Empty for our own messages. */
     val senderName: String = "",
+    /** True if this is a voice note (audio attachment with a voice marker) — rendered as a
+     *  play/pause bubble rather than a file chip. [media] carries the audio source. */
+    val isVoice: Boolean = false,
+    /** Voice-note length in milliseconds (0 if unknown) — shown next to the play button. */
+    val voiceMs: Long = 0L,
 )
 
 /** One emoji reaction bucket on a message: the emoji, how many people reacted, and
@@ -1226,6 +1231,7 @@ object MatrixRepo {
                 // Attachments render as a tappable chip carrying the media source.
                 var text = mc.body; var media: org.matrix.rustcomponents.sdk.MediaSource? = null
                 var fileName: String? = null; var mime: String? = null; var isImage = false
+                var isVoice = false; var voiceMs = 0L
                 when (val mt = mc.msgType) {
                     is org.matrix.rustcomponents.sdk.MessageType.File ->
                         { media = mt.content.source; fileName = mt.content.filename ?: mc.body; mime = mt.content.info?.mimetype; text = "📎 $fileName" }
@@ -1233,8 +1239,15 @@ object MatrixRepo {
                         { media = mt.content.source; fileName = mt.content.filename ?: mc.body; mime = "image/*"; isImage = true; text = "🖼️ $fileName" }
                     is org.matrix.rustcomponents.sdk.MessageType.Video ->
                         { media = mt.content.source; fileName = mc.body; text = "🎞️ ${mc.body}" }
-                    is org.matrix.rustcomponents.sdk.MessageType.Audio ->
-                        { media = mt.content.source; fileName = mc.body; text = "🎵 ${mc.body}" }
+                    is org.matrix.rustcomponents.sdk.MessageType.Audio -> {
+                        val ac = mt.content
+                        media = ac.source; fileName = ac.filename ?: mc.body
+                        mime = ac.info?.mimetype ?: "audio/ogg"
+                        // A voice note carries the m.voice marker; a plain audio file doesn't.
+                        isVoice = ac.voice != null
+                        voiceMs = runCatching { ac.info?.duration?.toMillis() ?: 0L }.getOrDefault(0L)
+                        text = if (isVoice) "🎤 Voice message" else "🎵 ${mc.body}"
+                    }
                     else -> {}
                 }
                 val mine = sender == me
@@ -1245,7 +1258,7 @@ object MatrixRepo {
                 // messages are always Sent. We never hand-roll a timer; this reflects the
                 // SDK's real queue state.
                 val sendState = if (mine) sendStateOf(ev, key) else SendState.Sent
-                return ChatMsg(key, sender, text, mine, ts, media, fileName, mime, isImage, sendState, reactions = reactions, eventId = eventId, readByPeer = mine && peerHasRead, senderName = senderName)
+                return ChatMsg(key, sender, text, mine, ts, media, fileName, mime, isImage, sendState, reactions = reactions, eventId = eventId, readByPeer = mine && peerHasRead, senderName = senderName, isVoice = isVoice, voiceMs = voiceMs)
             }
             // A message the sender deleted (Matrix redaction) — show a tombstone, not
             // nothing, so both sides see it was removed. Any reactions carry over.
@@ -1445,6 +1458,26 @@ object MatrixRepo {
         val info = org.matrix.rustcomponents.sdk.FileInfo(mime, tmp.length().toULong(), null, null)
         runCatching { tl.sendFile(params, info).join() }.onFailure { Log.e(TAG, "sendFile failed", it) }
         runCatching { dir.deleteRecursively() }
+    }
+
+    /** Send a recorded voice note (OGG/Opus) as a Matrix **voice message** — an encrypted
+     *  audio attachment carrying its [durationMs] and [waveform], federated over Tor and
+     *  rendered as a proper voice bubble (not a file chip) on both ends. Deletes the temp
+     *  recording after the upload joins. */
+    suspend fun sendVoiceMessage(path: String, durationMs: Long, waveform: List<Float>) {
+        val tl = timeline ?: return
+        if (refuseIfUnencrypted()) return
+        val f = File(path); if (!f.exists() || f.length() == 0L) return
+        val params = org.matrix.rustcomponents.sdk.UploadParameters(
+            org.matrix.rustcomponents.sdk.UploadSource.File(path), null, null, null, null
+        )
+        val info = org.matrix.rustcomponents.sdk.AudioInfo(
+            java.time.Duration.ofMillis(durationMs), f.length().toULong(), "audio/ogg"
+        )
+        runCatching { tl.sendVoiceMessage(params, info, waveform).join() }
+            .onSuccess { Log.i(TAG, "voice note sent (${durationMs}ms, ${f.length()}B)") }
+            .onFailure { Log.e(TAG, "sendVoiceMessage failed", it) }
+        runCatching { f.delete() }
     }
 
     private val mediaCache = java.util.concurrent.ConcurrentHashMap<String, ByteArray>()

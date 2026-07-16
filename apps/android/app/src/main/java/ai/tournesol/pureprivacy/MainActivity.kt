@@ -35,7 +35,11 @@ import androidx.compose.material.icons.automirrored.filled.CallMade
 import androidx.compose.material.icons.automirrored.filled.CallMissed
 import androidx.compose.material.icons.automirrored.filled.CallReceived
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.DoneAll
+import androidx.compose.material.icons.filled.GraphicEq
+import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.DeleteForever
 import androidx.compose.material.icons.filled.PauseCircleOutline
 import androidx.compose.material.icons.filled.PlayArrow
@@ -1103,6 +1107,16 @@ fun ChatScreen(vm: AppViewModel, roomId: String, roomName: String) {
         androidx.activity.result.contract.ActivityResultContracts.GetContent()
     ) { uri -> if (uri != null) vm.sendFile(uri) }
 
+    // Voice notes: recording state + the RECORD_AUDIO permission dance.
+    val recording by vm.recording.collectAsState()
+    val recordElapsed by vm.recordElapsed.collectAsState()
+    val micNeeded by vm.micPermissionNeeded.collectAsState()
+    val playingVoice by vm.playingVoice.collectAsState()
+    val askMic = rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.RequestPermission()
+    ) { granted -> vm.onMicPermission(granted) }
+    LaunchedEffect(micNeeded) { if (micNeeded) askMic.launch(android.Manifest.permission.RECORD_AUDIO) }
+
     Scaffold(
         containerColor = Ink,
         snackbarHost = { SnackbarHost(snackbar) },
@@ -1145,7 +1159,29 @@ fun ChatScreen(vm: AppViewModel, roomId: String, roomName: String) {
                     }
                 }
             }
-            Row(
+            if (recording) {
+                // Recording bar — replaces the input while a voice note is being captured.
+                Row(
+                    Modifier.fillMaxWidth().padding(10.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    IconButton(onClick = { vm.cancelRecording() }) {
+                        Icon(Icons.Filled.Delete, "discard", tint = Danger)
+                    }
+                    Box(Modifier.size(9.dp).clip(CircleShape).background(Danger))
+                    Spacer(Modifier.width(10.dp))
+                    val s = recordElapsed / 1000
+                    Text("Recording  %d:%02d".format(s / 60, s % 60), color = Paper, fontSize = 15.sp,
+                        modifier = Modifier.weight(1f))
+                    Text("🗑 discard · ✓ send", color = PaperDim, fontSize = 10.sp)
+                    Spacer(Modifier.width(8.dp))
+                    FilledIconButton(
+                        onClick = { vm.stopAndSendRecording() },
+                        colors = IconButtonDefaults.filledIconButtonColors(containerColor = Sunflower, contentColor = Ink)
+                    ) { Icon(Icons.AutoMirrored.Filled.Send, "send voice note") }
+                }
+            } else {
+              Row(
                 Modifier.fillMaxWidth().padding(10.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
@@ -1171,13 +1207,21 @@ fun ChatScreen(vm: AppViewModel, roomId: String, roomName: String) {
                     )
                 )
                 Spacer(Modifier.width(8.dp))
-                // [QW-ui] Enabled only when there's something to send (disabled = no-op +
-                // dimmed), so an empty tap can't fire a blank send.
-                FilledIconButton(
-                    onClick = doSend,
-                    enabled = canSend,
-                    colors = IconButtonDefaults.filledIconButtonColors(containerColor = Sunflower, contentColor = Ink)
-                ) { Icon(Icons.AutoMirrored.Filled.Send, "send") }
+                // Empty draft → a mic button (record a voice note); typing → the send button.
+                // WhatsApp-style swap keeps one primary action in the same spot.
+                if (canSend || !vm.canRecordVoice()) {
+                    FilledIconButton(
+                        onClick = doSend,
+                        enabled = canSend,
+                        colors = IconButtonDefaults.filledIconButtonColors(containerColor = Sunflower, contentColor = Ink)
+                    ) { Icon(Icons.AutoMirrored.Filled.Send, "send") }
+                } else {
+                    FilledIconButton(
+                        onClick = { vm.startRecording() },
+                        colors = IconButtonDefaults.filledIconButtonColors(containerColor = Sunflower, contentColor = Ink)
+                    ) { Icon(Icons.Filled.Mic, "record a voice note") }
+                }
+            }
             }
           }   // close the composer Column (reply/edit banner + input row)
         }
@@ -1208,7 +1252,9 @@ fun ChatScreen(vm: AppViewModel, roomId: String, roomName: String) {
                         onReply = { vm.startReply(m) },
                         onEdit = { vm.startEdit(m); draft = m.body },
                         onDelete = { m.eventId?.let { vm.deleteMessage(it) } },
-                        onReact = { e -> m.eventId?.let { vm.toggleReaction(it, e) } })
+                        onReact = { e -> m.eventId?.let { vm.toggleReaction(it, e) } },
+                        isPlaying = playingVoice == m.key,
+                        onPlayVoice = { vm.playVoice(m) })
                 }
             }
         }
@@ -1226,6 +1272,8 @@ private fun Bubble(
     onEdit: () -> Unit = {},
     onDelete: () -> Unit = {},
     onReact: (String) -> Unit = {},
+    isPlaying: Boolean = false,
+    onPlayVoice: () -> Unit = {},
 ) {
     // A deleted (redacted) message: a muted tombstone, no bubble, no actions.
     if (m.redacted) {
@@ -1274,7 +1322,27 @@ private fun Bubble(
                 )
                 .padding(horizontal = 14.dp, vertical = 9.dp)
         ) {
-            if (m.isImage && m.media != null) {
+            if (m.isVoice && m.media != null) {
+                // Voice note: a play/pause control + duration. Tapping the disc downloads
+                // the clip over Tor (cached) and plays it; tap again to stop.
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                        if (isPlaying) "stop" else "play voice note",
+                        tint = if (m.mine) Ink else Sunflower,
+                        modifier = Modifier.size(34.dp).clip(CircleShape)
+                            .background(if (m.mine) Sunflower else InkCard).padding(5.dp)
+                            .clickable { onPlayVoice() }
+                    )
+                    Spacer(Modifier.width(10.dp))
+                    Icon(Icons.Filled.GraphicEq, null, tint = if (m.mine) Ink.copy(alpha = 0.7f) else PaperDim,
+                        modifier = Modifier.size(22.dp))
+                    Spacer(Modifier.width(10.dp))
+                    val secs = (m.voiceMs / 1000).toInt()
+                    Text(if (secs > 0) "%d:%02d".format(secs / 60, secs % 60) else "Voice",
+                        color = if (m.mine) Ink else Paper, fontSize = 13.sp)
+                }
+            } else if (m.isImage && m.media != null) {
                 // Inline thumbnail: fetch the image bytes over Tor (cached by key) and
                 // render them; fall back to the chip while loading / on failure.
                 val bmp by produceState<ImageBitmap?>(null, m.key) {

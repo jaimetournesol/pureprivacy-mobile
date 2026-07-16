@@ -8,6 +8,7 @@ import ai.tournesol.pureprivacy.tor.TorManager
 import ai.tournesol.pureprivacy.util.mapError
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 
@@ -411,6 +412,83 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         displayNamePref = n; displayName.value = n
         viewModelScope.launch(Dispatchers.IO) { runCatching { MatrixRepo.setDisplayName(n) } }
         notice.value = if (n.isEmpty()) "Name cleared" else "Name updated"
+    }
+
+    // ── Voice notes ─────────────────────────────────────────────────────────────
+    private val voiceRecorder by lazy { ai.tournesol.pureprivacy.audio.VoiceRecorder(getApplication()) }
+    /** True while recording — the composer shows the recording bar instead of the input. */
+    val recording = MutableStateFlow(false)
+    /** Elapsed recording time (ms), ticked while [recording] so the bar shows a live timer. */
+    val recordElapsed = MutableStateFlow(0L)
+    /** Set true when we need the RECORD_AUDIO permission — MainActivity observes it, asks,
+     *  and calls [onMicPermission] with the result. */
+    val micPermissionNeeded = MutableStateFlow(false)
+    /** Key of the voice note currently playing (drives the play/pause icon), or null. */
+    val playingVoice = MutableStateFlow<String?>(null)
+    private var recordTicker: kotlinx.coroutines.Job? = null
+
+    fun canRecordVoice(): Boolean = voiceRecorder.supported()
+
+    /** Start a voice note. If the mic permission isn't granted we raise
+     *  [micPermissionNeeded] and let the UI request it, then it calls us back. */
+    fun startRecording() {
+        if (!voiceRecorder.supported()) { notice.value = "Voice notes need Android 10 or newer"; return }
+        val ctx = getApplication<Application>()
+        if (androidx.core.content.ContextCompat.checkSelfPermission(ctx, android.Manifest.permission.RECORD_AUDIO)
+            != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            micPermissionNeeded.value = true; return
+        }
+        beginRecording()
+    }
+
+    /** Called by the UI after the RECORD_AUDIO prompt resolves. */
+    fun onMicPermission(granted: Boolean) {
+        micPermissionNeeded.value = false
+        if (granted) beginRecording() else notice.value = "Microphone permission is needed for voice notes"
+    }
+
+    private fun beginRecording() {
+        if (!voiceRecorder.start()) { notice.value = "Couldn't start recording"; return }
+        recording.value = true; recordElapsed.value = 0L
+        recordTicker = viewModelScope.launch {
+            while (recording.value) { recordElapsed.value = voiceRecorder.elapsedMs; delay(100) }
+        }
+    }
+
+    /** Discard the in-progress recording (user tapped the ✕). */
+    fun cancelRecording() {
+        recordTicker?.cancel(); recording.value = false; recordElapsed.value = 0L
+        viewModelScope.launch(Dispatchers.IO) { runCatching { voiceRecorder.cancel() } }
+    }
+
+    /** Stop recording and send the voice note (user tapped the send arrow). */
+    fun stopAndSendRecording() {
+        recordTicker?.cancel(); recording.value = false
+        viewModelScope.launch(Dispatchers.IO) {
+            val res = runCatching { voiceRecorder.stop() }.getOrNull()
+            recordElapsed.value = 0L
+            if (res == null) { notice.value = "Voice note too short"; return@launch }
+            val (path, dur, wave) = res
+            runCatching { MatrixRepo.sendVoiceMessage(path, dur, wave) }
+                .onFailure { error.value = "Couldn't send voice note" }
+        }
+    }
+
+    /** Play (or stop, if already playing) a received voice note — downloads the clip over
+     *  Tor then plays it, updating [playingVoice] so the bubble flips its icon. */
+    fun playVoice(m: ai.tournesol.pureprivacy.matrix.ChatMsg) {
+        val media = m.media ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            if (ai.tournesol.pureprivacy.audio.AudioPlayer.currentKey == m.key) {
+                ai.tournesol.pureprivacy.audio.AudioPlayer.stop(); playingVoice.value = null; return@launch
+            }
+            val bytes = runCatching { MatrixRepo.mediaBytes(m.key, media) }.getOrNull()
+            if (bytes == null) { notice.value = "Couldn't load voice note"; return@launch }
+            playingVoice.value = m.key
+            ai.tournesol.pureprivacy.audio.AudioPlayer.toggle(getApplication(), m.key, bytes) {
+                playingVoice.value = null
+            }
+        }
     }
 
     /** Pause / "go dark": tear down sync + Tor and hide the chat list, WITHOUT signing
