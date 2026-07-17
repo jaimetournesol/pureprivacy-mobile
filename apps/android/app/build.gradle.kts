@@ -20,8 +20,8 @@ android {
         applicationId = "ai.tournesol.pureprivacy"
         minSdk = 26
         targetSdk = 34
-        versionCode = 31
-        versionName = "0.1.30"
+        versionCode = 32
+        versionName = "0.1.31"
         // matrix-rust-sdk + tor ship arm64-v8a + x86_64 (+ 32-bit). Keep all so it
         // runs on the x86_64 emulator AND real arm64 phones.
         ndk { abiFilters += listOf("arm64-v8a", "x86_64") }

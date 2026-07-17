@@ -163,6 +163,18 @@ object MatrixRepo {
     // A cross-box megolm key can take a while to federate over cold Tor, so don't give up
     // after one sync-restart — keep re-pulling (bounded) until the message decrypts.
     private const val MAX_UTD_ATTEMPTS = 6
+    // [key-warmup] The SENDER-side half of "the first cross-box message decrypts". Before we
+    // send, our box must know the peer's DEVICE keys — otherwise the SDK shares the megolm
+    // session key to an empty device set and the peer is stuck on "can't decrypt" FOREVER
+    // (the key was never sent to them, so no receiver-side sync-restart can recover it — this
+    // is the permanent-UTD case that the UTD-retry above can't fix). We force a federated
+    // /keys/query for the peer so the send targets their real device. Bounded + debounced so
+    // it never hammers Tor.
+    private const val KEY_WARMUP_ATTEMPTS = 3
+    private const val KEY_WARMUP_ATTEMPT_TIMEOUT_MS = 12_000L   // per-attempt cap over cold Tor
+    private const val KEY_WARMUP_RETRY_MS = 3000L
+    private const val KEY_WARMUP_DEBOUNCE_MS = 45_000L          // a warm peer returns instantly
+    private const val KEY_WARMUP_SEND_BUDGET_MS = 7000L         // max the FIRST send waits on it
     /** [QW-perf] Debounce for the onForeground consent read — a resume burst shouldn't
      *  fire a fresh Tor round-trip each time. The authoritative per-sync-cycle
      *  loadConsent is NOT debounced. */
@@ -204,6 +216,11 @@ object MatrixRepo {
     private val utdAttempts = java.util.Collections.synchronizedMap(mutableMapOf<String, Int>())
     @Volatile private var lastUtdRecoveryMs = 0L
     private val utdLock = Any()
+
+    // [key-warmup] peerUserId -> last time we successfully forced a device-key download for
+    // them. Debounces the federated /keys/query so opening/sending in an already-warm chat
+    // costs nothing; only a genuinely-cold peer pays the round-trip.
+    private val keyWarmedAtMs = java.util.Collections.synchronizedMap(mutableMapOf<String, Long>())
 
     var userId: String = ""
         private set
@@ -1138,6 +1155,46 @@ object MatrixRepo {
             .onSuccess { Log.i(TAG, "m.direct: tagged $roomId as DM with $userId") }
     }
 
+    /** Force our box to download [peerUserId]'s device keys over federation, so the next
+     *  message we send in a shared room shares the megolm session key to their real
+     *  device(s) instead of an empty set. This is the sender-side half of "the first
+     *  cross-box message decrypts": without it a cold box hasn't run /keys/query for the
+     *  peer yet, shares the room key to nobody, and the peer is stuck on "can't decrypt"
+     *  with no key any receiver-side sync-restart can recover (the permanent-UTD case).
+     *
+     *  encryption().userIdentity(peer, requestFromHomeserver=true) triggers exactly that
+     *  federated /keys/query. The returned identity may be null (the peer has no cross-
+     *  signing set up — our boxes don't) and we DON'T care: the device keys are downloaded
+     *  and cached as a side effect, which is all the megolm share needs. So we treat "the
+     *  call returned within the timeout" as success, null identity or not.
+     *
+     *  Bounded (per-attempt timeout), retried (cold Tor), and debounced (a warm peer returns
+     *  immediately). Returns true once the peer's keys are warm. */
+    private suspend fun warmUpKeys(peerUserId: String?): Boolean {
+        val peer = peerUserId?.takeIf { it.startsWith("@") && it != userId } ?: return false
+        val c = client ?: return false
+        val last = keyWarmedAtMs[peer] ?: 0L
+        if (System.currentTimeMillis() - last < KEY_WARMUP_DEBOUNCE_MS) return true  // already warm
+        for (attempt in 1..KEY_WARMUP_ATTEMPTS) {
+            // withTimeoutOrNull returns null on a hung circuit; returning `true` from INSIDE
+            // the block distinguishes "query completed (identity maybe null)" from "timed out".
+            val done = runCatching {
+                kotlinx.coroutines.withTimeoutOrNull(KEY_WARMUP_ATTEMPT_TIMEOUT_MS) {
+                    c.encryption().userIdentity(peer, true)
+                    true
+                }
+            }.getOrNull()
+            if (done == true) {
+                keyWarmedAtMs[peer] = System.currentTimeMillis()
+                Log.i(TAG, "key warm-up: fetched device keys for $peer (attempt $attempt)")
+                return true
+            }
+            Log.w(TAG, "key warm-up for $peer attempt $attempt/$KEY_WARMUP_ATTEMPTS didn't complete over Tor")
+            if (attempt < KEY_WARMUP_ATTEMPTS) kotlinx.coroutines.delay(KEY_WARMUP_RETRY_MS)
+        }
+        return false
+    }
+
     private fun roomName(r: Room): String {
         val hero = runCatching { r.heroes() }.getOrDefault(emptyList())
             .firstOrNull { it.userId != userId && !isServerBot(it.userId) }
@@ -1188,6 +1245,13 @@ object MatrixRepo {
         })
         runCatching { tl.paginateBackwards(50u.toUShort()) }
         maybeMarkRead()   // opening a room counts as reading it (if opted in)
+        // [key-warmup] Opening a chat is the "about to converse" signal: pre-fetch the peer's
+        // device keys now, in the background over Tor, so by the time the user types + sends
+        // the first message the megolm key can be shared to their device (and it decrypts).
+        // Debounced, so reopening a warm chat is a no-op; the send path re-checks as a belt.
+        // Resolve the peer from heroes() (works on BOTH sides) and fall back to m.direct —
+        // NOT m.direct alone, which only the room's creator tags (the joiner has no entry).
+        scope.launch { warmUpKeys(peerId(room) ?: directPeerOf(roomId)) }
     }
 
     /** True if the user opted in to sending read receipts (Profile → "Send read
@@ -1408,6 +1472,16 @@ object MatrixRepo {
                 Log.w(TAG, "refusing to send into a non-encrypted room ${runCatching { room.id() }.getOrNull()}")
                 status.value = "Not sent — this chat isn't encrypted."
                 return
+            }
+        }
+        // [key-warmup] Guarantee the peer's device keys are downloaded BEFORE we send, so the
+        // megolm session key is shared to their device (not an empty set → permanent UTD on
+        // their side). openRoom already kicked this off in the background, so this is normally
+        // an instant debounce hit; only a genuinely-cold first send waits, and only up to a
+        // bounded budget so a hung circuit can never freeze the composer.
+        currentRoom?.let { room ->
+            kotlinx.coroutines.withTimeoutOrNull(KEY_WARMUP_SEND_BUDGET_MS) {
+                warmUpKeys(peerId(room) ?: directPeerOf(room.id()))
             }
         }
         tl.send(messageEventContentFromMarkdown(text))
