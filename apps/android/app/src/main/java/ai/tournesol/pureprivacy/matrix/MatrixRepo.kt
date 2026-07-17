@@ -159,7 +159,10 @@ object MatrixRepo {
     private const val LOGIN_ATTEMPTS = 4
     private const val LOGIN_RETRY_DELAY_MS = 4000L
     // [UTD-recovery] Don't restart the sync more than once per this window.
-    private const val UTD_RECOVERY_COOLDOWN_MS = 20_000L
+    private const val UTD_RECOVERY_COOLDOWN_MS = 12_000L
+    // A cross-box megolm key can take a while to federate over cold Tor, so don't give up
+    // after one sync-restart — keep re-pulling (bounded) until the message decrypts.
+    private const val MAX_UTD_ATTEMPTS = 6
     /** [QW-perf] Debounce for the onForeground consent read — a resume burst shouldn't
      *  fire a fresh Tor round-trip each time. The authoritative per-sync-cycle
      *  loadConsent is NOT debounced. */
@@ -197,7 +200,8 @@ object MatrixRepo {
     // it and decrypts the message + all later ones in that session. We restart the sync
     // ONCE per session (this set bounds it) so a genuinely-lost key can't loop forever,
     // and no more than once per cooldown (debounces a burst of UTDs into one restart).
-    private val utdRecoveredSessions = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+    // sessionId → how many recovery attempts we've made (capped at MAX_UTD_ATTEMPTS).
+    private val utdAttempts = java.util.Collections.synchronizedMap(mutableMapOf<String, Int>())
     @Volatile private var lastUtdRecoveryMs = 0L
     private val utdLock = Any()
 
@@ -580,20 +584,23 @@ object MatrixRepo {
      *  one in the session, turning "stuck forever" into "heals itself in ~10s".
      *
      *  Bounded so it can't thrash: at most one restart per [UTD_RECOVERY_COOLDOWN_MS]
-     *  (debounces a burst of UTDs into a single restart), and each session is only ever
-     *  retried once (a genuinely-lost key — e.g. a peer that wiped its device — must not
-     *  loop). Fire-and-forget; safe to call from rebuildRooms/toChatMsg. */
+     *  (debounces a burst of UTDs into a single restart), and each session is retried up to
+     *  [MAX_UTD_ATTEMPTS] times — a cross-box first-message key can take a while to federate
+     *  over cold Tor, so one restart often fires before the key has even arrived; we keep
+     *  re-pulling until it decrypts, then stop (a genuinely-lost key must not loop forever).
+     *  Fire-and-forget; safe to call from rebuildRooms/toChatMsg. */
     private fun maybeRecoverFromUtd(sessionId: String?) {
         val sid = sessionId ?: return
-        if (sid in utdRecoveredSessions) return          // already tried this session — don't loop
+        val tried = utdAttempts[sid] ?: 0
+        if (tried >= MAX_UTD_ATTEMPTS) return            // gave it enough tries — stop looping
         val now = System.currentTimeMillis()
         val go = synchronized(utdLock) {
             if (now - lastUtdRecoveryMs < UTD_RECOVERY_COOLDOWN_MS) false
-            else { lastUtdRecoveryMs = now; utdRecoveredSessions.add(sid); true }
+            else { lastUtdRecoveryMs = now; utdAttempts[sid] = tried + 1; true }
         }
         if (!go) return
         scope.launch {
-            Log.i(TAG, "UTD recovery: restarting sync to re-apply room keys (session $sid)")
+            Log.i(TAG, "UTD recovery attempt ${tried + 1}/$MAX_UTD_ATTEMPTS: restarting sync to pull room keys (session $sid)")
             runCatching { syncService?.stop() }
             runCatching { startSync() }
         }
@@ -834,7 +841,7 @@ object MatrixRepo {
      *  paired check). Runs in a coroutine; assigns `rooms` once when done. */
     private suspend fun rebuildRooms() {
         val handles = synchronized(roomHandles) { roomHandles.values.toList() }
-        rooms.value = handles.map { r ->
+        val all = handles.map { r ->
             val mem = runCatching { r.membership() }.getOrNull()
             val (preview, ts) = latestPreview(r)
             // a live conversation = I'm in AND the human peer is in too — which only
@@ -861,12 +868,24 @@ object MatrixRepo {
                 ts = ts,
                 avatarUrl = runCatching { r.avatarUrl() }.getOrNull(),
             )
+        }
+        // Dedup DMs: a peer can end up with >1 live room (a create-race, or a re-add before
+        // the first invite landed). Show only ONE — deterministically the LOWEST room-id,
+        // which both sides pick the same, so they converge on it (and send there); the extra
+        // room just goes quiet. Invites / pending-outgoing rows are never deduped.
+        val canonical = HashMap<String, String>()
+        for (s in all) {
+            val p = s.peerId
+            if (s.paired && p != null) { val cur = canonical[p]; if (cur == null || s.id < cur) canonical[p] = s.id }
+        }
         // Invites first (actionable), then pending outgoing, then most-recently-active.
-        }.sortedWith(
-            compareByDescending<RoomSummary> { it.invited }
-                .thenByDescending { it.outgoing }
-                .thenByDescending { it.ts }
-        )
+        rooms.value = all
+            .filter { s -> val p = s.peerId; !s.paired || p == null || canonical[p] == s.id }
+            .sortedWith(
+                compareByDescending<RoomSummary> { it.invited }
+                    .thenByDescending { it.outgoing }
+                    .thenByDescending { it.ts }
+            )
         Log.i(TAG, "rebuildRooms: ${rooms.value.size} rooms (" +
             "${rooms.value.count { it.paired }} paired, ${rooms.value.count { it.invited }} invited, " +
             "${rooms.value.count { it.outgoing }} pending-outgoing)")
@@ -1103,6 +1122,21 @@ object MatrixRepo {
         }
         null
     }.getOrNull()
+
+    /** Record [roomId] as a DM with [userId] in `m.direct` so getDmRooms(userId) finds it.
+     *  Needed because we create DM rooms with an empty invite list (inviting the peer
+     *  separately, once their box allowlists us), so the SDK never tags them itself. */
+    private suspend fun addToMDirect(userId: String, roomId: String) {
+        val c = client ?: return
+        val obj = runCatching { c.accountData("m.direct")?.let { org.json.JSONObject(it) } }
+            .getOrNull() ?: org.json.JSONObject()
+        val arr = obj.optJSONArray(userId) ?: org.json.JSONArray()
+        for (i in 0 until arr.length()) if (arr.getString(i) == roomId) return  // already recorded
+        arr.put(roomId)
+        obj.put(userId, arr)
+        runCatching { c.setAccountData("m.direct", obj.toString()) }
+            .onSuccess { Log.i(TAG, "m.direct: tagged $roomId as DM with $userId") }
+    }
 
     private fun roomName(r: Room): String {
         val hero = runCatching { r.heroes() }.getOrDefault(emptyList())
@@ -1835,9 +1869,10 @@ object MatrixRepo {
                     "m.call" to 0,
                 ),
             )
-            val rid = dms.firstOrNull {
+            val existingDm = dms.firstOrNull {
                 runCatching { it.membership() == Membership.JOINED }.getOrDefault(false)
-            }?.id() ?: c.createRoom(
+            }?.id()
+            val rid = existingDm ?: c.createRoom(
                 CreateRoomParameters(
                     name = null,
                     topic = null,
@@ -1854,6 +1889,11 @@ object MatrixRepo {
                     isSpace = false,
                 )
             )
+            // Newly created → record it in m.direct for this peer. We invite the peer
+            // separately (once their box has allowlisted us), so the SDK never tags the
+            // room as a DM-with-peer on its own — which means a re-add wouldn't find it via
+            // getDmRooms and would spawn a DUPLICATE. Tagging it here is the root-cause fix.
+            if (existingDm == null) scope.launch { runCatching { addToMDirect(userId, rid) } }
             scope.launch { ensureInvited(rid, userId) }
             return ConnectResult(rid, false)
         }
