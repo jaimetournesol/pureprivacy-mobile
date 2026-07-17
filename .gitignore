@@ -5,3 +5,8 @@ Cargo.lock
 apps/ios/Generated/
 apps/android/**/build/
 .DS_Store
+
+# signing secrets — never commit
+keystore.properties
+*.jks
+*.keystore
