@@ -175,6 +175,11 @@ object MatrixRepo {
     private const val KEY_WARMUP_RETRY_MS = 3000L
     private const val KEY_WARMUP_DEBOUNCE_MS = 45_000L          // a warm peer returns instantly
     private const val KEY_WARMUP_SEND_BUDGET_MS = 7000L         // max the FIRST send waits on it
+    // [file-size] Refuse a file larger than this BEFORE upload. The box's media endpoint caps
+    // uploads (tuwunel default ~24 MB); a file past it is 413'd mid-upload, which WEDGES the
+    // room's whole send queue (every later message then sticks on "sending…"). Cap client-side
+    // comfortably under that so oversized files are refused with a message, never wedged.
+    private const val MAX_FILE_BYTES = 15L * 1024 * 1024        // 15 MB
     /** [QW-perf] Debounce for the onForeground consent read — a resume burst shouldn't
      *  fire a fresh Tor round-trip each time. The authoritative per-sync-cycle
      *  loadConsent is NOT debounced. */
@@ -276,6 +281,10 @@ object MatrixRepo {
     // bubble can be tapped to retry via SendHandle.tryResend(). Rebuilt on every timeline
     // diff (handles for now-sent/removed items are dropped). Bounded by the open room.
     private val sendHandles = java.util.concurrent.ConcurrentHashMap<String, org.matrix.rustcomponents.sdk.SendHandle>()
+    // Local-echo keys we've already auto-aborted (an unrecoverable/too-large send that would
+    // otherwise wedge the room queue). Bounds the abort to once per item — sendStateOf runs
+    // on every timeline diff.
+    private val abortedSends = java.util.Collections.synchronizedSet(mutableSetOf<String>())
 
     val isLoggedIn: Boolean get() = client != null
 
@@ -1421,9 +1430,23 @@ object MatrixRepo {
      *  Sent/round-tripped item drops its handle. Failures here default to Sending so a
      *  transient read never paints a healthy message as failed. */
     private fun sendStateOf(ev: org.matrix.rustcomponents.sdk.EventTimelineItem, key: String): SendState {
-        return when (ev.localSendState) {
+        return when (val ss = ev.localSendState) {
             is EventSendState.SendingFailed -> {
-                runCatching { ev.lazyProvider.getSendHandle() }.getOrNull()?.let { sendHandles[key] = it }
+                val handle = runCatching { ev.lazyProvider.getSendHandle() }.getOrNull()
+                handle?.let { sendHandles[key] = it }
+                // An UNRECOVERABLE failure (e.g. a file past the box's size limit → 413) will
+                // never succeed and, left queued, WEDGES the room — every later message then
+                // sticks on "sending…". Auto-discard it ONCE (abort + re-enable the queue) so
+                // messages flow again, and tell the user. Recoverable failures keep the retry chip.
+                if (!ss.isRecoverable && abortedSends.add(key)) {
+                    Log.w(TAG, "unrecoverable send $key — auto-discarding to unwedge the queue")
+                    sendHandles.remove(key)
+                    scope.launch {
+                        runCatching { handle?.abort() }.onFailure { Log.w(TAG, "abort $key failed: ${it.message}") }
+                        runCatching { currentRoom?.enableSendQueue(true) }
+                        status.value = "Couldn't send that (too large) — removed it so your messages can go through."
+                    }
+                }
                 SendState.Failed
             }
             is EventSendState.NotSentYet -> {
@@ -1609,6 +1632,17 @@ object MatrixRepo {
                 runCatching { tmp.writeBytes(capped) }
                 Log.i(TAG, "sent image capped to ${ai.tournesol.pureprivacy.util.ImageUtil.SEND_MAX_PX}px (${raw.size}B → ${capped.size}B)")
             }
+        }
+        // [file-size] Refuse an oversized file BEFORE uploading (checked after any image
+        // capping, so it's the real bytes that would go over the wire). A file past the box's
+        // media limit is 413'd mid-upload and wedges the room's send queue, so cap it here and
+        // tell the user instead. No partial upload, no wedge.
+        if (tmp.length() > MAX_FILE_BYTES) {
+            val mb = tmp.length() / (1024 * 1024)
+            status.value = "That file is ${mb} MB — too big to send (max ${MAX_FILE_BYTES / (1024 * 1024)} MB)."
+            Log.w(TAG, "sendFile refused: ${tmp.length()}B > $MAX_FILE_BYTES ($name)")
+            runCatching { dir.deleteRecursively() }
+            return
         }
         // UploadParameters(source, caption, formattedCaption, mentions, inReplyTo) —
         // the trailing arg is a reply event-id, NOT the filename. Pass null or the SDK
