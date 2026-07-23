@@ -883,7 +883,15 @@ object MatrixRepo {
             // hiding a live chat during hero warm-up — gating only kicks in once we
             // can actually read the peer's onion.
             val peerOnion = peerId(r)?.substringAfter(":", "")?.trim()
-            val paired = peerIn && (peerOnion == null || peerOnion in consent)
+            // [#54] Grace period: until consent has loaded from account-data at least once
+            // (lastReadMs == 0), don't gate. A fresh device (post-wipe / erase / duress
+            // re-login) has an EMPTY local account-data store until sliding sync populates
+            // it, so consent reads empty for a while — and hiding every joined DM as
+            // "0 paired" during that window looked like the chats had vanished. Right after a
+            // fresh login there are no removed contacts to hide anyway, and gating resumes
+            // automatically the moment the first consent read succeeds.
+            val consentReady = consent.lastReadMs != 0L
+            val paired = peerIn && (peerOnion == null || !consentReady || peerOnion in consent)
             RoomSummary(
                 r.id(), roomName(r),
                 invited = mem == Membership.INVITED,
