@@ -31,9 +31,11 @@ android {
     defaultConfig {
         applicationId = "ai.tournesol.pureprivacy"
         minSdk = 26
-        targetSdk = 34
-        versionCode = 36
-        versionName = "0.1.35"
+        // Play requires a recent target. API 35 (Android 15) enforces edge-to-edge, so every
+        // non-Scaffold full-screen composable applies systemBarsPadding() (see MainActivity).
+        targetSdk = 35
+        versionCode = 37
+        versionName = "0.1.36"
         // matrix-rust-sdk + tor ship arm64-v8a + x86_64 (+ 32-bit). Keep all so it
         // runs on the x86_64 emulator AND real arm64 phones.
         ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
