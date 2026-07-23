@@ -516,6 +516,41 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** The sealed backup envelope, once the box has produced one — the UI then asks the user
+     *  where to save it. Already encrypted with their passphrase; we never hold the passphrase. */
+    val backupEnvelope = MutableStateFlow<String?>(null)
+    fun clearBackupEnvelope() { backupEnvelope.value = null }
+
+    /** Ask the box for an encrypted identity backup, sealed with [passphrase] (feature D).
+     *  The passphrase is sent once in the guarded command and never stored on this device. */
+    fun backupBox(passphrase: String) {
+        if (passphrase.length < 8) {
+            configNotice.value = "Use a backup passphrase of at least 8 characters."
+            return
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            configBusy.value = true
+            configNotice.value = "Asking your box for a backup…"
+            val id = runCatching { MatrixRepo.sendBoxCommand("backup", passphrase) }.getOrNull()
+            if (id == null) {
+                configNotice.value = "Couldn't reach your box."; configBusy.value = false; return@launch
+            }
+            var env: String? = null
+            for (i in 1..20) {
+                kotlinx.coroutines.delay(2000)
+                env = runCatching { MatrixRepo.readBackupEnvelope(id) }.getOrNull()
+                if (env != null) break
+            }
+            configBusy.value = false
+            if (env == null) {
+                configNotice.value = "Your box didn't return a backup — try again."
+            } else {
+                backupEnvelope.value = env
+                configNotice.value = "Backup ready — choose where to save it."
+            }
+        }
+    }
+
     /** Restart the box's services (safe) via the guarded command channel. */
     fun restartBox() {
         viewModelScope.launch(Dispatchers.IO) {

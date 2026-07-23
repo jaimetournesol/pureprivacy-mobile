@@ -1821,6 +1821,30 @@ private fun ConfigScreen(vm: AppViewModel) {
     val notice by vm.configNotice.collectAsState()
     var showReset by remember { mutableStateOf(false) }
     var confirmName by remember { mutableStateOf("") }
+    var showBackup by remember { mutableStateOf(false) }
+    var bp1 by remember { mutableStateOf("") }
+    var bp2 by remember { mutableStateOf("") }
+    val envelope by vm.backupEnvelope.collectAsState()
+    val ctx = LocalContext.current
+    // The box hands back an already-encrypted envelope; let the user put it wherever they keep
+    // backups (Files, Drive, …) via the system picker — we never copy it anywhere ourselves.
+    val saveBackup = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/json")
+    ) { uri ->
+        val data = vm.backupEnvelope.value
+        if (uri != null && data != null) {
+            val ok = runCatching {
+                ctx.contentResolver.openOutputStream(uri)?.use { it.write(data.toByteArray()) }
+            }.isSuccess
+            vm.configNotice.value =
+                if (ok) "Backup saved. Keep it — and remember its passphrase."
+                else "Couldn't write the backup file."
+        }
+        vm.clearBackupEnvelope()
+    }
+    LaunchedEffect(envelope) {
+        if (envelope != null) saveBackup.launch("pureprivacy-backup.json")
+    }
     LaunchedEffect(Unit) { vm.loadBoxStatus() }
     BackHandler { vm.goHome() }
 
@@ -1871,11 +1895,12 @@ private fun ConfigScreen(vm: AppViewModel) {
                 }
                 Spacer(Modifier.height(12.dp))
                 Button(
-                    onClick = { }, enabled = false, modifier = Modifier.fillMaxWidth(),
-                    colors = ButtonDefaults.buttonColors(containerColor = InkCard, contentColor = PaperDim),
+                    onClick = { bp1 = ""; bp2 = ""; showBackup = true }, enabled = !busy,
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(containerColor = InkCard, contentColor = Paper),
                 ) {
                     Icon(Icons.Filled.CloudUpload, null, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(8.dp)); Text("Back up  ·  coming soon")
+                    Spacer(Modifier.width(8.dp)); Text("Back up my box")
                 }
                 Spacer(Modifier.height(28.dp))
                 Text("Danger zone", color = Danger, fontSize = 12.sp, fontWeight = FontWeight.Bold)
@@ -1928,6 +1953,50 @@ private fun ConfigScreen(vm: AppViewModel) {
             },
             dismissButton = {
                 TextButton(onClick = { showReset = false }) { Text("Cancel", color = PaperDim) }
+            },
+        )
+    }
+
+    if (showBackup) {
+        AlertDialog(
+            onDismissRequest = { showBackup = false },
+            containerColor = InkSoft,
+            title = { Text("Back up your box", color = Paper) },
+            text = {
+                Column {
+                    Text(
+                        "Saves your box's identity — its address, login and contacts — as an encrypted " +
+                            "file you choose where to keep. Message history isn't included.",
+                        color = PaperDim, fontSize = 13.sp,
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    Text(
+                        "Pick a passphrase. You'll need it to restore — if you lose it, the backup " +
+                            "can't be opened by anyone, including you.",
+                        color = Sunflower, fontSize = 12.sp,
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    OutlinedTextField(
+                        value = bp1, onValueChange = { bp1 = it }, singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        label = { Text("Backup passphrase") }, modifier = Modifier.fillMaxWidth(),
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = bp2, onValueChange = { bp2 = it }, singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        label = { Text("Confirm passphrase") }, modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = { vm.backupBox(bp1); showBackup = false },
+                    enabled = bp1.length >= 8 && bp1 == bp2,
+                ) { Text("Back up", color = Sunflower) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showBackup = false }) { Text("Cancel", color = PaperDim) }
             },
         )
     }

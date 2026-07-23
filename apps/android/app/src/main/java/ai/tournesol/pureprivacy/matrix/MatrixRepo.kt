@@ -151,6 +151,7 @@ object MatrixRepo {
     private const val BOXSTATUS_TYPE = "ai.tournesol.pureprivacy.boxstatus"
     private const val COMMAND_TYPE = "ai.tournesol.pureprivacy.command"
     private const val COMMAND_RESULT_TYPE = "ai.tournesol.pureprivacy.command_result"
+    private const val BACKUP_TYPE = "ai.tournesol.pureprivacy.backup"
     // Auto-accepting a freshly-scanned contact's invite is a federated round-trip to
     // their box; the FIRST contact over a cold Tor circuit routinely fails. Retry the
     // join this many times (warming the circuit) before leaving it for the next cycle.
@@ -2138,10 +2139,13 @@ object MatrixRepo {
         )
     }.getOrNull()
 
-    /** Issue a guarded box command (only "restart" / "reset" are honoured by the box).
+    /** Issue a guarded box command ("restart" / "reset" / "backup" are honoured by the box).
      *  Returns the command id to poll [readCommandResult] with, or null on failure.
-     *  Carries a short expiry so a stale write can't be replayed. */
-    suspend fun sendBoxCommand(action: String): String? = runCatching {
+     *  Carries a short expiry so a stale write can't be replayed.
+     *
+     *  [passphrase] is only used by "backup" — it seals the identity backup. The box reads it,
+     *  CLEARS this command immediately, and only then does the work, so it doesn't linger. */
+    suspend fun sendBoxCommand(action: String, passphrase: String? = null): String? = runCatching {
         val c = client ?: return@runCatching null
         val id = java.util.UUID.randomUUID().toString()
         val now = System.currentTimeMillis()
@@ -2150,8 +2154,19 @@ object MatrixRepo {
             .put("action", action)
             .put("issued_ts", now)
             .put("expires_ts", now + 90_000L)
+        if (!passphrase.isNullOrEmpty()) cmd.put("passphrase", passphrase)
         c.setAccountData(COMMAND_TYPE, cmd.toString())
         id
+    }.getOrNull()
+
+    /** Read the sealed backup envelope the box published for [id]; null until it lands.
+     *  The envelope is already encrypted with the user's passphrase — we only ferry it. */
+    suspend fun readBackupEnvelope(id: String): String? = runCatching {
+        val raw = client?.accountData(BACKUP_TYPE)
+        if (raw.isNullOrBlank()) return@runCatching null
+        val o = org.json.JSONObject(raw)
+        if (o.optString("id") != id) return@runCatching null
+        o.optString("envelope").ifBlank { null }
     }.getOrNull()
 
     /** Poll the box's result for [id]: null = not done yet, true/false = ok/failed. */
