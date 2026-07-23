@@ -1007,7 +1007,7 @@ fun ProfileScreen(vm: AppViewModel) {
             // Tappable avatar → pick an image → upload. A small camera badge signals it's
             // editable; a contact's-eye-view of what your paired peers will see.
             Box(contentAlignment = Alignment.BottomEnd) {
-                Box(Modifier.clip(RoundedCornerShape(20.dp)).clickable { pickAvatar.launch("image/*") }) {
+                Box(Modifier.clip(RoundedCornerShape(20.dp)).clickable { vm.beginExternalPick(); pickAvatar.launch("image/*") }) {
                     if (!myAvatar.isNullOrBlank() || name.isNotBlank()) {
                         AvatarImage(myAvatar, name, 76, RoundedCornerShape(20.dp))
                     } else {
@@ -1018,7 +1018,7 @@ fun ProfileScreen(vm: AppViewModel) {
                         }
                     }
                 }
-                Box(Modifier.size(26.dp).clip(CircleShape).background(Sunflower).clickable { pickAvatar.launch("image/*") },
+                Box(Modifier.size(26.dp).clip(CircleShape).background(Sunflower).clickable { vm.beginExternalPick(); pickAvatar.launch("image/*") },
                     contentAlignment = Alignment.Center) {
                     Icon(Icons.Filled.PhotoCamera, "change photo", tint = Ink, modifier = Modifier.size(15.dp))
                 }
@@ -1283,7 +1283,7 @@ fun ChatScreen(vm: AppViewModel, roomId: String, roomName: String) {
                 Modifier.fillMaxWidth().padding(10.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                IconButton(onClick = { pickFile.launch("*/*") }) {
+                IconButton(onClick = { vm.beginExternalPick(); pickFile.launch("*/*") }) {
                     Icon(Icons.Filled.AttachFile, "attach a file", tint = Sunflower)
                 }
                 // [QW-ui] A trimmed draft is the real payload; blank/whitespace never sends.
@@ -1847,7 +1847,7 @@ private fun ConfigScreen(vm: AppViewModel) {
         vm.clearBackupEnvelope()
     }
     LaunchedEffect(envelope) {
-        if (envelope != null) saveBackup.launch("pureprivacy-backup.json")
+        if (envelope != null) { vm.beginExternalPick(); saveBackup.launch("pureprivacy-backup.json") }
     }
     LaunchedEffect(Unit) { vm.loadBoxStatus() }
     BackHandler { vm.goHome() }
@@ -2060,7 +2060,7 @@ private fun FilesScreen(vm: AppViewModel) {
         floatingActionButton = {
             if (ready) {
                 ExtendedFloatingActionButton(
-                    onClick = { pick.launch(arrayOf("*/*")) },
+                    onClick = { vm.beginExternalPick(); pick.launch(arrayOf("*/*")) },
                     containerColor = Sunflower, contentColor = Ink,
                 ) {
                     Icon(Icons.Filled.CloudUpload, null, modifier = Modifier.size(20.dp))
@@ -2103,7 +2103,7 @@ private fun FilesScreen(vm: AppViewModel) {
                 }
                 else -> LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(12.dp)) {
                     items(files, key = { it.key }) { f ->
-                        BackupFileRow(f) { pendingDownload = f; saveTo.launch(f.name) }
+                        BackupFileRow(f) { pendingDownload = f; vm.beginExternalPick(); saveTo.launch(f.name) }
                     }
                 }
             }

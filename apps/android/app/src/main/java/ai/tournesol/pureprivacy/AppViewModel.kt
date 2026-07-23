@@ -68,6 +68,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     val pinLength = PasscodeStore.PIN_LENGTH
     /** Wall-clock of the last time the whole app went to background, for the auto-lock timeout. */
     @Volatile private var backgroundedAt = 0L
+    /** Set just before we launch an OUT-OF-PROCESS picker (any SAF open/create — file backup,
+     *  chat attachment, avatar, backup-JSON save). Those run inside DocumentsUI, a *different*
+     *  process, so [ProcessLifecycleOwner] sees the whole app go to background and would auto-lock
+     *  — tearing down the picker's result callback before the file is ever delivered. This one-shot
+     *  flag tells the next foreground pass "you came back from your own picker, don't re-lock",
+     *  mirroring how same-process sub-activities (the call UI, the QR scanner) are already exempt.
+     *  Consumed in [onEnterForeground]. */
+    @Volatile private var returningFromPicker = false
+    /** Call immediately before launching a cross-process SAF picker. See [returningFromPicker]. */
+    fun beginExternalPick() { returningFromPicker = true }
 
     /** After a successful sign-in with no passcode yet, force the user to set one. */
     private fun maybePromptSetup() {
@@ -75,12 +85,20 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** Process went to background (whole app, not an in-app activity hop). */
-    fun onEnterBackground() { backgroundedAt = System.currentTimeMillis() }
+    fun onEnterBackground() {
+        // Leaving to our OWN cross-process picker is not a real background — don't arm the
+        // auto-lock, or the picker's result would be dropped on return (see returningFromPicker).
+        if (returningFromPicker) return
+        backgroundedAt = System.currentTimeMillis()
+    }
 
     /** Process came to foreground. Re-lock if configured and the timeout has elapsed.
      *  Immediate by default (lockTimeoutMs = 0). Never locks over an in-progress setup. */
     fun onEnterForeground() {
         val app = getApplication<Application>()
+        // Returning from our own SAF picker — consume the exemption and don't re-lock, so the
+        // picked file is delivered to the (still-composed) screen instead of a torn-down callback.
+        if (returningFromPicker) { returningFromPicker = false; return }
         if (!PasscodeStore.isConfigured(app)) return
         if (gate.value != Gate.Open) return
         val elapsed = if (backgroundedAt == 0L) Long.MAX_VALUE else System.currentTimeMillis() - backgroundedAt

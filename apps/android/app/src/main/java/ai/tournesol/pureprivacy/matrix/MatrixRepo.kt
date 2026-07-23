@@ -13,6 +13,8 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.matrix.rustcomponents.sdk.Client
 import org.matrix.rustcomponents.sdk.ClientDelegate
 import org.matrix.rustcomponents.sdk.ClientSessionDelegate
@@ -2070,6 +2072,7 @@ object MatrixRepo {
         roomHandles.clear(); timelineItems.clear(); sendHandles.clear()
         lastSeen.clear(); notifyArmed = false; activeCallRooms.clear()
         rooms.value = emptyList(); messages.value = emptyList()
+        cachedBackupRoom = null                         // next account resolves its own library
         wipeStore(ctx)                                  // remove crypto store too
         status.value = ""
     }
@@ -2096,6 +2099,7 @@ object MatrixRepo {
         roomHandles.clear(); timelineItems.clear(); sendHandles.clear()
         lastSeen.clear(); notifyArmed = false; activeCallRooms.clear()
         rooms.value = emptyList(); messages.value = emptyList()
+        cachedBackupRoom = null                         // next account resolves its own library
         runCatching { sessionPrefs(ctx).edit().clear().apply() }
         runCatching { ctx.getSharedPreferences(SESSION_OLD, Context.MODE_PRIVATE).edit().clear().apply() }
         wipeStore(ctx)                                  // delete the crypto store (megolm keys etc.)
@@ -2170,16 +2174,26 @@ object MatrixRepo {
     /** Ceiling for a backup upload. Matches the box's tuwunel max_request_size (256 MB). */
     const val MAX_BACKUP_BYTES = 256L * 1024 * 1024
 
+    /** Serializes [ensureBackupRoom] so two concurrent openers (the app tile AND the screen's
+     *  LaunchedEffect both fire) can't each pass the check-then-create and mint duplicate library
+     *  rooms. Within the lock the account-data write of the first caller is visible to the second. */
+    private val backupRoomMutex = Mutex()
+    /** Once resolved, the library room id — a fast path that also survives account-data lag. */
+    @Volatile private var cachedBackupRoom: String? = null
+
     /** Find (or create) the room used as this box's file library. The id is recorded in
-     *  account-data so every device — and a reinstall — finds the SAME library. */
-    suspend fun ensureBackupRoom(): String? {
-        val c = client ?: return null
+     *  account-data so every device — and a reinstall — finds the SAME library. Serialized so
+     *  overlapping callers converge on ONE room. */
+    suspend fun ensureBackupRoom(): String? = backupRoomMutex.withLock {
+        val c = client ?: return@withLock null
+        cachedBackupRoom?.let { if (runCatching { c.getRoom(it) }.getOrNull() != null) return@withLock it }
         val recorded = runCatching {
             c.accountData(BACKUP_ROOM_ACCOUNT_DATA)
                 ?.let { org.json.JSONObject(it).optString("room_id").ifBlank { null } }
         }.getOrNull()
         if (!recorded.isNullOrBlank() && runCatching { c.getRoom(recorded) }.getOrNull() != null) {
-            return recorded
+            cachedBackupRoom = recorded
+            return@withLock recorded
         }
         val rid = runCatching {
             c.createRoom(
@@ -2199,15 +2213,16 @@ object MatrixRepo {
                     isSpace = false,
                 )
             )
-        }.getOrNull() ?: return null
+        }.getOrNull() ?: return@withLock null
         runCatching {
             c.setAccountData(
                 BACKUP_ROOM_ACCOUNT_DATA,
                 org.json.JSONObject().put("room_id", rid).toString(),
             )
         }
+        cachedBackupRoom = rid
         Log.i(TAG, "created backup library room $rid")
-        return rid
+        return@withLock rid
     }
 
     /** Upload one file to the backup library at FULL fidelity (no image downscale — a backup
