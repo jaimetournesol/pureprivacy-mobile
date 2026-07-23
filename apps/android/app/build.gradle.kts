@@ -32,8 +32,8 @@ android {
         applicationId = "ai.tournesol.pureprivacy"
         minSdk = 26
         targetSdk = 34
-        versionCode = 33
-        versionName = "0.1.32"
+        versionCode = 34
+        versionName = "0.1.33"
         // matrix-rust-sdk + tor ship arm64-v8a + x86_64 (+ 32-bit). Keep all so it
         // runs on the x86_64 emulator AND real arm64 phones.
         ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
@@ -83,6 +83,9 @@ dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.6")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.6")
+    // Process-level lifecycle (ProcessLifecycleOwner) — drives the passcode auto-lock so it
+    // only fires when the WHOLE app backgrounds, not on in-app activity hops (calls/pickers).
+    implementation("androidx.lifecycle:lifecycle-process:2.8.6")
     implementation("androidx.activity:activity-compose:1.9.2")
     implementation(platform("androidx.compose:compose-bom:2024.09.03"))
     implementation("androidx.compose.ui:ui")

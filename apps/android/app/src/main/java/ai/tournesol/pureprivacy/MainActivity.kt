@@ -59,6 +59,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
@@ -67,7 +68,11 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.semantics.Role
 import androidx.compose.runtime.produceState
 import ai.tournesol.pureprivacy.matrix.MatrixRepo
+import androidx.lifecycle.DefaultLifecycleObserver
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.ProcessLifecycleOwner
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
@@ -114,6 +119,20 @@ class MainActivity : ComponentActivity() {
     override fun onResume() { super.onResume(); vm.setForeground(true) }
     override fun onStop() { super.onStop(); vm.setForeground(false) }
 
+    // Passcode auto-lock (feature C). Observe the *process* lifecycle, not this Activity's —
+    // so launching our OWN sub-activities (the call UI, the QR scanner, image pickers) does
+    // NOT count as backgrounding and never locks the user out mid-call. Only the whole app
+    // going to background re-locks.
+    private val processObserver = object : DefaultLifecycleObserver {
+        override fun onStart(owner: LifecycleOwner) { vm.onEnterForeground() }
+        override fun onStop(owner: LifecycleOwner) { vm.onEnterBackground() }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        ProcessLifecycleOwner.get().lifecycle.removeObserver(processObserver)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         // Keep the login password, identity QR and recovery info out of screenshots
@@ -122,6 +141,7 @@ class MainActivity : ComponentActivity() {
         requestCorePermissions()   // mic + camera (for calls) + notifications
         handleNotifIntent(intent)
         handleDeepLink(intent)
+        ProcessLifecycleOwner.get().lifecycle.addObserver(processObserver)   // auto-lock (feature C)
         setContent {
             PurePrivacyTheme {
                 // Answered an incoming call from the notification → launch the call UI
@@ -134,14 +154,25 @@ class MainActivity : ComponentActivity() {
                     }
                 }
                 Surface(Modifier.fillMaxSize(), color = Ink) {
-                    val screen by vm.screen.collectAsState()
-                    when (val s = screen) {
-                        is Screen.Splash -> SplashScreen(vm)
-                        is Screen.Login -> LoginScreen(vm)
-                        is Screen.Rooms -> RoomsScreen(vm)
-                        is Screen.Profile -> ProfileScreen(vm)
-                        is Screen.Paused -> PausedScreen(vm)
-                        is Screen.Chat -> ChatScreen(vm, s.roomId, s.roomName)
+                    // The passcode gate (feature C) is drawn IN FRONT of the normal screen.
+                    // NOTE: the launchCall LaunchedEffect above stays OUTSIDE this gate, so an
+                    // incoming call still launches (ElementCallActivity, a separate activity)
+                    // even while Locked — you can answer a call without your messages showing.
+                    val gate by vm.gate.collectAsState()
+                    when (gate) {
+                        Gate.NeedsSetup -> PasscodeSetupScreen(vm)
+                        Gate.Locked -> LockScreen(vm)
+                        Gate.Open -> {
+                            val screen by vm.screen.collectAsState()
+                            when (val s = screen) {
+                                is Screen.Splash -> SplashScreen(vm)
+                                is Screen.Login -> LoginScreen(vm)
+                                is Screen.Rooms -> RoomsScreen(vm)
+                                is Screen.Profile -> ProfileScreen(vm)
+                                is Screen.Paused -> PausedScreen(vm)
+                                is Screen.Chat -> ChatScreen(vm, s.roomId, s.roomName)
+                            }
+                        }
                     }
                 }
             }
@@ -1514,4 +1545,195 @@ private fun Bubble(
             }
         }
     }
+}
+
+// ============================================================================================
+// Feature C — passcode lock (unlock + duress). Drawn IN FRONT of the normal screen by the
+// gate in onCreate. PIN-only (no biometrics — biometrics would let a coercer bypass the
+// duress code). See AppViewModel.gate / submitPasscode / setPasscodes / duressWipe.
+// ============================================================================================
+
+/** The cold-start / return-from-background lock. Correct code opens the gate; the duress
+ *  code (or the 10th wrong attempt) self-destructs. Locked out with an escalating countdown
+ *  after repeated wrong entries. */
+@Composable
+private fun LockScreen(vm: AppViewModel) {
+    val err by vm.lockError.collectAsState()
+    val lockoutUntil by vm.lockoutUntilMs.collectAsState()
+    // Tick a clock while a lockout is in effect so the countdown updates live.
+    var now by remember { mutableStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(lockoutUntil) {
+        while (lockoutUntil > System.currentTimeMillis()) { now = System.currentTimeMillis(); delay(500) }
+        now = System.currentTimeMillis()
+    }
+    val remaining = (lockoutUntil - now).coerceAtLeast(0L)
+    val lockedOut = remaining > 0
+    PinPad(
+        title = "Enter your passcode",
+        subtitle = if (lockedOut) "Too many attempts — try again in ${fmtDuration(remaining)}." else err,
+        subtitleIsError = err != null && !lockedOut,
+        pinLength = vm.pinLength,
+        enabled = !lockedOut,
+        resetKey = lockoutUntil,
+        onEntered = { code -> vm.submitPasscode(code) },
+    )
+}
+
+/** First-run / upgrade setup: pick + confirm the unlock code, then the duress code. */
+@Composable
+private fun PasscodeSetupScreen(vm: AppViewModel) {
+    val len = vm.pinLength
+    var step by remember { mutableStateOf(0) }   // 0=unlock, 1=confirm unlock, 2=duress, 3=confirm duress
+    var firstUnlock by remember { mutableStateOf("") }
+    var firstDuress by remember { mutableStateOf("") }
+    var errText by remember { mutableStateOf<String?>(null) }
+
+    fun onEntered(code: String) {
+        when (step) {
+            0 -> { firstUnlock = code; errText = null; step = 1 }
+            1 -> if (code == firstUnlock) { errText = null; step = 2 }
+                 else { errText = "Those didn't match — let's start over"; firstUnlock = ""; step = 0 }
+            2 -> if (code == firstUnlock) errText = "Your emergency code must be different from your unlock code"
+                 else { firstDuress = code; errText = null; step = 3 }
+            3 -> if (code == firstDuress) vm.setPasscodes(firstUnlock, firstDuress)
+                 else { errText = "Those didn't match — re-enter your emergency code"; firstDuress = ""; step = 2 }
+        }
+    }
+
+    val title = when (step) {
+        0 -> "Create your unlock code"
+        1 -> "Confirm your unlock code"
+        2 -> "Set your emergency code"
+        else -> "Confirm your emergency code"
+    }
+    val hint = when (step) {
+        0 -> "Choose a $len-digit code. You'll enter it every time you open PurePrivacy."
+        1 -> "Enter it once more to confirm."
+        2 -> "A DIFFERENT $len-digit code. If you're ever forced to open the app, enter this " +
+             "instead of your unlock code — it erases everything in the app. Nothing will show that it did."
+        else -> "Enter your emergency code once more."
+    }
+    PinPad(
+        title = title,
+        subtitle = errText ?: hint,
+        subtitleIsError = errText != null,
+        pinLength = len,
+        enabled = true,
+        resetKey = step,
+        onEntered = { onEntered(it) },
+    )
+}
+
+/** Shared PIN entry: title + hint, [pinLength] dots, and a numeric keypad. Owns its own
+ *  entered-digit state; fires [onEntered] once a full code is typed (after a brief hold so
+ *  the last dot is visible), then clears. Clears immediately whenever [resetKey] changes. */
+@Composable
+private fun PinPad(
+    title: String,
+    subtitle: String?,
+    subtitleIsError: Boolean,
+    pinLength: Int,
+    enabled: Boolean,
+    resetKey: Any?,
+    onEntered: (String) -> Unit,
+) {
+    var pin by remember { mutableStateOf("") }
+    var checking by remember { mutableStateOf(false) }
+    LaunchedEffect(resetKey) { pin = ""; checking = false }
+    LaunchedEffect(checking) {
+        if (checking) {
+            delay(140)                    // let the final dot render before we act/clear
+            val entered = pin
+            pin = ""
+            checking = false
+            onEntered(entered)
+        }
+    }
+    val active = enabled && !checking
+
+    Column(
+        Modifier.fillMaxSize().background(Ink).padding(horizontal = 32.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Spacer(Modifier.weight(0.20f))
+        Icon(Icons.Filled.Lock, contentDescription = null, tint = Sunflower, modifier = Modifier.size(40.dp))
+        Spacer(Modifier.height(20.dp))
+        Text(title, color = Paper, fontSize = 20.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
+        if (subtitle != null) {
+            Spacer(Modifier.height(10.dp))
+            Text(
+                subtitle,
+                color = if (subtitleIsError) Danger else PaperDim,
+                fontSize = 13.sp,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.heightIn(min = 40.dp),
+            )
+        }
+        Spacer(Modifier.height(24.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+            repeat(pinLength) { i ->
+                Box(
+                    Modifier.size(14.dp).clip(CircleShape)
+                        .background(if (i < pin.length) Sunflower else InkCard)
+                )
+            }
+        }
+        Spacer(Modifier.weight(0.38f))
+        val rows = listOf(
+            listOf('1', '2', '3'),
+            listOf('4', '5', '6'),
+            listOf('7', '8', '9'),
+            listOf(' ', '0', '<'),
+        )
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            rows.forEach { row ->
+                Row(horizontalArrangement = Arrangement.spacedBy(24.dp)) {
+                    row.forEach { c ->
+                        when (c) {
+                            ' ' -> Spacer(Modifier.size(72.dp))
+                            '<' -> KeypadKey(enabled = active && pin.isNotEmpty(), onClick = {
+                                if (pin.isNotEmpty()) pin = pin.dropLast(1)
+                            }) {
+                                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Delete",
+                                    tint = Paper, modifier = Modifier.size(26.dp))
+                            }
+                            else -> KeypadKey(enabled = active, onClick = {
+                                if (pin.length < pinLength) {
+                                    pin += c
+                                    if (pin.length == pinLength) checking = true
+                                }
+                            }) {
+                                Text(c.toString(), color = Paper, fontSize = 28.sp, fontWeight = FontWeight.Medium)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Spacer(Modifier.weight(0.5f))
+    }
+}
+
+@Composable
+private fun KeypadKey(enabled: Boolean, onClick: () -> Unit, content: @Composable () -> Unit) {
+    Box(
+        Modifier
+            .size(72.dp)
+            .clip(CircleShape)
+            .background(InkCard)
+            .alpha(if (enabled) 1f else 0.35f)
+            .then(if (enabled) Modifier.clickable(role = Role.Button, onClick = onClick) else Modifier),
+        contentAlignment = Alignment.Center,
+    ) { content() }
+}
+
+/** "1:05" / "45s" — remaining lockout time, rounded up. */
+private fun fmtDuration(ms: Long): String {
+    val totalSec = ((ms + 999) / 1000).toInt()
+    val m = totalSec / 60
+    val s = totalSec % 60
+    return if (m > 0) "%d:%02d".format(m, s) else "${s}s"
 }

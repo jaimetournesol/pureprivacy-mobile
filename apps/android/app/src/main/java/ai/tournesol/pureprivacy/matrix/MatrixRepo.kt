@@ -2060,4 +2060,34 @@ object MatrixRepo {
         wipeStore(ctx)                                  // remove crypto store too
         status.value = ""
     }
+
+    /** Duress / self-destruct wipe. Unlike [logout], this destroys ALL local session +
+     *  crypto state IMMEDIATELY and synchronously — NO network call first. Under coercion
+     *  the local data is the crown jewel and must be gone instantly (a blocking server
+     *  round-trip over Tor could hang, and a coercer must never see a "still working…"
+     *  spinner that hints a wipe is under way). The server-side device logout is fired
+     *  best-effort in the background and never blocks the wipe. Leaves the app looking like
+     *  a fresh install. See AppViewModel.duressWipe() for the full-device version. */
+    suspend fun duressWipe(ctx: Context) {
+        val doomed = client                             // keep a handle for the best-effort server logout
+        // 1) Local-first: tear down everything on disk + in memory, right now, no network.
+        runCatching { syncService?.stop() }
+        runCatching { timelineHandle?.cancel() }
+        runCatching { syncStateHandle?.cancel() }; syncStateHandle = null; syncRestartDelayMs = 0L
+        runCatching { clientDelegateHandle?.cancel() }; clientDelegateHandle = null
+        syncHardFailures = 0; authExpired.value = false
+        runCatching { callSubs.values.forEach { it.cancel() } }; callSubs.clear()
+        timelineHandle = null; roomListResult = null; roomList = null
+        client = null; syncService = null; roomListService = null; timeline = null
+        currentRoom = null; currentRoomId = null; userId = ""; deviceId = ""
+        roomHandles.clear(); timelineItems.clear(); sendHandles.clear()
+        lastSeen.clear(); notifyArmed = false; activeCallRooms.clear()
+        rooms.value = emptyList(); messages.value = emptyList()
+        runCatching { sessionPrefs(ctx).edit().clear().apply() }
+        runCatching { ctx.getSharedPreferences(SESSION_OLD, Context.MODE_PRIVATE).edit().clear().apply() }
+        wipeStore(ctx)                                  // delete the crypto store (megolm keys etc.)
+        status.value = ""
+        // 2) Best-effort, background, non-blocking: ask the box to drop this device too.
+        scope.launch { runCatching { doomed?.logout() } }
+    }
 }
