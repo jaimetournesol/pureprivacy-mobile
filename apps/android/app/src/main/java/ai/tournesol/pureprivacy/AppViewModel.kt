@@ -23,6 +23,8 @@ sealed class Screen {
     data object Rooms : Screen()
     /** PP Config — the box dashboard (feature B). */
     data object Config : Screen()
+    /** Backup Sync — sync phone files to the box + browse/download (feature F). */
+    data object Files : Screen()
     data object Profile : Screen()
     /** "Go dark": Tor + sync are torn down and the chat list is hidden behind a calm
      *  offline wall. A privacy control — nothing goes in or out until Resume. Survives
@@ -503,6 +505,58 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun goHome() { error.value = null; screen.value = Screen.Home }
     fun openMessaging() { error.value = null; screen.value = Screen.Rooms }
     fun openConfig() { error.value = null; screen.value = Screen.Config; loadBoxStatus() }
+
+    // --- Backup Sync app (feature F) ----------------------------------------------------
+    val backupFiles = MatrixRepo.backupFiles
+    private val _libRoomId = MutableStateFlow<String?>(null)
+    val libraryReady = MutableStateFlow(false)
+    val backupBusy = MutableStateFlow(false)
+    /** Count of uploads in flight, shown as progress. */
+    val backupUploading = MutableStateFlow(0)
+    val backupNotice = MutableStateFlow<String?>(null)
+    fun clearBackupNotice() { backupNotice.value = null }
+
+    fun openFilesApp() {
+        error.value = null
+        screen.value = Screen.Files
+        viewModelScope.launch(Dispatchers.IO) {
+            libraryReady.value = false
+            val rid = runCatching { MatrixRepo.ensureBackupRoom() }.getOrNull()
+            if (rid == null) { backupNotice.value = "Couldn't reach your box."; return@launch }
+            _libRoomId.value = rid
+            runCatching { MatrixRepo.openBackupLibrary(rid) }
+            libraryReady.value = true
+        }
+    }
+
+    fun closeFilesApp() {
+        viewModelScope.launch(Dispatchers.IO) { runCatching { MatrixRepo.closeBackupLibrary() } }
+        goHome()
+    }
+
+    /** Upload the picked files to the box's library, at full fidelity. */
+    fun syncFiles(uris: List<android.net.Uri>) {
+        val rid = _libRoomId.value ?: return
+        if (uris.isEmpty()) return
+        viewModelScope.launch(Dispatchers.IO) {
+            backupUploading.value = uris.size
+            var ok = 0
+            for (u in uris) {
+                if (runCatching { MatrixRepo.backupUpload(getApplication(), rid, u) }.getOrDefault(false)) ok++
+                backupUploading.value = (backupUploading.value - 1).coerceAtLeast(0)
+            }
+            backupUploading.value = 0
+            backupNotice.value =
+                if (ok == uris.size) "Backed up $ok ${if (ok == 1) "file" else "files"} to your box."
+                else "Backed up $ok of ${uris.size} — some were too large or failed."
+        }
+    }
+
+    /** Fetch a library file's bytes so the UI can write them to a user-chosen location. */
+    suspend fun fetchBackupBytes(file: MatrixRepo.BackupFile): ByteArray? {
+        val media = file.media ?: return null
+        return runCatching { MatrixRepo.backupBytes(media) }.getOrNull()
+    }
 
     val boxStatus = MutableStateFlow<MatrixRepo.BoxStatus?>(null)
     val configBusy = MutableStateFlow(false)

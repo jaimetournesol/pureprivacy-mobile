@@ -16,6 +16,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.launch
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -48,6 +50,7 @@ import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.DeleteForever
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.PauseCircleOutline
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.ContentCopy
@@ -184,6 +187,7 @@ class MainActivity : ComponentActivity() {
                                 is Screen.Home -> HomeScreen(vm)
                                 is Screen.Rooms -> RoomsScreen(vm)
                                 is Screen.Config -> ConfigScreen(vm)
+                                is Screen.Files -> FilesScreen(vm)
                                 is Screen.Profile -> ProfileScreen(vm)
                                 is Screen.Paused -> PausedScreen(vm)
                                 is Screen.Chat -> ChatScreen(vm, s.roomId, s.roomName)
@@ -1780,8 +1784,8 @@ private fun HomeScreen(vm: AppViewModel) {
         }
         Spacer(Modifier.height(16.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-            AppTile(Modifier.weight(1f), "Backup", "Coming soon",
-                Icons.Filled.CloudUpload, PaperDim, false) { }
+            AppTile(Modifier.weight(1f), "Backup", "Your files on your box",
+                Icons.Filled.CloudUpload, Sunflower, true) { vm.openFilesApp() }
             Spacer(Modifier.weight(1f))
         }
     }
@@ -2000,6 +2004,147 @@ private fun ConfigScreen(vm: AppViewModel) {
             },
         )
     }
+}
+
+/** Backup Sync (feature F): sync phone files to the box + browse/download them back. */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun FilesScreen(vm: AppViewModel) {
+    val files by vm.backupFiles.collectAsState()
+    val ready by vm.libraryReady.collectAsState()
+    val uploading by vm.backupUploading.collectAsState()
+    val notice by vm.backupNotice.collectAsState()
+    val scope = rememberCoroutineScope()
+    val ctx = LocalContext.current
+
+    LaunchedEffect(Unit) { vm.openFilesApp() }
+    BackHandler { vm.closeFilesApp() }
+
+    // Pick any number of files (photos, videos, docs) to sync up.
+    val pick = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris -> if (uris.isNotEmpty()) vm.syncFiles(uris) }
+
+    // Download a chosen library file to a user-picked location.
+    var pendingDownload by remember { mutableStateOf<MatrixRepo.BackupFile?>(null) }
+    val saveTo = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/octet-stream")
+    ) { uri ->
+        val f = pendingDownload
+        if (uri != null && f != null) {
+            scope.launch {
+                vm.backupNotice.value = "Downloading ${f.name}…"
+                val bytes = vm.fetchBackupBytes(f)
+                val ok = bytes != null && runCatching {
+                    ctx.contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
+                }.isSuccess
+                vm.backupNotice.value = if (ok) "Saved ${f.name}." else "Couldn't download ${f.name}."
+            }
+        }
+        pendingDownload = null
+    }
+
+    Scaffold(
+        containerColor = Ink,
+        topBar = {
+            TopAppBar(
+                title = { Text("Backup", color = Paper, fontWeight = FontWeight.Bold) },
+                navigationIcon = {
+                    IconButton(onClick = { vm.closeFilesApp() }) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, "back to apps", tint = Sunflower)
+                    }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = InkSoft),
+            )
+        },
+        floatingActionButton = {
+            if (ready) {
+                ExtendedFloatingActionButton(
+                    onClick = { pick.launch(arrayOf("*/*")) },
+                    containerColor = Sunflower, contentColor = Ink,
+                ) {
+                    Icon(Icons.Filled.CloudUpload, null, modifier = Modifier.size(20.dp))
+                    Spacer(Modifier.width(8.dp)); Text("Back up files")
+                }
+            }
+        },
+    ) { pad ->
+        Column(Modifier.padding(pad).fillMaxSize()) {
+            if (uploading > 0) {
+                Row(
+                    Modifier.fillMaxWidth().background(InkCard).padding(14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    CircularProgressIndicator(Modifier.size(18.dp), color = Sunflower, strokeWidth = 2.dp)
+                    Spacer(Modifier.width(12.dp))
+                    Text("Backing up $uploading ${if (uploading == 1) "file" else "files"}…",
+                        color = Paper, fontSize = 13.sp)
+                }
+            }
+            notice?.let {
+                Text(it, color = Sunflower, fontSize = 13.sp,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
+            }
+            when {
+                !ready -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Text("Opening your library…", color = PaperDim)
+                }
+                files.isEmpty() -> Column(
+                    Modifier.fillMaxSize().padding(32.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center,
+                ) {
+                    Icon(Icons.Filled.CloudUpload, null, tint = PaperDim, modifier = Modifier.size(48.dp))
+                    Spacer(Modifier.height(16.dp))
+                    Text("No files backed up yet", color = Paper, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.height(6.dp))
+                    Text("Tap “Back up files” to copy photos or files to your box — encrypted, over Tor.",
+                        color = PaperDim, fontSize = 13.sp, textAlign = TextAlign.Center)
+                }
+                else -> LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(12.dp)) {
+                    items(files, key = { it.key }) { f ->
+                        BackupFileRow(f) { pendingDownload = f; saveTo.launch(f.name) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun BackupFileRow(f: MatrixRepo.BackupFile, onDownload: () -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().padding(vertical = 4.dp).clip(RoundedCornerShape(12.dp))
+            .background(InkCard).padding(14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            if (f.isImage) Icons.Filled.PhotoCamera else Icons.Filled.AttachFile,
+            null, tint = Sunflower, modifier = Modifier.size(26.dp),
+        )
+        Spacer(Modifier.width(14.dp))
+        Column(Modifier.weight(1f)) {
+            Text(f.name, color = Paper, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            val meta = buildString {
+                if (f.sizeBytes > 0) append(fmtSize(f.sizeBytes))
+                if (f.sending) { if (isNotEmpty()) append(" · "); append("backing up…") }
+            }
+            if (meta.isNotEmpty()) Text(meta, color = PaperDim, fontSize = 11.sp)
+        }
+        if (!f.sending) {
+            IconButton(onClick = onDownload) {
+                Icon(Icons.Filled.Download, "download", tint = Sunflower)
+            }
+        }
+    }
+}
+
+private fun fmtSize(bytes: Long): String {
+    if (bytes < 1024) return "$bytes B"
+    val kb = bytes / 1024.0
+    if (kb < 1024) return "%.0f KB".format(kb)
+    val mb = kb / 1024.0
+    return if (mb < 1024) "%.1f MB".format(mb) else "%.1f GB".format(mb / 1024.0)
 }
 
 @Composable
