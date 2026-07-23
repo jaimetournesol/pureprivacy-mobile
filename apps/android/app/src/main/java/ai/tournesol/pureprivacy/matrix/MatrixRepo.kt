@@ -147,6 +147,10 @@ object MatrixRepo {
     private const val SESSION_ENC = "pp_session_enc"   // encrypted token store
     private const val SESSION_OLD = "pp_session"       // legacy plaintext (migrated away)
     private const val RECOVERY_ACCOUNT_DATA = "ai.tournesol.pureprivacy.recovery"
+    // Box config channel (feature B): box publishes status here; phone writes commands.
+    private const val BOXSTATUS_TYPE = "ai.tournesol.pureprivacy.boxstatus"
+    private const val COMMAND_TYPE = "ai.tournesol.pureprivacy.command"
+    private const val COMMAND_RESULT_TYPE = "ai.tournesol.pureprivacy.command_result"
     // Auto-accepting a freshly-scanned contact's invite is a federated round-trip to
     // their box; the FIRST contact over a cold Tor circuit routinely fails. Retry the
     // join this many times (warming the circuit) before leaving it for the next cycle.
@@ -2060,4 +2064,94 @@ object MatrixRepo {
         wipeStore(ctx)                                  // remove crypto store too
         status.value = ""
     }
+
+    /** Duress / self-destruct wipe. Unlike [logout], this destroys ALL local session +
+     *  crypto state IMMEDIATELY and synchronously — NO network call first. Under coercion
+     *  the local data is the crown jewel and must be gone instantly (a blocking server
+     *  round-trip over Tor could hang, and a coercer must never see a "still working…"
+     *  spinner that hints a wipe is under way). The server-side device logout is fired
+     *  best-effort in the background and never blocks the wipe. Leaves the app looking like
+     *  a fresh install. See AppViewModel.duressWipe() for the full-device version. */
+    suspend fun duressWipe(ctx: Context) {
+        val doomed = client                             // keep a handle for the best-effort server logout
+        // 1) Local-first: tear down everything on disk + in memory, right now, no network.
+        runCatching { syncService?.stop() }
+        runCatching { timelineHandle?.cancel() }
+        runCatching { syncStateHandle?.cancel() }; syncStateHandle = null; syncRestartDelayMs = 0L
+        runCatching { clientDelegateHandle?.cancel() }; clientDelegateHandle = null
+        syncHardFailures = 0; authExpired.value = false
+        runCatching { callSubs.values.forEach { it.cancel() } }; callSubs.clear()
+        timelineHandle = null; roomListResult = null; roomList = null
+        client = null; syncService = null; roomListService = null; timeline = null
+        currentRoom = null; currentRoomId = null; userId = ""; deviceId = ""
+        roomHandles.clear(); timelineItems.clear(); sendHandles.clear()
+        lastSeen.clear(); notifyArmed = false; activeCallRooms.clear()
+        rooms.value = emptyList(); messages.value = emptyList()
+        runCatching { sessionPrefs(ctx).edit().clear().apply() }
+        runCatching { ctx.getSharedPreferences(SESSION_OLD, Context.MODE_PRIVATE).edit().clear().apply() }
+        wipeStore(ctx)                                  // delete the crypto store (megolm keys etc.)
+        status.value = ""
+        // 2) Best-effort, background, non-blocking: ask the box to drop this device too.
+        scope.launch { runCatching { doomed?.logout() } }
+    }
+
+    // --- Box config channel (appliance-UX feature B) ------------------------------------
+    // Talks to the box over the SAME authenticated account-data channel as pairing (no new
+    // network surface). The box publishes BOXSTATUS_TYPE (read-only) and executes guarded
+    // commands we write to COMMAND_TYPE, acking to COMMAND_RESULT_TYPE. See supervisor.rs
+    // run_box_config for the box side + its security rules.
+
+    data class BoxStatus(
+        val onion: String,
+        val boxName: String,
+        val version: String,
+        val homeserver: String,
+        val tor: String,
+        val voice: String,
+        val pairedCount: Int,
+        val updatedTs: Long,
+    )
+
+    /** Read the box's published status (health, address, version, pairings). */
+    suspend fun readBoxStatus(): BoxStatus? = runCatching {
+        val raw = client?.accountData(BOXSTATUS_TYPE)
+        if (raw.isNullOrBlank()) return@runCatching null
+        val o = org.json.JSONObject(raw)
+        val svc = o.optJSONObject("services") ?: org.json.JSONObject()
+        BoxStatus(
+            onion = o.optString("onion"),
+            boxName = o.optString("box_name"),
+            version = o.optString("version"),
+            homeserver = svc.optString("homeserver", "unknown"),
+            tor = svc.optString("tor", "unknown"),
+            voice = svc.optString("voice", "unknown"),
+            pairedCount = o.optInt("paired_count", 0),
+            updatedTs = o.optLong("updated_ts", 0L),
+        )
+    }.getOrNull()
+
+    /** Issue a guarded box command (only "restart" / "reset" are honoured by the box).
+     *  Returns the command id to poll [readCommandResult] with, or null on failure.
+     *  Carries a short expiry so a stale write can't be replayed. */
+    suspend fun sendBoxCommand(action: String): String? = runCatching {
+        val c = client ?: return@runCatching null
+        val id = java.util.UUID.randomUUID().toString()
+        val now = System.currentTimeMillis()
+        val cmd = org.json.JSONObject()
+            .put("id", id)
+            .put("action", action)
+            .put("issued_ts", now)
+            .put("expires_ts", now + 90_000L)
+        c.setAccountData(COMMAND_TYPE, cmd.toString())
+        id
+    }.getOrNull()
+
+    /** Poll the box's result for [id]: null = not done yet, true/false = ok/failed. */
+    suspend fun readCommandResult(id: String): Boolean? = runCatching {
+        val raw = client?.accountData(COMMAND_RESULT_TYPE)
+        if (raw.isNullOrBlank()) return@runCatching null
+        val o = org.json.JSONObject(raw)
+        if (o.optString("id") != id) return@runCatching null
+        o.optBoolean("ok", false)
+    }.getOrNull()
 }

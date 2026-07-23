@@ -4,6 +4,7 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import ai.tournesol.pureprivacy.matrix.MatrixRepo
+import ai.tournesol.pureprivacy.security.PasscodeStore
 import ai.tournesol.pureprivacy.tor.TorManager
 import ai.tournesol.pureprivacy.util.mapError
 import android.util.Log
@@ -17,13 +18,28 @@ sealed class Screen {
      *  session restores, so a returning user never sees an empty login form. */
     data object Splash : Screen()
     data object Login : Screen()
+    /** The ecosystem home: an apps grid (Messaging, PP Config). Landing after unlock. */
+    data object Home : Screen()
     data object Rooms : Screen()
+    /** PP Config — the box dashboard (feature B). */
+    data object Config : Screen()
     data object Profile : Screen()
     /** "Go dark": Tor + sync are torn down and the chat list is hidden behind a calm
      *  offline wall. A privacy control — nothing goes in or out until Resume. Survives
      *  app restarts (persisted), so re-opening the app while paused stays dark. */
     data object Paused : Screen()
     data class Chat(val roomId: String, val roomName: String) : Screen()
+}
+
+/** The passcode gate, drawn *in front of* the normal [Screen] (see MainActivity). Kept
+ *  independent of the Screen state machine so the lock never disturbs cold-start restore. */
+enum class Gate {
+    /** No gate — render the normal [Screen]. */
+    Open,
+    /** Passcode required — [MainActivity] draws the lock screen over everything. */
+    Locked,
+    /** First run / upgrade: the user must set their unlock + duress codes. */
+    NeedsSetup,
 }
 
 class AppViewModel(app: Application) : AndroidViewModel(app) {
@@ -38,6 +54,100 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     val notice = MutableStateFlow<String?>(null)
     val busy = MutableStateFlow(false)
     fun clearNotice() { notice.value = null }
+
+    // --- Passcode gate (feature C) -------------------------------------------------------
+    /** Drawn in front of [screen] by MainActivity. See [Gate]. */
+    val gate = MutableStateFlow(Gate.Open)
+    /** Transient lock-screen error ("Wrong code"). The LockScreen clears its dots on change. */
+    val lockError = MutableStateFlow<String?>(null)
+    /** Epoch-ms until which entry is locked out after wrong attempts (0 = not locked out).
+     *  The LockScreen ticks a countdown off this. */
+    val lockoutUntilMs = MutableStateFlow(0L)
+    val pinLength = PasscodeStore.PIN_LENGTH
+    /** Wall-clock of the last time the whole app went to background, for the auto-lock timeout. */
+    @Volatile private var backgroundedAt = 0L
+
+    /** After a successful sign-in with no passcode yet, force the user to set one. */
+    private fun maybePromptSetup() {
+        if (!PasscodeStore.isConfigured(getApplication())) gate.value = Gate.NeedsSetup
+    }
+
+    /** Process went to background (whole app, not an in-app activity hop). */
+    fun onEnterBackground() { backgroundedAt = System.currentTimeMillis() }
+
+    /** Process came to foreground. Re-lock if configured and the timeout has elapsed.
+     *  Immediate by default (lockTimeoutMs = 0). Never locks over an in-progress setup. */
+    fun onEnterForeground() {
+        val app = getApplication<Application>()
+        if (!PasscodeStore.isConfigured(app)) return
+        if (gate.value != Gate.Open) return
+        val elapsed = if (backgroundedAt == 0L) Long.MAX_VALUE else System.currentTimeMillis() - backgroundedAt
+        if (elapsed >= PasscodeStore.lockTimeoutMs(app)) {
+            lockError.value = null
+            lockoutUntilMs.value = System.currentTimeMillis() + PasscodeStore.lockoutRemainingMs(app)
+            gate.value = Gate.Locked
+        }
+    }
+
+    /** Verify an entered code. Runs PBKDF2 off the main thread. Unlock opens the gate;
+     *  the duress code (or the 10th wrong attempt) triggers the self-destruct wipe. */
+    fun submitPasscode(code: String) {
+        viewModelScope.launch(Dispatchers.Default) {
+            val app = getApplication<Application>()
+            if (PasscodeStore.lockoutRemainingMs(app) > 0) {
+                lockoutUntilMs.value = System.currentTimeMillis() + PasscodeStore.lockoutRemainingMs(app)
+                return@launch
+            }
+            when (PasscodeStore.verify(app, code)) {
+                PasscodeStore.Verdict.UNLOCK -> {
+                    lockError.value = null; lockoutUntilMs.value = 0L; gate.value = Gate.Open
+                }
+                PasscodeStore.Verdict.DURESS, PasscodeStore.Verdict.WIPE -> duressWipe()
+                PasscodeStore.Verdict.WRONG -> {
+                    val remaining = PasscodeStore.lockoutRemainingMs(app)
+                    lockoutUntilMs.value = if (remaining > 0) System.currentTimeMillis() + remaining else 0L
+                    lockError.value = "Wrong code"
+                }
+            }
+        }
+    }
+
+    /** Store the two codes during first-run setup, then open the app. Validates format +
+     *  that the codes differ (the UI already confirms each twice). */
+    fun setPasscodes(unlock: String, duress: String) {
+        val app = getApplication<Application>()
+        if (unlock.length != pinLength || duress.length != pinLength ||
+            !unlock.all { it.isDigit() } || !duress.all { it.isDigit() }) {
+            lockError.value = "Codes must be $pinLength digits"; return
+        }
+        if (unlock == duress) { lockError.value = "Your two codes must be different"; return }
+        viewModelScope.launch(Dispatchers.Default) {
+            PasscodeStore.setCodes(app, unlock, duress)
+            lockError.value = null
+            gate.value = Gate.Open
+        }
+    }
+
+    /** Duress self-destruct: wipe ALL local app data (session + crypto store via a
+     *  local-first [MatrixRepo.duressWipe], Tor data dir, caches, and the passcodes) and
+     *  land on a neutral Login — no indication a wipe happened. Irreversible. */
+    private fun duressWipe() {
+        val app = getApplication<Application>()
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { PpSyncService.stop(app) }
+            runCatching { MatrixRepo.duressWipe(app) }       // local-first: session + crypto store
+            runCatching { TorManager.stop() }
+            runCatching { java.io.File(app.filesDir, "tor").deleteRecursively() }  // guards + descriptor cache
+            runCatching { app.cacheDir.deleteRecursively() }                       // cached media/thumbs
+            PasscodeStore.clear(app)                          // forget the codes too
+            isPaused = false; paused.value = false
+            lockError.value = null; lockoutUntilMs.value = 0L
+            gate.value = Gate.Open                            // reveal the neutral Login underneath
+            screen.value = Screen.Login
+            // Re-boot Tor for the next sign-in (its data dir was just wiped → fresh guards).
+            viewModelScope.launch(Dispatchers.IO) { runCatching { TorManager.start(app) } }
+        }
+    }
 
     /** How the cold-start session restore is going, for the SplashScreen. A RETURNING
      *  user (saved session) must never silently fall through to a bare login form, so
@@ -67,6 +177,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     @Volatile private var restoring = false
 
     init {
+        // Passcode gate (feature C): if the user has set codes, lock immediately on cold
+        // start — the lock is drawn over whatever the restore below reaches, so it never
+        // interferes with restore. A configured-but-locked-out relaunch restores the
+        // countdown from the persisted lockout timestamp.
+        if (PasscodeStore.isConfigured(getApplication())) {
+            gate.value = Gate.Locked
+            lockoutUntilMs.value = System.currentTimeMillis() + PasscodeStore.lockoutRemainingMs(getApplication())
+        }
         if (isPaused) {
             // Stay dark on launch: don't boot Tor or restore the session, and hide the
             // chat list. The user explicitly paused; honour it until they Resume.
@@ -135,8 +253,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     runCatching {
                         MatrixRepo.startSync()
                         PpSyncService.start(getApplication())
-                        screen.value = Screen.Rooms
+                        screen.value = Screen.Home
                         consumePendingContact()
+                        // Upgrade path: an existing user (session restored) with no passcode
+                        // yet is prompted to set one on first launch of this version. If a
+                        // passcode IS set, init() already locked the gate — this is a no-op.
+                        maybePromptSetup()
                     }.onFailure {
                         // Sync failed to start — recoverable, not "signed out". Keep the
                         // saved session and offer a retry from the splash.
@@ -193,8 +315,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 MatrixRepo.login(getApplication(), hs, user.trim(), pass)
                 MatrixRepo.startSync()
                 PpSyncService.start(getApplication())
-                screen.value = Screen.Rooms
+                screen.value = Screen.Home
                 consumePendingContact()
+                maybePromptSetup()   // first sign-in with no passcode -> force setup (feature C)
             } catch (t: Throwable) {
                 Log.w("AppVM", "login failed", t)
                 error.value = mapError(t)
@@ -376,6 +499,66 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun showProfile() { error.value = null; screen.value = Screen.Profile }
     fun openRooms() { error.value = null; screen.value = Screen.Rooms }
 
+    // --- Apps grid (feature E) + PP Config (feature B) ----------------------------------
+    fun goHome() { error.value = null; screen.value = Screen.Home }
+    fun openMessaging() { error.value = null; screen.value = Screen.Rooms }
+    fun openConfig() { error.value = null; screen.value = Screen.Config; loadBoxStatus() }
+
+    val boxStatus = MutableStateFlow<MatrixRepo.BoxStatus?>(null)
+    val configBusy = MutableStateFlow(false)
+    val configNotice = MutableStateFlow<String?>(null)
+    fun clearConfigNotice() { configNotice.value = null }
+
+    /** Read the box's published status (health/address/version/pairings) for PP Config. */
+    fun loadBoxStatus() {
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { MatrixRepo.readBoxStatus() }.getOrNull()?.let { boxStatus.value = it }
+        }
+    }
+
+    /** Restart the box's services (safe) via the guarded command channel. */
+    fun restartBox() {
+        viewModelScope.launch(Dispatchers.IO) {
+            configBusy.value = true
+            val id = runCatching { MatrixRepo.sendBoxCommand("restart") }.getOrNull()
+            if (id == null) { configNotice.value = "Couldn't reach your box."; configBusy.value = false; return@launch }
+            configNotice.value = "Restarting your box…"
+            repeat(20) {
+                kotlinx.coroutines.delay(2000)
+                if (runCatching { MatrixRepo.readCommandResult(id) }.getOrNull() == true) {
+                    configNotice.value = "Your box is restarting."
+                }
+            }
+            configBusy.value = false
+            loadBoxStatus()
+        }
+    }
+
+    /** Factory-reset the box — DESTRUCTIVE (wipes the onion, unrecoverable). Gated behind
+     *  typing the box name (see PP Config). After reset the box identity is gone, so we
+     *  sign out locally to a fresh state. */
+    fun resetBox(typedName: String) {
+        val expected = boxStatus.value?.boxName?.trim().orEmpty()
+        if (expected.isEmpty() || typedName.trim() != expected) {
+            configNotice.value = "That doesn't match your box's name."
+            return
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            configBusy.value = true
+            val id = runCatching { MatrixRepo.sendBoxCommand("reset") }.getOrNull()
+            if (id == null) { configNotice.value = "Couldn't reach your box."; configBusy.value = false; return@launch }
+            configNotice.value = "Resetting your box…"
+            kotlinx.coroutines.delay(4000)   // let the box ack + begin wiping
+            // The box + its account are being destroyed — sign out locally to a fresh state.
+            runCatching { PpSyncService.stop(getApplication()) }
+            runCatching { MatrixRepo.logout(getApplication()) }
+            PasscodeStore.clear(getApplication())
+            configBusy.value = false
+            gate.value = Gate.Open
+            screen.value = Screen.Login
+        }
+    }
+
     /** Persisted "paused" flag so a Pause survives an app restart (privacy: re-opening
      *  the app while paused must stay dark, not silently reconnect). */
     private fun appPrefs() =
@@ -548,7 +731,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun logout() {
         viewModelScope.launch(Dispatchers.IO) {
             runCatching { MatrixRepo.logout(getApplication()) }
+            PasscodeStore.clear(getApplication())   // forget the passcode -> re-sign-in re-prompts (feature C)
             isPaused = false; paused.value = false
+            gate.value = Gate.Open
             screen.value = Screen.Login
         }
     }
@@ -565,7 +750,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             runCatching { TorManager.stop() }
             runCatching { java.io.File(app.filesDir, "tor").deleteRecursively() }   // guards + descriptor cache
             runCatching { app.cacheDir.deleteRecursively() }                        // any cached media/thumbs
+            PasscodeStore.clear(app)                        // forget the passcode too (feature C)
             isPaused = false; paused.value = false
+            gate.value = Gate.Open
             // Re-boot Tor for the next sign-in (its data dir was just wiped → fresh guards).
             viewModelScope.launch(Dispatchers.IO) { runCatching { TorManager.start(app) } }
             screen.value = Screen.Login
