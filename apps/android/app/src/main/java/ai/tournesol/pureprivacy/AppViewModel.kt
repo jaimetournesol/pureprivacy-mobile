@@ -18,7 +18,11 @@ sealed class Screen {
      *  session restores, so a returning user never sees an empty login form. */
     data object Splash : Screen()
     data object Login : Screen()
+    /** The ecosystem home: an apps grid (Messaging, PP Config). Landing after unlock. */
+    data object Home : Screen()
     data object Rooms : Screen()
+    /** PP Config — the box dashboard (feature B). */
+    data object Config : Screen()
     data object Profile : Screen()
     /** "Go dark": Tor + sync are torn down and the chat list is hidden behind a calm
      *  offline wall. A privacy control — nothing goes in or out until Resume. Survives
@@ -249,7 +253,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     runCatching {
                         MatrixRepo.startSync()
                         PpSyncService.start(getApplication())
-                        screen.value = Screen.Rooms
+                        screen.value = Screen.Home
                         consumePendingContact()
                         // Upgrade path: an existing user (session restored) with no passcode
                         // yet is prompted to set one on first launch of this version. If a
@@ -311,7 +315,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 MatrixRepo.login(getApplication(), hs, user.trim(), pass)
                 MatrixRepo.startSync()
                 PpSyncService.start(getApplication())
-                screen.value = Screen.Rooms
+                screen.value = Screen.Home
                 consumePendingContact()
                 maybePromptSetup()   // first sign-in with no passcode -> force setup (feature C)
             } catch (t: Throwable) {
@@ -494,6 +498,66 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun showProfile() { error.value = null; screen.value = Screen.Profile }
     fun openRooms() { error.value = null; screen.value = Screen.Rooms }
+
+    // --- Apps grid (feature E) + PP Config (feature B) ----------------------------------
+    fun goHome() { error.value = null; screen.value = Screen.Home }
+    fun openMessaging() { error.value = null; screen.value = Screen.Rooms }
+    fun openConfig() { error.value = null; screen.value = Screen.Config; loadBoxStatus() }
+
+    val boxStatus = MutableStateFlow<MatrixRepo.BoxStatus?>(null)
+    val configBusy = MutableStateFlow(false)
+    val configNotice = MutableStateFlow<String?>(null)
+    fun clearConfigNotice() { configNotice.value = null }
+
+    /** Read the box's published status (health/address/version/pairings) for PP Config. */
+    fun loadBoxStatus() {
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { MatrixRepo.readBoxStatus() }.getOrNull()?.let { boxStatus.value = it }
+        }
+    }
+
+    /** Restart the box's services (safe) via the guarded command channel. */
+    fun restartBox() {
+        viewModelScope.launch(Dispatchers.IO) {
+            configBusy.value = true
+            val id = runCatching { MatrixRepo.sendBoxCommand("restart") }.getOrNull()
+            if (id == null) { configNotice.value = "Couldn't reach your box."; configBusy.value = false; return@launch }
+            configNotice.value = "Restarting your box…"
+            repeat(20) {
+                kotlinx.coroutines.delay(2000)
+                if (runCatching { MatrixRepo.readCommandResult(id) }.getOrNull() == true) {
+                    configNotice.value = "Your box is restarting."
+                }
+            }
+            configBusy.value = false
+            loadBoxStatus()
+        }
+    }
+
+    /** Factory-reset the box — DESTRUCTIVE (wipes the onion, unrecoverable). Gated behind
+     *  typing the box name (see PP Config). After reset the box identity is gone, so we
+     *  sign out locally to a fresh state. */
+    fun resetBox(typedName: String) {
+        val expected = boxStatus.value?.boxName?.trim().orEmpty()
+        if (expected.isEmpty() || typedName.trim() != expected) {
+            configNotice.value = "That doesn't match your box's name."
+            return
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            configBusy.value = true
+            val id = runCatching { MatrixRepo.sendBoxCommand("reset") }.getOrNull()
+            if (id == null) { configNotice.value = "Couldn't reach your box."; configBusy.value = false; return@launch }
+            configNotice.value = "Resetting your box…"
+            kotlinx.coroutines.delay(4000)   // let the box ack + begin wiping
+            // The box + its account are being destroyed — sign out locally to a fresh state.
+            runCatching { PpSyncService.stop(getApplication()) }
+            runCatching { MatrixRepo.logout(getApplication()) }
+            PasscodeStore.clear(getApplication())
+            configBusy.value = false
+            gate.value = Gate.Open
+            screen.value = Screen.Login
+        }
+    }
 
     /** Persisted "paused" flag so a Pause survives an app restart (privacy: re-opening
      *  the app while paused must stay dark, not silently reconnect). */

@@ -24,7 +24,11 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.automirrored.filled.Logout
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.CloudUpload
+import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.automirrored.filled.Reply
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.automirrored.filled.Send
@@ -167,7 +171,9 @@ class MainActivity : ComponentActivity() {
                             when (val s = screen) {
                                 is Screen.Splash -> SplashScreen(vm)
                                 is Screen.Login -> LoginScreen(vm)
+                                is Screen.Home -> HomeScreen(vm)
                                 is Screen.Rooms -> RoomsScreen(vm)
+                                is Screen.Config -> ConfigScreen(vm)
                                 is Screen.Profile -> ProfileScreen(vm)
                                 is Screen.Paused -> PausedScreen(vm)
                                 is Screen.Chat -> ChatScreen(vm, s.roomId, s.roomName)
@@ -588,6 +594,7 @@ private fun PpField(value: String, onChange: (String) -> Unit, label: String, pa
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun RoomsScreen(vm: AppViewModel) {
+    BackHandler { vm.goHome() }   // Rooms sits under the apps-grid Home now
     val allRooms by vm.rooms.collectAsState()
     // Mutual consent, made legible. A row shows when it's live (both scanned), an
     // INCOMING request (someone scanned you — scan them back), or an OUTGOING request
@@ -730,6 +737,11 @@ fun RoomsScreen(vm: AppViewModel) {
         topBar = {
             TopAppBar(
                 title = { Column { Text("Chats", color = Paper, fontWeight = FontWeight.Bold); TorBadge(onRetry = vm::retryTor) } },
+                navigationIcon = {
+                    IconButton(onClick = { vm.goHome() }) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, "back to apps", tint = Sunflower)
+                    }
+                },
                 actions = {
                     IconButton(onClick = { vm.showProfile() }) {
                         Icon(Icons.Filled.AccountCircle, "profile — my code, pause, sign out", tint = Sunflower)
@@ -1736,4 +1748,195 @@ private fun fmtDuration(ms: Long): String {
     val m = totalSec / 60
     val s = totalSec % 60
     return if (m > 0) "%d:%02d".format(m, s) else "${s}s"
+}
+
+// ============================================================================================
+// Feature E — apps-grid home + Feature B — PP Config (box dashboard over account-data).
+// ============================================================================================
+
+/** The ecosystem home: a grid of apps shown after unlock. */
+@Composable
+private fun HomeScreen(vm: AppViewModel) {
+    Column(Modifier.fillMaxSize().background(Ink).padding(horizontal = 24.dp)) {
+        Spacer(Modifier.height(64.dp))
+        Text("PurePrivacy", color = Paper, fontSize = 28.sp, fontWeight = FontWeight.Bold)
+        Text("Your apps", color = PaperDim, fontSize = 14.sp)
+        Spacer(Modifier.height(28.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+            AppTile(Modifier.weight(1f), "Messaging", "Chats & calls",
+                Icons.AutoMirrored.Filled.Chat, Sunflower, true) { vm.openMessaging() }
+            AppTile(Modifier.weight(1f), "PP Config", "Your box",
+                Icons.Filled.Settings, Sunflower, true) { vm.openConfig() }
+        }
+        Spacer(Modifier.height(16.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+            AppTile(Modifier.weight(1f), "Backup", "Coming soon",
+                Icons.Filled.CloudUpload, PaperDim, false) { }
+            Spacer(Modifier.weight(1f))
+        }
+    }
+}
+
+@Composable
+private fun AppTile(
+    modifier: Modifier,
+    title: String,
+    sub: String,
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    tint: Color,
+    enabled: Boolean,
+    onClick: () -> Unit,
+) {
+    Column(
+        modifier
+            .clip(RoundedCornerShape(20.dp))
+            .background(InkCard)
+            .then(if (enabled) Modifier.clickable(role = Role.Button, onClick = onClick) else Modifier)
+            .alpha(if (enabled) 1f else 0.5f)
+            .padding(20.dp),
+    ) {
+        Icon(icon, null, tint = tint, modifier = Modifier.size(34.dp))
+        Spacer(Modifier.height(14.dp))
+        Text(title, color = Paper, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+        Text(sub, color = PaperDim, fontSize = 12.sp)
+    }
+}
+
+/** PP Config — the box dashboard (health/address/version/pairings) + restart / reset. */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ConfigScreen(vm: AppViewModel) {
+    val st by vm.boxStatus.collectAsState()
+    val busy by vm.configBusy.collectAsState()
+    val notice by vm.configNotice.collectAsState()
+    var showReset by remember { mutableStateOf(false) }
+    var confirmName by remember { mutableStateOf("") }
+    LaunchedEffect(Unit) { vm.loadBoxStatus() }
+    BackHandler { vm.goHome() }
+
+    Scaffold(
+        containerColor = Ink,
+        topBar = {
+            TopAppBar(
+                title = { Text("PP Config", color = Paper, fontWeight = FontWeight.Bold) },
+                navigationIcon = {
+                    IconButton(onClick = { vm.goHome() }) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, "back to apps", tint = Sunflower)
+                    }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = InkSoft),
+            )
+        },
+    ) { pad ->
+        Column(
+            Modifier.padding(pad).fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp),
+        ) {
+            val s = st
+            if (s == null) {
+                Text("Reading your box…", color = PaperDim)
+            } else {
+                Column(
+                    Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(InkCard).padding(18.dp),
+                ) {
+                    Text(s.boxName.ifEmpty { "Your box" }, color = Paper, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.height(4.dp))
+                    Text(s.onion, color = PaperDim, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                    Spacer(Modifier.height(14.dp))
+                    HealthRow("Homeserver", s.homeserver)
+                    HealthRow("Tor", s.tor)
+                    HealthRow("Voice", s.voice)
+                    Spacer(Modifier.height(10.dp))
+                    Text(
+                        "Version ${s.version}  ·  ${s.pairedCount} contact${if (s.pairedCount == 1) "" else "s"}",
+                        color = PaperDim, fontSize = 12.sp,
+                    )
+                }
+                Spacer(Modifier.height(20.dp))
+                Button(
+                    onClick = { vm.restartBox() }, enabled = !busy, modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(containerColor = InkCard, contentColor = Paper),
+                ) {
+                    Icon(Icons.Filled.RestartAlt, null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp)); Text("Restart box")
+                }
+                Spacer(Modifier.height(12.dp))
+                Button(
+                    onClick = { }, enabled = false, modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(containerColor = InkCard, contentColor = PaperDim),
+                ) {
+                    Icon(Icons.Filled.CloudUpload, null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp)); Text("Back up  ·  coming soon")
+                }
+                Spacer(Modifier.height(28.dp))
+                Text("Danger zone", color = Danger, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(8.dp))
+                Button(
+                    onClick = { confirmName = ""; showReset = true }, enabled = !busy,
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(containerColor = Danger, contentColor = Color.White),
+                ) {
+                    Icon(Icons.Filled.DeleteForever, null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp)); Text("Reset box")
+                }
+                Text(
+                    "Permanently erases your box — its address and all its data. Cannot be undone.",
+                    color = PaperDim, fontSize = 11.sp, modifier = Modifier.padding(top = 8.dp),
+                )
+            }
+            if (notice != null) {
+                Spacer(Modifier.height(16.dp))
+                Text(notice!!, color = Sunflower, fontSize = 13.sp)
+            }
+        }
+    }
+
+    if (showReset && st != null) {
+        AlertDialog(
+            onDismissRequest = { showReset = false },
+            containerColor = InkSoft,
+            title = { Text("Reset your box?", color = Paper) },
+            text = {
+                Column {
+                    Text(
+                        "This permanently erases your box — its .onion address and all its data. It cannot be undone.",
+                        color = PaperDim, fontSize = 13.sp,
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    Text("Type your box name to confirm:  ${st!!.boxName}", color = Paper, fontSize = 13.sp)
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = confirmName, onValueChange = { confirmName = it },
+                        singleLine = true, modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = { vm.resetBox(confirmName); showReset = false },
+                    enabled = st!!.boxName.isNotBlank() && confirmName.trim() == st!!.boxName.trim(),
+                ) { Text("Reset", color = Danger) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showReset = false }) { Text("Cancel", color = PaperDim) }
+            },
+        )
+    }
+}
+
+@Composable
+private fun HealthRow(label: String, state: String) {
+    val (color, text) = when (state) {
+        "healthy" -> Success to "healthy"
+        "starting" -> Sunflower to "starting…"
+        "stopped" -> PaperDim to "off"
+        "error" -> Danger to "error"
+        else -> PaperDim to state
+    }
+    Row(
+        Modifier.fillMaxWidth().padding(vertical = 3.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Text(label, color = Paper, fontSize = 13.sp)
+        Text(text, color = color, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+    }
 }
