@@ -13,6 +13,8 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.matrix.rustcomponents.sdk.Client
 import org.matrix.rustcomponents.sdk.ClientDelegate
 import org.matrix.rustcomponents.sdk.ClientSessionDelegate
@@ -151,6 +153,7 @@ object MatrixRepo {
     private const val BOXSTATUS_TYPE = "ai.tournesol.pureprivacy.boxstatus"
     private const val COMMAND_TYPE = "ai.tournesol.pureprivacy.command"
     private const val COMMAND_RESULT_TYPE = "ai.tournesol.pureprivacy.command_result"
+    private const val BACKUP_TYPE = "ai.tournesol.pureprivacy.backup"
     // Auto-accepting a freshly-scanned contact's invite is a federated round-trip to
     // their box; the FIRST contact over a cold Tor circuit routinely fails. Retry the
     // join this many times (warming the circuit) before leaving it for the next cycle.
@@ -2069,6 +2072,7 @@ object MatrixRepo {
         roomHandles.clear(); timelineItems.clear(); sendHandles.clear()
         lastSeen.clear(); notifyArmed = false; activeCallRooms.clear()
         rooms.value = emptyList(); messages.value = emptyList()
+        cachedBackupRoom = null                         // next account resolves its own library
         wipeStore(ctx)                                  // remove crypto store too
         status.value = ""
     }
@@ -2095,6 +2099,7 @@ object MatrixRepo {
         roomHandles.clear(); timelineItems.clear(); sendHandles.clear()
         lastSeen.clear(); notifyArmed = false; activeCallRooms.clear()
         rooms.value = emptyList(); messages.value = emptyList()
+        cachedBackupRoom = null                         // next account resolves its own library
         runCatching { sessionPrefs(ctx).edit().clear().apply() }
         runCatching { ctx.getSharedPreferences(SESSION_OLD, Context.MODE_PRIVATE).edit().clear().apply() }
         wipeStore(ctx)                                  // delete the crypto store (megolm keys etc.)
@@ -2138,10 +2143,13 @@ object MatrixRepo {
         )
     }.getOrNull()
 
-    /** Issue a guarded box command (only "restart" / "reset" are honoured by the box).
+    /** Issue a guarded box command ("restart" / "reset" / "backup" are honoured by the box).
      *  Returns the command id to poll [readCommandResult] with, or null on failure.
-     *  Carries a short expiry so a stale write can't be replayed. */
-    suspend fun sendBoxCommand(action: String): String? = runCatching {
+     *  Carries a short expiry so a stale write can't be replayed.
+     *
+     *  [passphrase] is only used by "backup" — it seals the identity backup. The box reads it,
+     *  CLEARS this command immediately, and only then does the work, so it doesn't linger. */
+    suspend fun sendBoxCommand(action: String, passphrase: String? = null): String? = runCatching {
         val c = client ?: return@runCatching null
         val id = java.util.UUID.randomUUID().toString()
         val now = System.currentTimeMillis()
@@ -2150,8 +2158,215 @@ object MatrixRepo {
             .put("action", action)
             .put("issued_ts", now)
             .put("expires_ts", now + 90_000L)
+        if (!passphrase.isNullOrEmpty()) cmd.put("passphrase", passphrase)
         c.setAccountData(COMMAND_TYPE, cmd.toString())
         id
+    }.getOrNull()
+
+    // --- Backup Sync app (feature F) --------------------------------------------------------
+    // The box already runs a Matrix homeserver with a media repository, reachable over the
+    // onion and already authenticated — so the file library is simply a PRIVATE, ENCRYPTED,
+    // single-member room: its timeline is the index, its attachments are the bytes. That means
+    // no new network surface, E2EE at rest on the box, and large files ride the same proven
+    // upload/download path as chat attachments.
+
+    private const val BACKUP_ROOM_ACCOUNT_DATA = "ai.tournesol.pureprivacy.backup_room"
+    /** Ceiling for a backup upload. Matches the box's tuwunel max_request_size (256 MB). */
+    const val MAX_BACKUP_BYTES = 256L * 1024 * 1024
+
+    /** Serializes [ensureBackupRoom] so two concurrent openers (the app tile AND the screen's
+     *  LaunchedEffect both fire) can't each pass the check-then-create and mint duplicate library
+     *  rooms. Within the lock the account-data write of the first caller is visible to the second. */
+    private val backupRoomMutex = Mutex()
+    /** Once resolved, the library room id — a fast path that also survives account-data lag. */
+    @Volatile private var cachedBackupRoom: String? = null
+
+    /** Find (or create) the room used as this box's file library. The id is recorded in
+     *  account-data so every device — and a reinstall — finds the SAME library. Serialized so
+     *  overlapping callers converge on ONE room. */
+    suspend fun ensureBackupRoom(): String? = backupRoomMutex.withLock {
+        val c = client ?: return@withLock null
+        cachedBackupRoom?.let { if (runCatching { c.getRoom(it) }.getOrNull() != null) return@withLock it }
+        val recorded = runCatching {
+            c.accountData(BACKUP_ROOM_ACCOUNT_DATA)
+                ?.let { org.json.JSONObject(it).optString("room_id").ifBlank { null } }
+        }.getOrNull()
+        if (!recorded.isNullOrBlank() && runCatching { c.getRoom(recorded) }.getOrNull() != null) {
+            cachedBackupRoom = recorded
+            return@withLock recorded
+        }
+        val rid = runCatching {
+            c.createRoom(
+                CreateRoomParameters(
+                    name = "My files",
+                    topic = "PurePrivacy backup library",
+                    isEncrypted = true,        // E2EE at rest on the box
+                    isDirect = false,
+                    visibility = RoomVisibility.Private,
+                    preset = RoomPreset.TRUSTED_PRIVATE_CHAT,
+                    invite = emptyList(),      // just me
+                    avatar = null,
+                    powerLevelContentOverride = null,
+                    joinRuleOverride = null,
+                    historyVisibilityOverride = null,
+                    canonicalAlias = null,
+                    isSpace = false,
+                )
+            )
+        }.getOrNull() ?: return@withLock null
+        runCatching {
+            c.setAccountData(
+                BACKUP_ROOM_ACCOUNT_DATA,
+                org.json.JSONObject().put("room_id", rid).toString(),
+            )
+        }
+        cachedBackupRoom = rid
+        Log.i(TAG, "created backup library room $rid")
+        return@withLock rid
+    }
+
+    /** Upload one file to the backup library at FULL fidelity (no image downscale — a backup
+     *  must keep the original bytes) via the library room's timeline. Uses a bounded timeline
+     *  handle for [roomId] so it doesn't disturb whatever chat is open. Returns true on success. */
+    suspend fun backupUpload(ctx: Context, roomId: String, uri: android.net.Uri): Boolean {
+        val c = client ?: return false
+        val cr = ctx.contentResolver
+        val name = (queryDisplayName(cr, uri) ?: "file").substringAfterLast('/').ifBlank { "file" }
+        val mime = cr.getType(uri) ?: "application/octet-stream"
+        val dir = File(ctx.cacheDir, "pp_bk/${System.currentTimeMillis()}").apply { mkdirs() }
+        val tmp = File(dir, name)
+        runCatching { cr.openInputStream(uri)?.use { i -> tmp.outputStream().use { o -> i.copyTo(o) } } }
+        try {
+            if (!tmp.exists() || tmp.length() == 0L) return false
+            if (tmp.length() > MAX_BACKUP_BYTES) {
+                val mb = tmp.length() / (1024 * 1024)
+                status.value = "\"$name\" is ${mb} MB — over the ${MAX_BACKUP_BYTES / (1024 * 1024)} MB limit."
+                return false
+            }
+            val room = runCatching { c.getRoom(roomId) }.getOrNull() ?: return false
+            val tl = runCatching { room.timeline() }.getOrNull() ?: return false
+            val params = org.matrix.rustcomponents.sdk.UploadParameters(
+                org.matrix.rustcomponents.sdk.UploadSource.File(tmp.absolutePath), null, null, null, null,
+            )
+            val info = org.matrix.rustcomponents.sdk.FileInfo(mime, tmp.length().toULong(), null, null)
+            return runCatching { tl.sendFile(params, info).join(); true }.getOrDefault(false)
+        } finally {
+            runCatching { dir.deleteRecursively() }
+        }
+    }
+
+    /** Fetch a library file's bytes (for saving to the phone). Not cached — backup files are
+     *  large and one-shot; the chat mediaCache is for small, re-viewed thumbnails. */
+    suspend fun backupBytes(media: org.matrix.rustcomponents.sdk.MediaSource): ByteArray? {
+        val c = client ?: return null
+        return runCatching { c.getMediaContent(media) }.getOrNull()
+    }
+
+    /** One file in the backup library. */
+    data class BackupFile(
+        val key: String,
+        val name: String,
+        val mime: String?,
+        val sizeBytes: Long,
+        val tsMs: Long,
+        val isImage: Boolean,
+        val media: org.matrix.rustcomponents.sdk.MediaSource?,
+        val sending: Boolean,
+    )
+
+    /** Contents of the backup library, newest first. A DEDICATED timeline (own handle + list)
+     *  so browsing files never disturbs whatever chat is open. */
+    val backupFiles = MutableStateFlow<List<BackupFile>>(emptyList())
+    private var libTimeline: org.matrix.rustcomponents.sdk.Timeline? = null
+    private var libHandle: org.matrix.rustcomponents.sdk.TaskHandle? = null
+    private val libItems = ArrayList<TimelineItem>()
+
+    /** Subscribe to the library room's timeline and project its file attachments into
+     *  [backupFiles]. Safe to call repeatedly; closes any previous subscription first. */
+    suspend fun openBackupLibrary(roomId: String) {
+        val c = client ?: return
+        closeBackupLibrary()
+        val room = runCatching { c.getRoom(roomId) }.getOrNull() ?: return
+        val tl = runCatching { room.timeline() }.getOrNull() ?: return
+        libTimeline = tl
+        synchronized(libItems) { libItems.clear() }
+        libHandle = tl.addListener(object : TimelineListener {
+            override fun onUpdate(diff: List<TimelineDiff>) {
+                synchronized(libItems) {
+                    for (d in diff) when (d) {
+                        is TimelineDiff.Append -> libItems.addAll(d.values)
+                        is TimelineDiff.PushBack -> libItems.add(d.value)
+                        is TimelineDiff.PushFront -> libItems.add(0, d.value)
+                        is TimelineDiff.Insert -> libItems.add(d.index.toInt(), d.value)
+                        is TimelineDiff.Set -> if (d.index.toInt() < libItems.size) libItems[d.index.toInt()] = d.value
+                        is TimelineDiff.Remove -> if (d.index.toInt() < libItems.size) libItems.removeAt(d.index.toInt())
+                        is TimelineDiff.Reset -> { libItems.clear(); libItems.addAll(d.values) }
+                        is TimelineDiff.Clear -> libItems.clear()
+                        is TimelineDiff.PopBack -> if (libItems.isNotEmpty()) libItems.removeAt(libItems.size - 1)
+                        is TimelineDiff.PopFront -> if (libItems.isNotEmpty()) libItems.removeAt(0)
+                        is TimelineDiff.Truncate -> while (libItems.size > d.length.toInt()) libItems.removeAt(libItems.size - 1)
+                    }
+                    backupFiles.value = projectLibrary(libItems)
+                }
+            }
+        })
+        runCatching { tl.paginateBackwards(200u.toUShort()) }
+    }
+
+    fun closeBackupLibrary() {
+        runCatching { libHandle?.cancel() }; libHandle = null
+        runCatching { libTimeline?.destroy() }; libTimeline = null
+        synchronized(libItems) { libItems.clear() }
+        backupFiles.value = emptyList()
+    }
+
+    /** Turn timeline items into the file list (attachments only), newest first. */
+    private fun projectLibrary(items: List<TimelineItem>): List<BackupFile> {
+        val out = ArrayList<BackupFile>()
+        for (item in items) {
+            val ev = runCatching { item.asEvent() }.getOrNull() ?: continue
+            val content = ev.content
+            if (content !is TimelineItemContent.MsgLike) continue
+            val kind = content.content.kind
+            if (kind !is MsgLikeKind.Message) continue
+            val mc = kind.content
+            val key = runCatching { ev.eventOrTransactionId.toString() }
+                .getOrDefault("bk:${System.identityHashCode(item)}")
+            val ts = runCatching { ev.timestamp.toLong() }.getOrDefault(0L)
+            val sending = runCatching { ev.localSendState != null }.getOrDefault(false)
+            var name: String? = null; var mime: String? = null; var size = 0L
+            var isImage = false; var media: org.matrix.rustcomponents.sdk.MediaSource? = null
+            when (val mt = mc.msgType) {
+                is org.matrix.rustcomponents.sdk.MessageType.File -> {
+                    name = mt.content.filename ?: mc.body; mime = mt.content.info?.mimetype
+                    size = runCatching { mt.content.info?.size?.toLong() ?: 0L }.getOrDefault(0L)
+                    media = mt.content.source
+                }
+                is org.matrix.rustcomponents.sdk.MessageType.Image -> {
+                    name = mt.content.filename ?: mc.body; mime = mt.content.info?.mimetype ?: "image/*"
+                    size = runCatching { mt.content.info?.size?.toLong() ?: 0L }.getOrDefault(0L)
+                    isImage = true; media = mt.content.source
+                }
+                is org.matrix.rustcomponents.sdk.MessageType.Video -> {
+                    name = mc.body; mime = "video/*"
+                    size = runCatching { mt.content.info?.size?.toLong() ?: 0L }.getOrDefault(0L)
+                    media = mt.content.source
+                }
+                else -> continue   // non-attachment events aren't files
+            }
+            out.add(BackupFile(key, name ?: "file", mime, size, ts, isImage, media, sending))
+        }
+        return out.asReversed()   // timeline is oldest-first; show newest first
+    }
+
+    /** Read the sealed backup envelope the box published for [id]; null until it lands.
+     *  The envelope is already encrypted with the user's passphrase — we only ferry it. */
+    suspend fun readBackupEnvelope(id: String): String? = runCatching {
+        val raw = client?.accountData(BACKUP_TYPE)
+        if (raw.isNullOrBlank()) return@runCatching null
+        val o = org.json.JSONObject(raw)
+        if (o.optString("id") != id) return@runCatching null
+        o.optString("envelope").ifBlank { null }
     }.getOrNull()
 
     /** Poll the box's result for [id]: null = not done yet, true/false = ok/failed. */

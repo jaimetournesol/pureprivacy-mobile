@@ -23,6 +23,8 @@ sealed class Screen {
     data object Rooms : Screen()
     /** PP Config — the box dashboard (feature B). */
     data object Config : Screen()
+    /** Backup Sync — sync phone files to the box + browse/download (feature F). */
+    data object Files : Screen()
     data object Profile : Screen()
     /** "Go dark": Tor + sync are torn down and the chat list is hidden behind a calm
      *  offline wall. A privacy control — nothing goes in or out until Resume. Survives
@@ -66,6 +68,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     val pinLength = PasscodeStore.PIN_LENGTH
     /** Wall-clock of the last time the whole app went to background, for the auto-lock timeout. */
     @Volatile private var backgroundedAt = 0L
+    /** Set just before we launch an OUT-OF-PROCESS picker (any SAF open/create — file backup,
+     *  chat attachment, avatar, backup-JSON save). Those run inside DocumentsUI, a *different*
+     *  process, so [ProcessLifecycleOwner] sees the whole app go to background and would auto-lock
+     *  — tearing down the picker's result callback before the file is ever delivered. This one-shot
+     *  flag tells the next foreground pass "you came back from your own picker, don't re-lock",
+     *  mirroring how same-process sub-activities (the call UI, the QR scanner) are already exempt.
+     *  Consumed in [onEnterForeground]. */
+    @Volatile private var returningFromPicker = false
+    /** Call immediately before launching a cross-process SAF picker. See [returningFromPicker]. */
+    fun beginExternalPick() { returningFromPicker = true }
 
     /** After a successful sign-in with no passcode yet, force the user to set one. */
     private fun maybePromptSetup() {
@@ -73,12 +85,20 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** Process went to background (whole app, not an in-app activity hop). */
-    fun onEnterBackground() { backgroundedAt = System.currentTimeMillis() }
+    fun onEnterBackground() {
+        // Leaving to our OWN cross-process picker is not a real background — don't arm the
+        // auto-lock, or the picker's result would be dropped on return (see returningFromPicker).
+        if (returningFromPicker) return
+        backgroundedAt = System.currentTimeMillis()
+    }
 
     /** Process came to foreground. Re-lock if configured and the timeout has elapsed.
      *  Immediate by default (lockTimeoutMs = 0). Never locks over an in-progress setup. */
     fun onEnterForeground() {
         val app = getApplication<Application>()
+        // Returning from our own SAF picker — consume the exemption and don't re-lock, so the
+        // picked file is delivered to the (still-composed) screen instead of a torn-down callback.
+        if (returningFromPicker) { returningFromPicker = false; return }
         if (!PasscodeStore.isConfigured(app)) return
         if (gate.value != Gate.Open) return
         val elapsed = if (backgroundedAt == 0L) Long.MAX_VALUE else System.currentTimeMillis() - backgroundedAt
@@ -504,6 +524,58 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun openMessaging() { error.value = null; screen.value = Screen.Rooms }
     fun openConfig() { error.value = null; screen.value = Screen.Config; loadBoxStatus() }
 
+    // --- Backup Sync app (feature F) ----------------------------------------------------
+    val backupFiles = MatrixRepo.backupFiles
+    private val _libRoomId = MutableStateFlow<String?>(null)
+    val libraryReady = MutableStateFlow(false)
+    val backupBusy = MutableStateFlow(false)
+    /** Count of uploads in flight, shown as progress. */
+    val backupUploading = MutableStateFlow(0)
+    val backupNotice = MutableStateFlow<String?>(null)
+    fun clearBackupNotice() { backupNotice.value = null }
+
+    fun openFilesApp() {
+        error.value = null
+        screen.value = Screen.Files
+        viewModelScope.launch(Dispatchers.IO) {
+            libraryReady.value = false
+            val rid = runCatching { MatrixRepo.ensureBackupRoom() }.getOrNull()
+            if (rid == null) { backupNotice.value = "Couldn't reach your box."; return@launch }
+            _libRoomId.value = rid
+            runCatching { MatrixRepo.openBackupLibrary(rid) }
+            libraryReady.value = true
+        }
+    }
+
+    fun closeFilesApp() {
+        viewModelScope.launch(Dispatchers.IO) { runCatching { MatrixRepo.closeBackupLibrary() } }
+        goHome()
+    }
+
+    /** Upload the picked files to the box's library, at full fidelity. */
+    fun syncFiles(uris: List<android.net.Uri>) {
+        val rid = _libRoomId.value ?: return
+        if (uris.isEmpty()) return
+        viewModelScope.launch(Dispatchers.IO) {
+            backupUploading.value = uris.size
+            var ok = 0
+            for (u in uris) {
+                if (runCatching { MatrixRepo.backupUpload(getApplication(), rid, u) }.getOrDefault(false)) ok++
+                backupUploading.value = (backupUploading.value - 1).coerceAtLeast(0)
+            }
+            backupUploading.value = 0
+            backupNotice.value =
+                if (ok == uris.size) "Backed up $ok ${if (ok == 1) "file" else "files"} to your box."
+                else "Backed up $ok of ${uris.size} — some were too large or failed."
+        }
+    }
+
+    /** Fetch a library file's bytes so the UI can write them to a user-chosen location. */
+    suspend fun fetchBackupBytes(file: MatrixRepo.BackupFile): ByteArray? {
+        val media = file.media ?: return null
+        return runCatching { MatrixRepo.backupBytes(media) }.getOrNull()
+    }
+
     val boxStatus = MutableStateFlow<MatrixRepo.BoxStatus?>(null)
     val configBusy = MutableStateFlow(false)
     val configNotice = MutableStateFlow<String?>(null)
@@ -513,6 +585,41 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun loadBoxStatus() {
         viewModelScope.launch(Dispatchers.IO) {
             runCatching { MatrixRepo.readBoxStatus() }.getOrNull()?.let { boxStatus.value = it }
+        }
+    }
+
+    /** The sealed backup envelope, once the box has produced one — the UI then asks the user
+     *  where to save it. Already encrypted with their passphrase; we never hold the passphrase. */
+    val backupEnvelope = MutableStateFlow<String?>(null)
+    fun clearBackupEnvelope() { backupEnvelope.value = null }
+
+    /** Ask the box for an encrypted identity backup, sealed with [passphrase] (feature D).
+     *  The passphrase is sent once in the guarded command and never stored on this device. */
+    fun backupBox(passphrase: String) {
+        if (passphrase.length < 8) {
+            configNotice.value = "Use a backup passphrase of at least 8 characters."
+            return
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            configBusy.value = true
+            configNotice.value = "Asking your box for a backup…"
+            val id = runCatching { MatrixRepo.sendBoxCommand("backup", passphrase) }.getOrNull()
+            if (id == null) {
+                configNotice.value = "Couldn't reach your box."; configBusy.value = false; return@launch
+            }
+            var env: String? = null
+            for (i in 1..20) {
+                kotlinx.coroutines.delay(2000)
+                env = runCatching { MatrixRepo.readBackupEnvelope(id) }.getOrNull()
+                if (env != null) break
+            }
+            configBusy.value = false
+            if (env == null) {
+                configNotice.value = "Your box didn't return a backup — try again."
+            } else {
+                backupEnvelope.value = env
+                configNotice.value = "Backup ready — choose where to save it."
+            }
         }
     }
 
