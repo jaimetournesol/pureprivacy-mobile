@@ -4,6 +4,8 @@ import android.content.Intent
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -139,6 +141,14 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // targetSdk 35 (Android 15+) ENFORCES edge-to-edge: content draws behind the system
+        // bars and the theme's statusBarColor/navigationBarColor are ignored. Opt in explicitly
+        // with transparent, DARK-style bars (light icons) to match the app's always-dark theme;
+        // each full-screen composable insets its own content with systemBarsPadding().
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+        )
         // Keep the login password, identity QR and recovery info out of screenshots
         // and the Recents thumbnail (release builds only — see applyScreenSecurity).
         applyScreenSecurity()
@@ -304,7 +314,7 @@ fun SplashScreen(vm: AppViewModel) {
     }
     val slow = phase == AppViewModel.RestorePhase.Slow
     Column(
-        Modifier.fillMaxSize().padding(32.dp),
+        Modifier.fillMaxSize().systemBarsPadding().padding(32.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
@@ -381,7 +391,7 @@ fun LoginScreen(vm: AppViewModel) {
     val scan = rememberScan { contents -> if (contents != null) vm.onDeepLink(contents) }
 
     Column(
-        Modifier.fillMaxSize().padding(28.dp).verticalScroll(rememberScrollState()),
+        Modifier.fillMaxSize().systemBarsPadding().padding(28.dp).verticalScroll(rememberScrollState()),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         Spacer(Modifier.height(48.dp))
@@ -1664,7 +1674,7 @@ private fun PinPad(
     val active = enabled && !checking
 
     Column(
-        Modifier.fillMaxSize().background(Ink).padding(horizontal = 32.dp),
+        Modifier.fillMaxSize().background(Ink).systemBarsPadding().padding(horizontal = 32.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         Spacer(Modifier.weight(0.20f))
@@ -1757,7 +1767,7 @@ private fun fmtDuration(ms: Long): String {
 /** The ecosystem home: a grid of apps shown after unlock. */
 @Composable
 private fun HomeScreen(vm: AppViewModel) {
-    Column(Modifier.fillMaxSize().background(Ink).padding(horizontal = 24.dp)) {
+    Column(Modifier.fillMaxSize().background(Ink).systemBarsPadding().padding(horizontal = 24.dp)) {
         Spacer(Modifier.height(64.dp))
         Text("PurePrivacy", color = Paper, fontSize = 28.sp, fontWeight = FontWeight.Bold)
         Text("Your apps", color = PaperDim, fontSize = 14.sp)
