@@ -34,8 +34,8 @@ android {
         // Play requires a recent target. API 35 (Android 15) enforces edge-to-edge, so every
         // non-Scaffold full-screen composable applies systemBarsPadding() (see MainActivity).
         targetSdk = 35
-        versionCode = 42
-        versionName = "0.1.41"
+        versionCode = 43
+        versionName = "0.1.42"
         // matrix-rust-sdk + tor ship arm64-v8a + x86_64 (+ 32-bit). Keep all so it
         // runs on the x86_64 emulator AND real arm64 phones.
         ndk { abiFilters += listOf("arm64-v8a", "x86_64") }

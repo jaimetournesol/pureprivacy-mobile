@@ -1241,7 +1241,13 @@ fun ChatScreen(vm: AppViewModel, roomId: String, roomName: String) {
             )
         },
         bottomBar = {
-          Column(Modifier.background(InkSoft)) {
+          // Edge-to-edge (targetSdk 35): the window draws behind the keyboard AND the nav bar,
+          // and a Scaffold does NOT inset a custom bottomBar for us. Pad by max(ime, navBar) so
+          // the composer rides above the keyboard when open and sits above the nav bar/home
+          // buttons when closed. Padding is applied AFTER background so InkSoft still bleeds to
+          // the screen edge. (Was: hidden behind the keyboard / behind the nav buttons.)
+          Column(Modifier.background(InkSoft)
+              .windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars))) {
             // Reply / edit banner: shows what you're replying to or editing, with a cancel.
             if (replyTarget != null || editTarget != null) {
                 Row(Modifier.fillMaxWidth().padding(start = 12.dp, end = 8.dp, top = 6.dp),
