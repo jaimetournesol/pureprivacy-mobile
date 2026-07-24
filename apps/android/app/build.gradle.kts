@@ -34,8 +34,8 @@ android {
         // Play requires a recent target. API 35 (Android 15) enforces edge-to-edge, so every
         // non-Scaffold full-screen composable applies systemBarsPadding() (see MainActivity).
         targetSdk = 35
-        versionCode = 40
-        versionName = "0.1.39"
+        versionCode = 41
+        versionName = "0.1.40"
         // matrix-rust-sdk + tor ship arm64-v8a + x86_64 (+ 32-bit). Keep all so it
         // runs on the x86_64 emulator AND real arm64 phones.
         ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
@@ -99,6 +99,10 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     // Encrypt the session tokens at rest (AES-256 via Android Keystore master key).
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
+    // Continuous Backup Sync (feature G): WorkManager runs periodic/expedited sync passes
+    // under Wi-Fi/battery constraints; DocumentFile walks a persisted OPEN_DOCUMENT_TREE folder.
+    implementation("androidx.work:work-runtime-ktx:2.9.1")
+    implementation("androidx.documentfile:documentfile:1.0.1")
     // WebView proxy override (route the Element Call WebView through embedded Tor)
     implementation("androidx.webkit:webkit:1.11.0")
     // local TLS-terminating proxy -> onion (over Tor) for the Element Call WebView

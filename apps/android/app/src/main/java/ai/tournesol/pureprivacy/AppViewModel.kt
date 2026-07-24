@@ -537,6 +537,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun openFilesApp() {
         error.value = null
         screen.value = Screen.Files
+        initBackupSync()
         viewModelScope.launch(Dispatchers.IO) {
             libraryReady.value = false
             val rid = runCatching { MatrixRepo.ensureBackupRoom() }.getOrNull()
@@ -574,6 +575,90 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     suspend fun fetchBackupBytes(file: MatrixRepo.BackupFile): ByteArray? {
         val media = file.media ?: return null
         return runCatching { MatrixRepo.backupBytes(media) }.getOrNull()
+    }
+
+    // --- Continuous Backup Sync (feature G) ---------------------------------------------
+    val syncSources = ai.tournesol.pureprivacy.backup.BackupSyncStore.sources
+    val syncWifiOnly = ai.tournesol.pureprivacy.backup.BackupSyncStore.wifiOnly
+    val syncBatteryNotLow = ai.tournesol.pureprivacy.backup.BackupSyncStore.batteryNotLow
+    val syncLastMs = ai.tournesol.pureprivacy.backup.BackupSyncStore.lastSyncMs
+    val syncingCount = ai.tournesol.pureprivacy.backup.BackupSyncManager.syncingCount
+    /** True while a PHOTOS source is being kept in sync (drives the toggle). */
+    val photoBackupOn get() = syncSources.value.any {
+        it.kind == ai.tournesol.pureprivacy.backup.BackupSyncStore.Kind.PHOTOS && it.enabled
+    }
+
+    fun initBackupSync() {
+        ai.tournesol.pureprivacy.backup.BackupSyncStore.ensureLoaded(getApplication())
+    }
+
+    /** Turn the camera-roll auto-backup on/off. Enabling starts the watermark at *now*, so only
+     *  NEW photos/videos flow up (never floods Tor with an existing 10k-photo camera roll). */
+    fun setPhotoBackup(enable: Boolean) {
+        val app = getApplication<Application>()
+        val store = ai.tournesol.pureprivacy.backup.BackupSyncStore
+        if (enable) {
+            store.upsert(app, ai.tournesol.pureprivacy.backup.BackupSyncStore.Source(
+                id = "photos", kind = ai.tournesol.pureprivacy.backup.BackupSyncStore.Kind.PHOTOS, uri = null,
+                label = "Camera roll", enabled = true,
+                watermarkMs = System.currentTimeMillis(), boundaryKeys = emptySet(),
+            ))
+            backupNotice.value = "New photos & videos will back up automatically."
+        } else {
+            store.remove(app, "photos")
+        }
+        ai.tournesol.pureprivacy.backup.BackupSyncWorker.applySchedule(app)
+        if (enable) kickSync()
+    }
+
+    /** Add a folder to keep in sync: persist read access (survives reboots) and back up its
+     *  current contents plus anything added later (watermark = 0). */
+    fun addSyncFolder(uri: android.net.Uri) {
+        val app = getApplication<Application>()
+        val store = ai.tournesol.pureprivacy.backup.BackupSyncStore
+        runCatching {
+            app.contentResolver.takePersistableUriPermission(uri, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        val label = runCatching {
+            androidx.documentfile.provider.DocumentFile.fromTreeUri(app, uri)?.name
+        }.getOrNull() ?: "Folder"
+        store.upsert(app, ai.tournesol.pureprivacy.backup.BackupSyncStore.Source(
+            id = uri.toString(), kind = ai.tournesol.pureprivacy.backup.BackupSyncStore.Kind.FOLDER, uri = uri.toString(),
+            label = label, enabled = true, watermarkMs = 0L, boundaryKeys = emptySet(),
+        ))
+        ai.tournesol.pureprivacy.backup.BackupSyncWorker.applySchedule(app)
+        backupNotice.value = "“$label” is now kept in sync with your box."
+        kickSync()
+    }
+
+    fun removeSyncSource(id: String) {
+        val app = getApplication<Application>()
+        ai.tournesol.pureprivacy.backup.BackupSyncStore.remove(app, id)
+        ai.tournesol.pureprivacy.backup.BackupSyncWorker.applySchedule(app)
+    }
+
+    fun setSyncWifiOnly(v: Boolean) {
+        val app = getApplication<Application>()
+        val store = ai.tournesol.pureprivacy.backup.BackupSyncStore
+        store.setConstraints(app, v, store.isBatteryNotLow(app))
+        ai.tournesol.pureprivacy.backup.BackupSyncWorker.applySchedule(app)
+    }
+
+    fun setSyncBatteryNotLow(v: Boolean) {
+        val app = getApplication<Application>()
+        val store = ai.tournesol.pureprivacy.backup.BackupSyncStore
+        store.setConstraints(app, store.isWifiOnly(app), v)
+        ai.tournesol.pureprivacy.backup.BackupSyncWorker.applySchedule(app)
+    }
+
+    /** User tapped "Sync now" (or a source was just added). Run a warm pass immediately since the
+     *  app is open + the client is live, and also enqueue the background worker as a backstop. */
+    fun kickSync() {
+        val app = getApplication<Application>()
+        ai.tournesol.pureprivacy.backup.BackupSyncWorker.syncNow(app)
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { ai.tournesol.pureprivacy.backup.BackupSyncManager.runPass(app) }
+        }
     }
 
     val boxStatus = MutableStateFlow<MatrixRepo.BoxStatus?>(null)

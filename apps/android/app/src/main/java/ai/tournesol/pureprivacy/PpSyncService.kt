@@ -11,6 +11,8 @@ import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
+import ai.tournesol.pureprivacy.backup.BackupSyncStore
+import ai.tournesol.pureprivacy.backup.BackupSyncWorker
 import ai.tournesol.pureprivacy.matrix.MatrixRepo
 import ai.tournesol.pureprivacy.matrix.Notif
 import ai.tournesol.pureprivacy.tor.TorManager
@@ -34,8 +36,27 @@ class PpSyncService : Service() {
     // [C4] Guards against two overlapping self-restore attempts (e.g. the OS redelivers
     // onStartCommand while one is already running after a process kill).
     private val reviving = AtomicBoolean(false)
+    private var backupObserver: android.database.ContentObserver? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    /** Fire a one-shot sync pass whenever the camera roll changes — but only if photo auto-backup
+     *  is on. Cheap: WorkManager coalesces bursts and the pass is a no-op when nothing is new. */
+    private fun registerBackupObserver() {
+        val handler = android.os.Handler(android.os.Looper.getMainLooper())
+        val obs = object : android.database.ContentObserver(handler) {
+            override fun onChange(selfChange: Boolean, uri: android.net.Uri?) {
+                if (BackupSyncStore.hasEnabledSource(this@PpSyncService)) BackupSyncWorker.syncNow(this@PpSyncService)
+            }
+        }
+        runCatching {
+            contentResolver.registerContentObserver(
+                android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI, true, obs)
+            contentResolver.registerContentObserver(
+                android.provider.MediaStore.Video.Media.EXTERNAL_CONTENT_URI, true, obs)
+            backupObserver = obs
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -44,6 +65,11 @@ class PpSyncService : Service() {
         // connected yet, so don't flash a misleading "Connected" before onStartCommand.
         startForegroundCompat(if (MatrixRepo.isLoggedIn) "Connected over Tor" else "Reconnecting over Tor…")
         scope.launch { MatrixRepo.notifications.collect { post(it) } }
+        // Continuous Backup Sync (feature G): while we're alive, watch the camera roll so a new
+        // photo backs up promptly, and do a catch-up pass on start. WorkManager's KEEP policy
+        // de-dupes rapid bursts. No-op unless the user enabled photo auto-backup.
+        registerBackupObserver()
+        if (BackupSyncStore.hasEnabledSource(this)) BackupSyncWorker.syncNow(this)
         // When a call ends (e.g. the caller hung up before answer), clear its ringing
         // notification so the callee stops being rung.
         scope.launch {
@@ -181,7 +207,11 @@ class PpSyncService : Service() {
         return PendingIntent.getActivity(this, roomId?.hashCode() ?: 0, i, pf)
     }
 
-    override fun onDestroy() { super.onDestroy(); scope.cancel() }
+    override fun onDestroy() {
+        super.onDestroy()
+        backupObserver?.let { runCatching { contentResolver.unregisterContentObserver(it) } }
+        scope.cancel()
+    }
 
     companion object {
         const val CH_STATUS = "pp_status"
