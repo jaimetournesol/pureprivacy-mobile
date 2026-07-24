@@ -32,6 +32,8 @@ import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.CloudUpload
+import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.automirrored.filled.Reply
 import androidx.compose.material.icons.filled.Close
@@ -2044,6 +2046,32 @@ private fun FilesScreen(vm: AppViewModel) {
         pendingDownload = null
     }
 
+    // Continuous sync (feature G): pick a folder to keep in sync (permission persisted), and
+    // request the media permission before turning on camera-roll auto-backup.
+    val pickTree = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { uri -> if (uri != null) vm.addSyncFolder(uri) }
+    val askMedia = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { grants -> if (grants.values.any { it }) vm.setPhotoBackup(true) }
+    val mediaPerms = remember {
+        if (Build.VERSION.SDK_INT >= 33)
+            arrayOf(android.Manifest.permission.READ_MEDIA_IMAGES, android.Manifest.permission.READ_MEDIA_VIDEO)
+        else arrayOf(android.Manifest.permission.READ_EXTERNAL_STORAGE)
+    }
+    val syncSources by vm.syncSources.collectAsState()
+    val wifiOnly by vm.syncWifiOnly.collectAsState()
+    val batteryNotLow by vm.syncBatteryNotLow.collectAsState()
+    val lastSyncMs by vm.syncLastMs.collectAsState()
+    val syncingCount by vm.syncingCount.collectAsState()
+    val photosOn = syncSources.any { it.kind == ai.tournesol.pureprivacy.backup.BackupSyncStore.Kind.PHOTOS && it.enabled }
+    val folders = syncSources.filter { it.kind == ai.tournesol.pureprivacy.backup.BackupSyncStore.Kind.FOLDER }
+    val enablePhotos = {
+        if (mediaPerms.all { ctx.checkSelfPermission(it) == android.content.pm.PackageManager.PERMISSION_GRANTED })
+            vm.setPhotoBackup(true)
+        else askMedia.launch(mediaPerms)
+    }
+
     Scaffold(
         containerColor = Ink,
         topBar = {
@@ -2085,29 +2113,151 @@ private fun FilesScreen(vm: AppViewModel) {
                 Text(it, color = Sunflower, fontSize = 13.sp,
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
             }
-            when {
-                !ready -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            if (!ready) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     Text("Opening your library…", color = PaperDim)
                 }
-                files.isEmpty() -> Column(
-                    Modifier.fillMaxSize().padding(32.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.Center,
-                ) {
-                    Icon(Icons.Filled.CloudUpload, null, tint = PaperDim, modifier = Modifier.size(48.dp))
-                    Spacer(Modifier.height(16.dp))
-                    Text("No files backed up yet", color = Paper, fontSize = 16.sp, fontWeight = FontWeight.Bold)
-                    Spacer(Modifier.height(6.dp))
-                    Text("Tap “Back up files” to copy photos or files to your box — encrypted, over Tor.",
-                        color = PaperDim, fontSize = 13.sp, textAlign = TextAlign.Center)
-                }
-                else -> LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(12.dp)) {
-                    items(files, key = { it.key }) { f ->
-                        BackupFileRow(f) { pendingDownload = f; vm.beginExternalPick(); saveTo.launch(f.name) }
+            } else {
+                LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(12.dp)) {
+                    item {
+                        KeepInSyncSection(
+                            photosOn = photosOn, folders = folders, wifiOnly = wifiOnly,
+                            batteryNotLow = batteryNotLow, lastSyncMs = lastSyncMs, syncingCount = syncingCount,
+                            onTogglePhotos = { on -> if (on) enablePhotos() else vm.setPhotoBackup(false) },
+                            onAddFolder = { vm.beginExternalPick(); pickTree.launch(null) },
+                            onRemoveFolder = { vm.removeSyncSource(it) },
+                            onWifiOnly = { vm.setSyncWifiOnly(it) },
+                            onBatteryNotLow = { vm.setSyncBatteryNotLow(it) },
+                            onSyncNow = { vm.kickSync() },
+                        )
+                        Spacer(Modifier.height(18.dp))
+                        Text("On your box", color = PaperDim, fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold, modifier = Modifier.padding(start = 4.dp, bottom = 4.dp))
+                    }
+                    if (files.isEmpty()) {
+                        item {
+                            Column(
+                                Modifier.fillMaxWidth().padding(vertical = 28.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                            ) {
+                                Icon(Icons.Filled.CloudUpload, null, tint = PaperDim, modifier = Modifier.size(40.dp))
+                                Spacer(Modifier.height(10.dp))
+                                Text("Nothing backed up yet", color = Paper, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                                Spacer(Modifier.height(4.dp))
+                                Text("Turn on a sync above, or tap “Back up files”.",
+                                    color = PaperDim, fontSize = 13.sp, textAlign = TextAlign.Center)
+                            }
+                        }
+                    } else {
+                        items(files, key = { it.key }) { f ->
+                            BackupFileRow(f) { pendingDownload = f; vm.beginExternalPick(); saveTo.launch(f.name) }
+                        }
                     }
                 }
             }
         }
+    }
+}
+
+/** "Keep in sync" — the continuous-sync controls (feature G): camera-roll auto-backup, watched
+ *  folders, Wi-Fi/battery constraints, and a live status line. Rendered as a card atop the
+ *  Backup screen's list. */
+@Composable
+private fun KeepInSyncSection(
+    photosOn: Boolean,
+    folders: List<ai.tournesol.pureprivacy.backup.BackupSyncStore.Source>,
+    wifiOnly: Boolean,
+    batteryNotLow: Boolean,
+    lastSyncMs: Long,
+    syncingCount: Int,
+    onTogglePhotos: (Boolean) -> Unit,
+    onAddFolder: () -> Unit,
+    onRemoveFolder: (String) -> Unit,
+    onWifiOnly: (Boolean) -> Unit,
+    onBatteryNotLow: (Boolean) -> Unit,
+    onSyncNow: () -> Unit,
+) {
+    Column(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(InkCard).padding(16.dp)
+    ) {
+        Text("Keep in sync", color = Paper, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+        Text("New files land on your box on their own — over Tor, encrypted.",
+            color = PaperDim, fontSize = 12.sp)
+        Spacer(Modifier.height(12.dp))
+
+        // Camera-roll auto-backup
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Filled.PhotoCamera, null, tint = Sunflower, modifier = Modifier.size(24.dp))
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text("Auto-back up photos & videos", color = Paper, fontSize = 14.sp)
+                Text("New shots upload automatically", color = PaperDim, fontSize = 12.sp)
+            }
+            Switch(checked = photosOn, onCheckedChange = onTogglePhotos,
+                colors = SwitchDefaults.colors(checkedTrackColor = Sunflower, checkedThumbColor = Ink))
+        }
+
+        // Watched folders
+        for (f in folders) {
+            Spacer(Modifier.height(8.dp))
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Filled.Folder, null, tint = Sunflower, modifier = Modifier.size(24.dp))
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(f.label, color = Paper, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text("Folder kept in sync", color = PaperDim, fontSize = 12.sp)
+                }
+                IconButton(onClick = { onRemoveFolder(f.id) }) {
+                    Icon(Icons.Filled.Close, "stop syncing this folder", tint = PaperDim, modifier = Modifier.size(20.dp))
+                }
+            }
+        }
+        Spacer(Modifier.height(6.dp))
+        TextButton(onClick = onAddFolder) {
+            Icon(Icons.Filled.Add, null, tint = Sunflower, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(6.dp)); Text("Add a folder", color = Sunflower)
+        }
+
+        Box(Modifier.fillMaxWidth().height(1.dp).background(Ink)); Spacer(Modifier.height(10.dp))
+
+        // Constraints
+        SyncToggleRow("Only on Wi-Fi", wifiOnly, onWifiOnly)
+        SyncToggleRow("Only when battery isn’t low", batteryNotLow, onBatteryNotLow)
+
+        Spacer(Modifier.height(10.dp))
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            if (syncingCount > 0) {
+                CircularProgressIndicator(Modifier.size(14.dp), color = Sunflower, strokeWidth = 2.dp)
+                Spacer(Modifier.width(8.dp))
+                Text("Syncing $syncingCount…", color = Paper, fontSize = 12.sp)
+            } else {
+                Text(if (lastSyncMs == 0L) "Not synced yet" else "Last synced ${fmtAgo(lastSyncMs)}",
+                    color = PaperDim, fontSize = 12.sp)
+            }
+            Spacer(Modifier.weight(1f))
+            TextButton(onClick = onSyncNow) { Text("Sync now", color = Sunflower) }
+        }
+    }
+}
+
+@Composable
+private fun SyncToggleRow(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text(label, color = Paper, fontSize = 13.sp, modifier = Modifier.weight(1f))
+        Switch(checked = checked, onCheckedChange = onChange,
+            colors = SwitchDefaults.colors(checkedTrackColor = Sunflower, checkedThumbColor = Ink))
+    }
+}
+
+/** Coarse "3 min ago" / "2 h ago" / "yesterday" for the last-sync line. */
+private fun fmtAgo(ms: Long): String {
+    val d = System.currentTimeMillis() - ms
+    return when {
+        d < 60_000 -> "just now"
+        d < 3_600_000 -> "${d / 60_000} min ago"
+        d < 86_400_000 -> "${d / 3_600_000} h ago"
+        d < 172_800_000 -> "yesterday"
+        else -> "${d / 86_400_000} days ago"
     }
 }
 
