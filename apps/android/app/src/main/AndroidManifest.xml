@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
@@ -77,5 +78,14 @@
             android:name=".PpSyncService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+
+        <!-- Continuous Backup Sync (feature G): BackupSyncWorker runs as a foreground service via
+             WorkManager. On Android 14+ the FGS type requested at runtime (dataSync) must be a
+             subset of the type DECLARED on WorkManager's own SystemForegroundService — which the
+             library leaves unset (0x0), so setForeground() crashes. Merge the type onto it. -->
+        <service
+            android:name="androidx.work.impl.foreground.SystemForegroundService"
+            android:foregroundServiceType="dataSync"
+            tools:node="merge" />
     </application>
 </manifest>

@@ -2051,9 +2051,11 @@ private fun FilesScreen(vm: AppViewModel) {
     val pickTree = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocumentTree()
     ) { uri -> if (uri != null) vm.addSyncFolder(uri) }
+    // Turning on photo backup asks whether to include existing photos; this gates that dialog.
+    var showPhotoScope by remember { mutableStateOf(false) }
     val askMedia = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) { grants -> if (grants.values.any { it }) vm.setPhotoBackup(true) }
+    ) { grants -> if (grants.values.any { it }) showPhotoScope = true }
     val mediaPerms = remember {
         if (Build.VERSION.SDK_INT >= 33)
             arrayOf(android.Manifest.permission.READ_MEDIA_IMAGES, android.Manifest.permission.READ_MEDIA_VIDEO)
@@ -2068,7 +2070,7 @@ private fun FilesScreen(vm: AppViewModel) {
     val folders = syncSources.filter { it.kind == ai.tournesol.pureprivacy.backup.BackupSyncStore.Kind.FOLDER }
     val enablePhotos = {
         if (mediaPerms.all { ctx.checkSelfPermission(it) == android.content.pm.PackageManager.PERMISSION_GRANTED })
-            vm.setPhotoBackup(true)
+            showPhotoScope = true
         else askMedia.launch(mediaPerms)
     }
 
@@ -2156,6 +2158,30 @@ private fun FilesScreen(vm: AppViewModel) {
                 }
             }
         }
+    }
+
+    // On enabling camera-roll backup: back up everything now, or only new shots from here on.
+    if (showPhotoScope) {
+        AlertDialog(
+            onDismissRequest = { showPhotoScope = false },   // tap-away = cancel, leaves it off
+            icon = { Icon(Icons.Filled.PhotoCamera, null, tint = Sunflower) },
+            title = { Text("Back up photos & videos") },
+            text = {
+                Text("Include the photos already on your phone, or just new ones from now on? " +
+                    "Backing up everything can take a while over Tor.")
+            },
+            confirmButton = {
+                TextButton(onClick = { showPhotoScope = false; vm.setPhotoBackup(true, includeExisting = true) }) {
+                    Text("Include existing", color = Sunflower)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showPhotoScope = false; vm.setPhotoBackup(true, includeExisting = false) }) {
+                    Text("New only", color = Paper)
+                }
+            },
+            containerColor = InkCard, titleContentColor = Paper, textContentColor = PaperDim,
+        )
     }
 }
 

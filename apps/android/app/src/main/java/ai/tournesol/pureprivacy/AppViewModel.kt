@@ -592,18 +592,21 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         ai.tournesol.pureprivacy.backup.BackupSyncStore.ensureLoaded(getApplication())
     }
 
-    /** Turn the camera-roll auto-backup on/off. Enabling starts the watermark at *now*, so only
-     *  NEW photos/videos flow up (never floods Tor with an existing 10k-photo camera roll). */
-    fun setPhotoBackup(enable: Boolean) {
+    /** Turn the camera-roll auto-backup on/off. [includeExisting] = true backs up the photos
+     *  already on the phone too (watermark 0); false (default) starts the watermark at *now*, so
+     *  only NEW photos/videos flow up — never floods Tor with an existing 10k-photo camera roll. */
+    fun setPhotoBackup(enable: Boolean, includeExisting: Boolean = false) {
         val app = getApplication<Application>()
         val store = ai.tournesol.pureprivacy.backup.BackupSyncStore
         if (enable) {
             store.upsert(app, ai.tournesol.pureprivacy.backup.BackupSyncStore.Source(
                 id = "photos", kind = ai.tournesol.pureprivacy.backup.BackupSyncStore.Kind.PHOTOS, uri = null,
-                label = "Camera roll", enabled = true,
-                watermarkMs = System.currentTimeMillis(), boundaryKeys = emptySet(),
+                label = "Photos & videos", enabled = true,   // whole MediaStore library, not just DCIM
+                watermarkMs = if (includeExisting) 0L else System.currentTimeMillis(), boundaryKeys = emptySet(),
             ))
-            backupNotice.value = "New photos & videos will back up automatically."
+            backupNotice.value = if (includeExisting)
+                "Backing up your photos & videos — this can take a while over Tor."
+            else "New photos & videos will back up automatically."
         } else {
             store.remove(app, "photos")
         }
