@@ -152,6 +152,10 @@ object MatrixRepo {
     // Box config channel (feature B): box publishes status here; phone writes commands.
     private const val BOXSTATUS_TYPE = "ai.tournesol.pureprivacy.boxstatus"
     private const val COMMAND_TYPE = "ai.tournesol.pureprivacy.command"
+    /** Box-published update state (feature H); read-only for the phone. */
+    private const val UPDATE_TYPE = "ai.tournesol.pureprivacy.update"
+    /** Phone-written update preferences (feature H): {auto_check}. */
+    private const val UPDATE_PREFS_TYPE = "ai.tournesol.pureprivacy.update_prefs"
     private const val COMMAND_RESULT_TYPE = "ai.tournesol.pureprivacy.command_result"
     private const val BACKUP_TYPE = "ai.tournesol.pureprivacy.backup"
     // Auto-accepting a freshly-scanned contact's invite is a federated round-trip to
@@ -2143,13 +2147,75 @@ object MatrixRepo {
         )
     }.getOrNull()
 
+    // --- Box update (feature H) -------------------------------------------------------------
+    // The box checks for a signed update over Tor and publishes what it found to UPDATE_TYPE.
+    // NOTHING installs until the owner approves here — approval rides the same guarded command
+    // channel as restart/reset. The phone never sees a URL or picks a version: it only says
+    // "yes" to the release the box already signature-verified.
+
+    /**
+     * What the box knows about updates.
+     * @param selfInstall true when the box can install it itself (native desktop app). Docker
+     *   boxes are false — a container can't replace its own image without host Docker access,
+     *   so the owner runs [command] on the host instead.
+     */
+    data class UpdateInfo(
+        val available: Boolean,
+        val current: String,
+        val latest: String,
+        val released: String,
+        val notes: List<String>,
+        val kind: String,          // "native" | "docker"
+        val selfInstall: Boolean,
+        val command: String,
+        val error: String?,
+        val checkedTs: Long,
+    )
+
+    suspend fun readUpdateInfo(): UpdateInfo? = runCatching {
+        val raw = client?.accountData(UPDATE_TYPE)
+        if (raw.isNullOrBlank()) return@runCatching null
+        val o = org.json.JSONObject(raw)
+        val notes = ArrayList<String>()
+        o.optJSONArray("notes")?.let { for (i in 0 until it.length()) notes.add(it.optString(i)) }
+        UpdateInfo(
+            available = o.optBoolean("available", false),
+            current = o.optString("current"),
+            latest = o.optString("latest"),
+            released = o.optString("released"),
+            notes = notes,
+            kind = o.optString("kind", "native"),
+            selfInstall = o.optBoolean("self_install", false),
+            command = o.optString("command"),
+            error = o.optString("error").ifBlank { null },
+            checkedTs = o.optLong("checked_ts", 0L),
+        )
+    }.getOrNull()
+
+    /** Whether the box checks for updates on its own (daily). Default true. */
+    suspend fun readAutoUpdateCheck(): Boolean = runCatching {
+        val raw = client?.accountData(UPDATE_PREFS_TYPE)
+        if (raw.isNullOrBlank()) true
+        else org.json.JSONObject(raw).optBoolean("auto_check", true)
+    }.getOrDefault(true)
+
+    suspend fun setAutoUpdateCheck(on: Boolean): Boolean = runCatching {
+        val c = client ?: return@runCatching false
+        c.setAccountData(UPDATE_PREFS_TYPE, org.json.JSONObject().put("auto_check", on).toString())
+        true
+    }.getOrDefault(false)
+
     /** Issue a guarded box command ("restart" / "reset" / "backup" are honoured by the box).
      *  Returns the command id to poll [readCommandResult] with, or null on failure.
      *  Carries a short expiry so a stale write can't be replayed.
      *
      *  [passphrase] is only used by "backup" — it seals the identity backup. The box reads it,
      *  CLEARS this command immediately, and only then does the work, so it doesn't linger. */
-    suspend fun sendBoxCommand(action: String, passphrase: String? = null): String? = runCatching {
+    suspend fun sendBoxCommand(
+        action: String,
+        passphrase: String? = null,
+        targetVersion: String? = null,
+    ): String? = runCatching {
         val c = client ?: return@runCatching null
         val id = java.util.UUID.randomUUID().toString()
         val now = System.currentTimeMillis()
@@ -2159,6 +2225,9 @@ object MatrixRepo {
             .put("issued_ts", now)
             .put("expires_ts", now + 90_000L)
         if (!passphrase.isNullOrEmpty()) cmd.put("passphrase", passphrase)
+        // Feature H: naming the version we're approving means an "update" command can't be
+        // replayed later against a DIFFERENT release — the box rejects a mismatch.
+        if (!targetVersion.isNullOrEmpty()) cmd.put("target_version", targetVersion)
         c.setAccountData(COMMAND_TYPE, cmd.toString())
         id
     }.getOrNull()
@@ -2370,6 +2439,20 @@ object MatrixRepo {
     }.getOrNull()
 
     /** Poll the box's result for [id]: null = not done yet, true/false = ok/failed. */
+    /** Command outcome WITH the box's own wording — the update flow shows the box's message
+     *  ("updated to 0.1.3 — your box is restarting") or its refusal verbatim, rather than
+     *  guessing on the phone. Null until the box has answered THIS command id. */
+    data class CommandOutcome(val ok: Boolean, val message: String?)
+
+    suspend fun readCommandOutcome(id: String): CommandOutcome? = runCatching {
+        val raw = client?.accountData(COMMAND_RESULT_TYPE)
+        if (raw.isNullOrBlank()) return@runCatching null
+        val o = org.json.JSONObject(raw)
+        if (o.optString("id") != id) return@runCatching null
+        val ok = o.optBoolean("ok", false)
+        CommandOutcome(ok, (if (ok) o.optString("message") else o.optString("error")).ifBlank { null })
+    }.getOrNull()
+
     suspend fun readCommandResult(id: String): Boolean? = runCatching {
         val raw = client?.accountData(COMMAND_RESULT_TYPE)
         if (raw.isNullOrBlank()) return@runCatching null

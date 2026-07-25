@@ -13,6 +13,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
@@ -1838,6 +1839,12 @@ private fun ConfigScreen(vm: AppViewModel) {
     var bp2 by remember { mutableStateOf("") }
     val envelope by vm.backupEnvelope.collectAsState()
     val ctx = LocalContext.current
+    // Feature H: box update state + the approve-before-install confirm.
+    val upd by vm.updateInfo.collectAsState()
+    val autoCheck by vm.autoUpdateCheck.collectAsState()
+    val updBusy by vm.updateBusy.collectAsState()
+    var showUpdate by remember { mutableStateOf(false) }
+    val clip = LocalClipboardManager.current
     // The box hands back an already-encrypted envelope; let the user put it wherever they keep
     // backups (Files, Drive, …) via the system picker — we never copy it anywhere ourselves.
     val saveBackup = rememberLauncherForActivityResult(
@@ -1897,6 +1904,17 @@ private fun ConfigScreen(vm: AppViewModel) {
                         color = PaperDim, fontSize = 12.sp,
                     )
                 }
+                Spacer(Modifier.height(20.dp))
+                UpdateSection(
+                    info = upd, autoCheck = autoCheck, busy = busy || updBusy,
+                    onCheck = { vm.checkForUpdate() },
+                    onApprove = { showUpdate = true },
+                    onAutoCheck = { vm.setAutoUpdateCheck(it) },
+                    onCopyCommand = { cmd ->
+                        clip.setText(androidx.compose.ui.text.AnnotatedString(cmd))
+                        vm.configNotice.value = "Command copied."
+                    },
+                )
                 Spacer(Modifier.height(20.dp))
                 Button(
                     onClick = { vm.restartBox() }, enabled = !busy, modifier = Modifier.fillMaxWidth(),
@@ -2011,6 +2029,166 @@ private fun ConfigScreen(vm: AppViewModel) {
                 TextButton(onClick = { showBackup = false }) { Text("Cancel", color = PaperDim) }
             },
         )
+    }
+
+    // Feature H: explicit approval before ANY update is installed. Nothing happens on the box
+    // until this is confirmed — that's the whole point of the design.
+    if (showUpdate && upd != null) {
+        AlertDialog(
+            onDismissRequest = { showUpdate = false },
+            containerColor = InkSoft,
+            icon = { Icon(Icons.Filled.Download, null, tint = Sunflower) },
+            title = { Text("Update your box?", color = Paper) },
+            text = {
+                Column {
+                    Text("Version ${upd!!.current} → ${upd!!.latest}", color = Paper, fontSize = 14.sp,
+                        fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.height(10.dp))
+                    Text(
+                        "Your box downloads this over Tor and checks it's genuinely signed by " +
+                            "PurePrivacy before installing. Your address, chats and contacts are kept.",
+                        color = PaperDim, fontSize = 13.sp,
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    Text("Your box goes offline for a moment while it restarts.",
+                        color = Sunflower, fontSize = 12.sp)
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showUpdate = false; vm.approveUpdate() }) {
+                    Text("Update now", color = Sunflower)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showUpdate = false }) { Text("Not now", color = PaperDim) }
+            },
+        )
+    }
+}
+
+/** "Software update" card in PP Config (feature H).
+ *
+ *  Three states, deliberately unambiguous:
+ *   - update available + the box can install it  → a big "Update my box" button,
+ *   - update available + Docker box              → the exact command to run on the host,
+ *     because a container can't replace its own image (no host Docker access, by design),
+ *   - up to date                                 → when it last looked, and a Check now.
+ *  The automatic-checks toggle is always visible so the owner can go manual-only. */
+@Composable
+private fun UpdateSection(
+    info: MatrixRepo.UpdateInfo?,
+    autoCheck: Boolean,
+    busy: Boolean,
+    onCheck: () -> Unit,
+    onApprove: () -> Unit,
+    onAutoCheck: (Boolean) -> Unit,
+    onCopyCommand: (String) -> Unit,
+) {
+    val available = info?.available == true
+    Column(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp))
+            .background(if (available) InkCard else InkSoft)
+            .then(
+                if (available) Modifier.border(1.dp, Sunflower, RoundedCornerShape(16.dp))
+                else Modifier
+            )
+            .padding(18.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(
+                if (available) Icons.Filled.Download else Icons.Filled.Check,
+                null, tint = if (available) Sunflower else PaperDim, modifier = Modifier.size(20.dp),
+            )
+            Spacer(Modifier.width(10.dp))
+            Text(
+                if (available) "Update available" else "Software update",
+                color = Paper, fontSize = 15.sp, fontWeight = FontWeight.Bold,
+            )
+        }
+        Spacer(Modifier.height(8.dp))
+
+        if (available && info != null) {
+            Text("Version ${info.current}  →  ${info.latest}", color = Sunflower, fontSize = 14.sp,
+                fontWeight = FontWeight.Bold)
+            if (info.released.isNotBlank()) {
+                Text("Released ${info.released}", color = PaperDim, fontSize = 11.sp)
+            }
+            if (info.notes.isNotEmpty()) {
+                Spacer(Modifier.height(10.dp))
+                Text("What's new", color = Paper, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(4.dp))
+                for (n in info.notes.take(6)) {
+                    Text("•  $n", color = PaperDim, fontSize = 12.sp,
+                        modifier = Modifier.padding(top = 2.dp))
+                }
+            }
+            Spacer(Modifier.height(14.dp))
+            if (info.selfInstall) {
+                Button(
+                    onClick = onApprove, enabled = !busy, modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(containerColor = Sunflower, contentColor = Ink),
+                ) {
+                    if (busy) {
+                        CircularProgressIndicator(Modifier.size(16.dp), color = Ink, strokeWidth = 2.dp)
+                        Spacer(Modifier.width(8.dp)); Text("Working…")
+                    } else {
+                        Icon(Icons.Filled.Download, null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(8.dp)); Text("Update my box", fontWeight = FontWeight.Bold)
+                    }
+                }
+                Spacer(Modifier.height(8.dp))
+                Text("Your box checks the update is signed by PurePrivacy before installing. " +
+                    "Your address, chats and contacts are kept.", color = PaperDim, fontSize = 11.sp)
+            } else {
+                // Docker: the container can't update itself — hand over the exact command.
+                Text("Run this on the computer running your box:", color = Paper, fontSize = 12.sp)
+                Spacer(Modifier.height(8.dp))
+                Row(
+                    Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(Ink).padding(12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(info.command, color = Sunflower, fontSize = 11.sp,
+                        fontFamily = FontFamily.Monospace, modifier = Modifier.weight(1f))
+                    IconButton(onClick = { onCopyCommand(info.command) }, modifier = Modifier.size(28.dp)) {
+                        Icon(Icons.Filled.ContentCopy, "copy command", tint = PaperDim,
+                            modifier = Modifier.size(16.dp))
+                    }
+                }
+                Spacer(Modifier.height(8.dp))
+                Text("Your box runs in Docker, so it can't update itself — that would mean giving " +
+                    "the container control of the computer it runs on. Your identity and chats are kept.",
+                    color = PaperDim, fontSize = 11.sp)
+            }
+        } else {
+            Text(
+                when {
+                    info == null -> "Checking your box…"
+                    info.error != null -> "Couldn't check for updates — will retry."
+                    else -> "Your box is up to date  ·  v${info.current}"
+                },
+                color = PaperDim, fontSize = 13.sp,
+            )
+            if (info?.checkedTs ?: 0L > 0L) {
+                Text("Last checked ${fmtAgo(info!!.checkedTs)}", color = PaperDim, fontSize = 11.sp)
+            }
+        }
+
+        Spacer(Modifier.height(14.dp))
+        Box(Modifier.fillMaxWidth().height(1.dp).background(Ink))
+        Spacer(Modifier.height(10.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("Check automatically", color = Paper, fontSize = 13.sp)
+                Text("Once a day, over Tor", color = PaperDim, fontSize = 11.sp)
+            }
+            Switch(
+                checked = autoCheck, onCheckedChange = onAutoCheck,
+                colors = SwitchDefaults.colors(checkedTrackColor = Sunflower, checkedThumbColor = Ink),
+            )
+        }
+        TextButton(onClick = onCheck, enabled = !busy) {
+            Text(if (busy) "Checking…" else "Check now", color = Sunflower)
+        }
     }
 }
 
