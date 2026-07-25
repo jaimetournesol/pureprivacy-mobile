@@ -522,7 +522,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     // --- Apps grid (feature E) + PP Config (feature B) ----------------------------------
     fun goHome() { error.value = null; screen.value = Screen.Home }
     fun openMessaging() { error.value = null; screen.value = Screen.Rooms }
-    fun openConfig() { error.value = null; screen.value = Screen.Config; loadBoxStatus() }
+    fun openConfig() {
+        error.value = null; screen.value = Screen.Config
+        loadBoxStatus(); loadUpdateInfo()
+    }
 
     // --- Backup Sync app (feature F) ----------------------------------------------------
     val backupFiles = MatrixRepo.backupFiles
@@ -708,6 +711,74 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 backupEnvelope.value = env
                 configNotice.value = "Backup ready — choose where to save it."
             }
+        }
+    }
+
+    // --- Box update (feature H) ---------------------------------------------------------
+    val updateInfo = MutableStateFlow<MatrixRepo.UpdateInfo?>(null)
+    val autoUpdateCheck = MutableStateFlow(true)
+    /** True while an update is being checked/installed, so the UI can show progress. */
+    val updateBusy = MutableStateFlow(false)
+
+    fun loadUpdateInfo() {
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { MatrixRepo.readUpdateInfo() }.getOrNull()?.let { updateInfo.value = it }
+            autoUpdateCheck.value = runCatching { MatrixRepo.readAutoUpdateCheck() }.getOrDefault(true)
+        }
+    }
+
+    fun setAutoUpdateCheck(on: Boolean) {
+        autoUpdateCheck.value = on
+        viewModelScope.launch(Dispatchers.IO) { runCatching { MatrixRepo.setAutoUpdateCheck(on) } }
+    }
+
+    /** Ask the box to look for a new release now (it verifies the signature before believing it). */
+    fun checkForUpdate() {
+        viewModelScope.launch(Dispatchers.IO) {
+            updateBusy.value = true
+            configNotice.value = "Checking for updates over Tor…"
+            val id = runCatching { MatrixRepo.sendBoxCommand("check_update") }.getOrNull()
+            if (id == null) {
+                configNotice.value = "Couldn't reach your box."; updateBusy.value = false; return@launch
+            }
+            var out: MatrixRepo.CommandOutcome? = null
+            for (i in 1..30) {
+                kotlinx.coroutines.delay(2000)
+                out = runCatching { MatrixRepo.readCommandOutcome(id) }.getOrNull()
+                if (out != null) break
+            }
+            updateBusy.value = false
+            configNotice.value = out?.message
+                ?: "Your box didn't answer — it may still be starting."
+            loadUpdateInfo()
+        }
+    }
+
+    /** Owner approved the update. The box installs ONLY the release it already verified;
+     *  naming the version stops this approval being replayed against a different one. */
+    fun approveUpdate() {
+        val target = updateInfo.value?.latest.orEmpty()
+        viewModelScope.launch(Dispatchers.IO) {
+            updateBusy.value = true
+            configNotice.value = "Installing the update — your box will restart…"
+            val id = runCatching {
+                MatrixRepo.sendBoxCommand("update", targetVersion = target)
+            }.getOrNull()
+            if (id == null) {
+                configNotice.value = "Couldn't reach your box."; updateBusy.value = false; return@launch
+            }
+            var out: MatrixRepo.CommandOutcome? = null
+            // A native install downloads a whole binary over Tor — allow generous time.
+            for (i in 1..90) {
+                kotlinx.coroutines.delay(2000)
+                out = runCatching { MatrixRepo.readCommandOutcome(id) }.getOrNull()
+                if (out != null) break
+            }
+            updateBusy.value = false
+            configNotice.value = out?.message
+                ?: "Still working — your box will come back on its own."
+            loadUpdateInfo()
+            loadBoxStatus()
         }
     }
 
