@@ -2381,7 +2381,7 @@ object MatrixRepo {
                 if (!tmp.exists() || tmp.length() == 0L) return false
                 val ok = sendOne(tl, tmp, mime)
                 if (ok) onProgress?.invoke(1, 1)
-                return ok
+                return ok   // single small attachment: the existing, proven path
             }
 
             // Chunked. Stable id => a retry resumes instead of duplicating.
@@ -2419,8 +2419,11 @@ object MatrixRepo {
                     val ok = sendOne(tl, part, mime)
                     part.delete()          // one chunk on disk at a time, never a full copy
                     if (!ok) return false  // stop here; the parts already sent let us resume
+                    // Confirm it actually LEFT the phone before counting it or moving on, so
+                    // progress is real and "Backed up" isn't announced mid-upload.
+                    if (!awaitPartSent(fileId, index)) return false
                     index++
-                    onProgress?.invoke(already.size + index - already.count { it < index }, total)
+                    onProgress?.invoke(existingParts(roomId, fileId).size, total)
                 }
             } ?: return false
             return true
@@ -2441,19 +2444,40 @@ object MatrixRepo {
         return runCatching { tl.sendFile(params, info).join(); true }.getOrDefault(false)
     }
 
-    /** Which chunk indexes of [fileId] the box already holds — the basis of resume. */
+    /** Chunk indexes of [fileId] that are actually ON THE BOX (fully sent) — the basis of both
+     *  resume and honest progress. Deliberately excludes still-queued parts: counting those
+     *  would let us skip a chunk that never made it, leaving a permanently broken file. */
     private fun existingParts(roomId: String, fileId: String): Set<Int> {
         val out = HashSet<Int>()
         synchronized(libItems) {
-            for (f in projectChunkRefs(libItems)) {
-                if (f.fileId == fileId) out.add(f.index)
+            for ((ref, sending) in projectChunkRefs(libItems)) {
+                if (ref.fileId == fileId && !sending) out.add(ref.index)
             }
         }
         return out
     }
 
-    private fun projectChunkRefs(items: List<TimelineItem>): List<ChunkRef> {
-        val out = ArrayList<ChunkRef>()
+    /**
+     * Wait until chunk [index] of [fileId] has genuinely left the phone.
+     *
+     * `sendFile(...).join()` returns once the send is QUEUED locally, not once it's uploaded —
+     * so without this the loop races through all chunks in seconds, reports "Backed up", and
+     * leaves the file still uploading in the background. That's exactly the lie this feature
+     * exists to remove, so every chunk is confirmed sent before we move to the next one.
+     * Returns false on timeout, which aborts the upload and leaves the sent parts for a resume.
+     */
+    private suspend fun awaitPartSent(fileId: String, index: Int, timeoutMs: Long = 20 * 60_000L): Boolean {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            if (index in existingParts("", fileId)) return true
+            kotlinx.coroutines.delay(1000)
+        }
+        return false
+    }
+
+    /** Chunk refs in the library timeline, each with whether it is still being sent. */
+    private fun projectChunkRefs(items: List<TimelineItem>): List<Pair<ChunkRef, Boolean>> {
+        val out = ArrayList<Pair<ChunkRef, Boolean>>()
         for (item in items) {
             val ev = runCatching { item.asEvent() }.getOrNull() ?: continue
             val content = ev.content as? TimelineItemContent.MsgLike ?: continue
@@ -2463,7 +2487,8 @@ object MatrixRepo {
                 is org.matrix.rustcomponents.sdk.MessageType.Image -> mt.content.filename
                 else -> null
             }
-            parseChunkName(fn)?.let { out.add(it) }
+            val sending = runCatching { ev.localSendState != null }.getOrDefault(false)
+            parseChunkName(fn)?.let { out.add(it to sending) }
         }
         return out
     }
