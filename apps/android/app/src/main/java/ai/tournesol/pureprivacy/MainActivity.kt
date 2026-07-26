@@ -2139,6 +2139,26 @@ private fun UpdateSection(
                 Spacer(Modifier.height(8.dp))
                 Text("Your box checks the update is signed by PurePrivacy before installing. " +
                     "Your address, chats and contacts are kept.", color = PaperDim, fontSize = 11.sp)
+            } else if (info.kind != "docker") {
+                // Native box with no build for its platform (e.g. Windows/macOS — the
+                // homeserver has no upstream build there yet). Must NOT show a docker command.
+                Text("Get this update for your computer:", color = Paper, fontSize = 12.sp)
+                Spacer(Modifier.height(8.dp))
+                Row(
+                    Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(Ink).padding(12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(info.downloadUrl.ifBlank { "the PurePrivacy releases page" },
+                        color = Sunflower, fontSize = 11.sp, fontFamily = FontFamily.Monospace,
+                        modifier = Modifier.weight(1f))
+                    IconButton(onClick = { onCopyCommand(info.downloadUrl) }, modifier = Modifier.size(28.dp)) {
+                        Icon(Icons.Filled.ContentCopy, "copy link", tint = PaperDim,
+                            modifier = Modifier.size(16.dp))
+                    }
+                }
+                Spacer(Modifier.height(8.dp))
+                Text("Download it on the computer running your box and install over the current " +
+                    "version. Your identity and chats are kept.", color = PaperDim, fontSize = 11.sp)
             } else {
                 // Docker: the container can't update itself — hand over the exact command.
                 Text("Run this on the computer running your box:", color = Paper, fontSize = 12.sp)

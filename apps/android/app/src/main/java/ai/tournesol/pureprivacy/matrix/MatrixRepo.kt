@@ -2168,6 +2168,9 @@ object MatrixRepo {
         val kind: String,          // "native" | "docker"
         val selfInstall: Boolean,
         val command: String,
+        /** Set when this box is native but the release has no build for its platform — the
+         *  owner installs it themselves from here. Mutually exclusive with [command]. */
+        val downloadUrl: String,
         val error: String?,
         val checkedTs: Long,
     )
@@ -2187,6 +2190,7 @@ object MatrixRepo {
             kind = o.optString("kind", "native"),
             selfInstall = o.optBoolean("self_install", false),
             command = o.optString("command"),
+            downloadUrl = o.optString("download_url"),
             error = o.optString("error").ifBlank { null },
             checkedTs = o.optLong("checked_ts", 0L),
         )
