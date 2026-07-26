@@ -2140,25 +2140,38 @@ private fun UpdateSection(
                 Text("Your box checks the update is signed by PurePrivacy before installing. " +
                     "Your address, chats and contacts are kept.", color = PaperDim, fontSize = 11.sp)
             } else if (info.kind != "docker") {
-                // Native box with no build for its platform (e.g. Windows/macOS — the
-                // homeserver has no upstream build there yet). Must NOT show a docker command.
-                Text("Get this update for your computer:", color = Paper, fontSize = 12.sp)
+                // Native box on an OS we don't publish a box for (Windows/macOS — the
+                // homeserver has no build there). Divert to Docker, the supported path.
+                // Must NOT claim the box "runs in Docker" — it doesn't, that's the point.
+                val toDocker = info.unsupportedOs || info.downloadUrl.isBlank()
+                Text(
+                    if (toDocker) "Run your box with Docker to get updates:"
+                    else "Get this update for your computer:",
+                    color = Paper, fontSize = 12.sp,
+                )
                 Spacer(Modifier.height(8.dp))
+                val copyable = if (toDocker) info.command.ifBlank { "docker pull jaimemelon/pureprivacy-box:latest" }
+                               else info.downloadUrl
                 Row(
                     Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(Ink).padding(12.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Text(info.downloadUrl.ifBlank { "the PurePrivacy releases page" },
-                        color = Sunflower, fontSize = 11.sp, fontFamily = FontFamily.Monospace,
-                        modifier = Modifier.weight(1f))
-                    IconButton(onClick = { onCopyCommand(info.downloadUrl) }, modifier = Modifier.size(28.dp)) {
-                        Icon(Icons.Filled.ContentCopy, "copy link", tint = PaperDim,
-                            modifier = Modifier.size(16.dp))
+                    Text(copyable, color = Sunflower, fontSize = 11.sp,
+                        fontFamily = FontFamily.Monospace, modifier = Modifier.weight(1f))
+                    IconButton(onClick = { onCopyCommand(copyable) }, modifier = Modifier.size(28.dp)) {
+                        Icon(Icons.Filled.ContentCopy, "copy", tint = PaperDim, modifier = Modifier.size(16.dp))
                     }
                 }
                 Spacer(Modifier.height(8.dp))
-                Text("Download it on the computer running your box and install over the current " +
-                    "version. Your identity and chats are kept.", color = PaperDim, fontSize = 11.sp)
+                Text(
+                    if (toDocker)
+                        "PurePrivacy only publishes a box for Linux right now, so updates can't " +
+                        "install on this computer. Running your box with Docker keeps it " +
+                        "updatable — your address, chats and contacts carry over."
+                    else "Download it on the computer running your box and install over the " +
+                        "current version. Your identity and chats are kept.",
+                    color = PaperDim, fontSize = 11.sp,
+                )
             } else {
                 // Docker: the container can't update itself — hand over the exact command.
                 Text("Run this on the computer running your box:", color = Paper, fontSize = 12.sp)

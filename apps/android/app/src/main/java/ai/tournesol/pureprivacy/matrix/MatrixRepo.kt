@@ -2171,6 +2171,9 @@ object MatrixRepo {
         /** Set when this box is native but the release has no build for its platform — the
          *  owner installs it themselves from here. Mutually exclusive with [command]. */
         val downloadUrl: String,
+        /** True when the box runs on an OS PurePrivacy doesn't publish a box for (only Linux
+         *  today — the homeserver has no other build). The phone then points at Docker. */
+        val unsupportedOs: Boolean,
         val error: String?,
         val checkedTs: Long,
     )
@@ -2191,6 +2194,7 @@ object MatrixRepo {
             selfInstall = o.optBoolean("self_install", false),
             command = o.optString("command"),
             downloadUrl = o.optString("download_url"),
+            unsupportedOs = o.optBoolean("unsupported_os", false),
             error = o.optString("error").ifBlank { null },
             checkedTs = o.optLong("checked_ts", 0L),
         )
