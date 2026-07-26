@@ -2251,6 +2251,49 @@ object MatrixRepo {
     /** Ceiling for a backup upload. Matches the box's tuwunel max_request_size (256 MB). */
     const val MAX_BACKUP_BYTES = 256L * 1024 * 1024
 
+    // --- Chunked upload (feature I) -----------------------------------------------------
+    // Big files are split, so no single request is large: the box never has to swallow a
+    // multi-hundred-MB body, a dead Tor circuit costs one chunk instead of the whole file,
+    // and "part 7 of 42" gives real progress. Metadata rides in the FILENAME because the SDK
+    // takes an attachment's name from the staged file's path and the library projection reads
+    // it straight back — no SDK support needed, guaranteed to round-trip.
+    //
+    //   <original name>~~pp~<fileId>~<index>~<total>      holiday.mp4~~pp~a1b2c3d4~7~42
+    //
+    /** One chunk. ~16 MB is well under a couple of minutes over Tor, so a failure loses little. */
+    const val CHUNK_BYTES = 16L * 1024 * 1024
+    /** Files at or below this go up as a single attachment, exactly as before (legacy shape). */
+    const val CHUNK_THRESHOLD = CHUNK_BYTES
+    /** Sanity ceiling now that per-request size is bounded; the real limit is the box's disk. */
+    const val MAX_CHUNKED_BYTES = 16L * 1024 * 1024 * 1024
+    private const val CHUNK_MARK = "~~pp~"
+
+    private fun chunkName(name: String, fileId: String, index: Int, total: Int) =
+        "$name$CHUNK_MARK$fileId~$index~$total"
+
+    /** Parsed chunk metadata from an attachment filename, or null for an ordinary file. */
+    data class ChunkRef(val name: String, val fileId: String, val index: Int, val total: Int)
+
+    fun parseChunkName(filename: String?): ChunkRef? {
+        val f = filename ?: return null
+        val at = f.lastIndexOf(CHUNK_MARK)
+        if (at <= 0) return null
+        val parts = f.substring(at + CHUNK_MARK.length).split('~')
+        if (parts.size != 3) return null
+        val idx = parts[1].toIntOrNull() ?: return null
+        val tot = parts[2].toIntOrNull() ?: return null
+        if (tot <= 0 || idx < 0 || idx >= tot || parts[0].isEmpty()) return null
+        return ChunkRef(f.substring(0, at), parts[0], idx, tot)
+    }
+
+    /** Content-derived id so re-picking the SAME file after a failure resumes instead of
+     *  duplicating: identical name+size+mtime ⇒ identical id ⇒ existing parts are skipped. */
+    private fun fileIdFor(name: String, size: Long, modified: Long): String {
+        val md = java.security.MessageDigest.getInstance("SHA-256")
+        md.update("$name|$size|$modified".toByteArray())
+        return md.digest().take(8).joinToString("") { "%02x".format(it) }
+    }
+
     /** Serializes [ensureBackupRoom] so two concurrent openers (the app tile AND the screen's
      *  LaunchedEffect both fire) can't each pass the check-then-create and mint duplicate library
      *  rooms. Within the lock the account-data write of the first caller is visible to the second. */
@@ -2305,38 +2348,172 @@ object MatrixRepo {
     /** Upload one file to the backup library at FULL fidelity (no image downscale — a backup
      *  must keep the original bytes) via the library room's timeline. Uses a bounded timeline
      *  handle for [roomId] so it doesn't disturb whatever chat is open. Returns true on success. */
-    suspend fun backupUpload(ctx: Context, roomId: String, uri: android.net.Uri): Boolean {
+    suspend fun backupUpload(
+        ctx: Context,
+        roomId: String,
+        uri: android.net.Uri,
+        /** Called as parts land: (done, total). total == 1 for a small, unchunked file. */
+        onProgress: ((Int, Int) -> Unit)? = null,
+    ): Boolean {
         val c = client ?: return false
         val cr = ctx.contentResolver
         val name = (queryDisplayName(cr, uri) ?: "file").substringAfterLast('/').ifBlank { "file" }
         val mime = cr.getType(uri) ?: "application/octet-stream"
+        val size = queryLength(cr, uri)
+        if (size <= 0L) return false
+        if (size > MAX_CHUNKED_BYTES) {
+            val gb = size / (1024 * 1024 * 1024)
+            status.value = "\"$name\" is ${gb} GB — over the ${MAX_CHUNKED_BYTES / (1024 * 1024 * 1024)} GB limit."
+            return false
+        }
+
+        val room = runCatching { c.getRoom(roomId) }.getOrNull() ?: return false
+        val tl = runCatching { room.timeline() }.getOrNull() ?: return false
         val dir = File(ctx.cacheDir, "pp_bk/${System.currentTimeMillis()}").apply { mkdirs() }
-        val tmp = File(dir, name)
-        runCatching { cr.openInputStream(uri)?.use { i -> tmp.outputStream().use { o -> i.copyTo(o) } } }
         try {
-            if (!tmp.exists() || tmp.length() == 0L) return false
-            if (tmp.length() > MAX_BACKUP_BYTES) {
-                val mb = tmp.length() / (1024 * 1024)
-                status.value = "\"$name\" is ${mb} MB — over the ${MAX_BACKUP_BYTES / (1024 * 1024)} MB limit."
-                return false
+            // Small file: single attachment, byte-for-byte the shape we shipped before, so
+            // existing libraries and older readers keep working.
+            if (size <= CHUNK_THRESHOLD) {
+                val tmp = File(dir, name)
+                runCatching {
+                    cr.openInputStream(uri)?.use { i -> tmp.outputStream().use { o -> i.copyTo(o) } }
+                }
+                if (!tmp.exists() || tmp.length() == 0L) return false
+                val ok = sendOne(tl, tmp, mime)
+                if (ok) onProgress?.invoke(1, 1)
+                return ok
             }
-            val room = runCatching { c.getRoom(roomId) }.getOrNull() ?: return false
-            val tl = runCatching { room.timeline() }.getOrNull() ?: return false
-            val params = org.matrix.rustcomponents.sdk.UploadParameters(
-                org.matrix.rustcomponents.sdk.UploadSource.File(tmp.absolutePath), null, null, null, null,
-            )
-            val info = org.matrix.rustcomponents.sdk.FileInfo(mime, tmp.length().toULong(), null, null)
-            return runCatching { tl.sendFile(params, info).join(); true }.getOrDefault(false)
+
+            // Chunked. Stable id => a retry resumes instead of duplicating.
+            val fileId = fileIdFor(name, size, queryModified(cr, uri))
+            val total = ((size + CHUNK_BYTES - 1) / CHUNK_BYTES).toInt()
+            val already = existingParts(roomId, fileId)
+            onProgress?.invoke(already.size, total)
+
+            cr.openInputStream(uri)?.use { input ->
+                val buf = ByteArray(256 * 1024)
+                var index = 0
+                while (index < total) {
+                    val want = minOf(CHUNK_BYTES, size - index * CHUNK_BYTES)
+                    if (index in already) {
+                        // Already on the box — skip its bytes without re-uploading them.
+                        var skipped = 0L
+                        while (skipped < want) {
+                            val n = input.skip(want - skipped)
+                            if (n <= 0) break
+                            skipped += n
+                        }
+                        index++
+                        continue
+                    }
+                    val part = File(dir, chunkName(name, fileId, index, total))
+                    var written = 0L
+                    part.outputStream().use { out ->
+                        while (written < want) {
+                            val n = input.read(buf, 0, minOf(buf.size.toLong(), want - written).toInt())
+                            if (n <= 0) break
+                            out.write(buf, 0, n); written += n
+                        }
+                    }
+                    if (written <= 0L) { part.delete(); return false }
+                    val ok = sendOne(tl, part, mime)
+                    part.delete()          // one chunk on disk at a time, never a full copy
+                    if (!ok) return false  // stop here; the parts already sent let us resume
+                    index++
+                    onProgress?.invoke(already.size + index - already.count { it < index }, total)
+                }
+            } ?: return false
+            return true
         } finally {
             runCatching { dir.deleteRecursively() }
         }
     }
+
+    private suspend fun sendOne(
+        tl: org.matrix.rustcomponents.sdk.Timeline,
+        file: File,
+        mime: String,
+    ): Boolean {
+        val params = org.matrix.rustcomponents.sdk.UploadParameters(
+            org.matrix.rustcomponents.sdk.UploadSource.File(file.absolutePath), null, null, null, null,
+        )
+        val info = org.matrix.rustcomponents.sdk.FileInfo(mime, file.length().toULong(), null, null)
+        return runCatching { tl.sendFile(params, info).join(); true }.getOrDefault(false)
+    }
+
+    /** Which chunk indexes of [fileId] the box already holds — the basis of resume. */
+    private fun existingParts(roomId: String, fileId: String): Set<Int> {
+        val out = HashSet<Int>()
+        synchronized(libItems) {
+            for (f in projectChunkRefs(libItems)) {
+                if (f.fileId == fileId) out.add(f.index)
+            }
+        }
+        return out
+    }
+
+    private fun projectChunkRefs(items: List<TimelineItem>): List<ChunkRef> {
+        val out = ArrayList<ChunkRef>()
+        for (item in items) {
+            val ev = runCatching { item.asEvent() }.getOrNull() ?: continue
+            val content = ev.content as? TimelineItemContent.MsgLike ?: continue
+            val kind = content.content.kind as? MsgLikeKind.Message ?: continue
+            val fn = when (val mt = kind.content.msgType) {
+                is org.matrix.rustcomponents.sdk.MessageType.File -> mt.content.filename
+                is org.matrix.rustcomponents.sdk.MessageType.Image -> mt.content.filename
+                else -> null
+            }
+            parseChunkName(fn)?.let { out.add(it) }
+        }
+        return out
+    }
+
+    private fun queryLength(cr: android.content.ContentResolver, uri: android.net.Uri): Long =
+        runCatching {
+            cr.query(uri, arrayOf(android.provider.OpenableColumns.SIZE), null, null, null)?.use { c ->
+                if (c.moveToFirst() && !c.isNull(0)) c.getLong(0) else -1L
+            } ?: -1L
+        }.getOrDefault(-1L).let { if (it > 0) it else runCatching {
+            cr.openAssetFileDescriptor(uri, "r")?.use { it.length }?.takeIf { l -> l > 0 } ?: -1L
+        }.getOrDefault(-1L) }
+
+    private fun queryModified(cr: android.content.ContentResolver, uri: android.net.Uri): Long =
+        runCatching {
+            cr.query(uri, arrayOf(android.provider.DocumentsContract.Document.COLUMN_LAST_MODIFIED), null, null, null)
+                ?.use { c -> if (c.moveToFirst() && !c.isNull(0)) c.getLong(0) else 0L } ?: 0L
+        }.getOrDefault(0L)
 
     /** Fetch a library file's bytes (for saving to the phone). Not cached — backup files are
      *  large and one-shot; the chat mediaCache is for small, re-viewed thumbnails. */
     suspend fun backupBytes(media: org.matrix.rustcomponents.sdk.MediaSource): ByteArray? {
         val c = client ?: return null
         return runCatching { c.getMediaContent(media) }.getOrNull()
+    }
+
+    /** Write a library file to [out], STREAMING a chunked one part-by-part so a multi-GB
+     *  download never has to exist in memory at once. Refuses an incomplete file rather than
+     *  silently writing a truncated one. Returns true only if every part was written in order. */
+    suspend fun backupDownloadTo(
+        f: BackupFile,
+        out: java.io.OutputStream,
+        onProgress: ((Int, Int) -> Unit)? = null,
+    ): Boolean {
+        val c = client ?: return false
+        if (f.partsTotal == 0) {                       // legacy single attachment
+            val src = f.media ?: return false
+            val bytes = runCatching { c.getMediaContent(src) }.getOrNull() ?: return false
+            out.write(bytes); out.flush()
+            onProgress?.invoke(1, 1)
+            return true
+        }
+        if (!f.complete || f.parts.size < f.partsTotal) return false   // never truncate
+        for ((i, src) in f.parts.withIndex()) {
+            val bytes = runCatching { c.getMediaContent(src) }.getOrNull() ?: return false
+            out.write(bytes)
+            onProgress?.invoke(i + 1, f.partsTotal)
+        }
+        out.flush()
+        return true
     }
 
     /** One file in the backup library. */
@@ -2349,7 +2526,15 @@ object MatrixRepo {
         val isImage: Boolean,
         val media: org.matrix.rustcomponents.sdk.MediaSource?,
         val sending: Boolean,
-    )
+        /** Chunked file (feature I): ordered part sources, index -> source. Empty for a
+         *  plain single-attachment file, which keeps the legacy [media] path. */
+        val parts: List<org.matrix.rustcomponents.sdk.MediaSource> = emptyList(),
+        val partsTotal: Int = 0,
+        val partsHave: Int = 0,
+    ) {
+        /** A part-uploaded file must never masquerade as a finished one. */
+        val complete: Boolean get() = partsTotal == 0 || partsHave >= partsTotal
+    }
 
     /** Contents of the backup library, newest first. A DEDICATED timeline (own handle + list)
      *  so browsing files never disturbs whatever chat is open. */
@@ -2433,7 +2618,45 @@ object MatrixRepo {
             }
             out.add(BackupFile(key, name ?: "file", mime, size, ts, isImage, media, sending))
         }
-        return out.asReversed()   // timeline is oldest-first; show newest first
+        return collapseChunks(out).asReversed()   // timeline is oldest-first; show newest first
+    }
+
+    /** Fold the parts of a chunked file into ONE row (feature I): real name, summed size, and
+     *  an ordered part list for streaming download. Plain files pass through untouched, so a
+     *  library written before chunking still browses and downloads exactly as before. */
+    private fun collapseChunks(flat: List<BackupFile>): List<BackupFile> {
+        val out = ArrayList<BackupFile>()
+        // fileId -> (first row seen, index -> source, summed size, total, any part still sending)
+        val groups = LinkedHashMap<String, MutableList<Pair<ChunkRef, BackupFile>>>()
+        for (f in flat) {
+            val ref = parseChunkName(f.name)
+            if (ref == null) { out.add(f); continue }
+            groups.getOrPut(ref.fileId) { ArrayList() }.add(ref to f)
+        }
+        for ((fileId, members) in groups) {
+            val ref0 = members.first().first
+            val byIndex = sortedMapOf<Int, BackupFile>()
+            for ((r, f) in members) byIndex[r.index] = f          // last write wins on a dup
+            val ordered = byIndex.entries.sortedBy { it.key }
+            val sources = ordered.mapNotNull { it.value.media }
+            val first = members.first().second
+            out.add(
+                BackupFile(
+                    key = "chunked:$fileId",
+                    name = ref0.name,
+                    mime = first.mime,
+                    sizeBytes = ordered.sumOf { it.value.sizeBytes },
+                    tsMs = members.minOf { it.second.tsMs },
+                    isImage = first.isImage,
+                    media = null,                       // chunked files download via [parts]
+                    sending = members.any { it.second.sending },
+                    parts = sources,
+                    partsTotal = ref0.total,
+                    partsHave = byIndex.size,
+                )
+            )
+        }
+        return out
     }
 
     /** Read the sealed backup envelope the box published for [id]; null until it lands.

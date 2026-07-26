@@ -534,6 +534,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     val backupBusy = MutableStateFlow(false)
     /** Count of uploads in flight, shown as progress. */
     val backupUploading = MutableStateFlow(0)
+    /** Chunk progress for the file currently uploading: "part 7 of 42" (feature I). Empty
+     *  when the current file is small enough to go in one piece. */
+    val backupPartProgress = MutableStateFlow("")
     val backupNotice = MutableStateFlow<String?>(null)
     fun clearBackupNotice() { backupNotice.value = null }
 
@@ -564,7 +567,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             backupUploading.value = uris.size
             var ok = 0
             for (u in uris) {
-                if (runCatching { MatrixRepo.backupUpload(getApplication(), rid, u) }.getOrDefault(false)) ok++
+                val done = runCatching {
+                    MatrixRepo.backupUpload(getApplication(), rid, u) { part, total ->
+                        backupPartProgress.value = if (total > 1) "part $part of $total" else ""
+                    }
+                }.getOrDefault(false)
+                backupPartProgress.value = ""
+                if (done) ok++
                 backupUploading.value = (backupUploading.value - 1).coerceAtLeast(0)
             }
             backupUploading.value = 0
@@ -574,11 +583,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Fetch a library file's bytes so the UI can write them to a user-chosen location. */
-    suspend fun fetchBackupBytes(file: MatrixRepo.BackupFile): ByteArray? {
-        val media = file.media ?: return null
-        return runCatching { MatrixRepo.backupBytes(media) }.getOrNull()
-    }
+    /** Stream a library file straight into the user's chosen location. Chunked files are
+     *  written part-by-part, so a multi-GB download never has to fit in memory. */
+    suspend fun downloadBackupTo(
+        file: MatrixRepo.BackupFile,
+        out: java.io.OutputStream,
+    ): Boolean = runCatching {
+        MatrixRepo.backupDownloadTo(file, out) { part, total ->
+            backupPartProgress.value = if (total > 1) "part $part of $total" else ""
+        }
+    }.getOrDefault(false).also { backupPartProgress.value = "" }
 
     // --- Continuous Backup Sync (feature G) ---------------------------------------------
     val syncSources = ai.tournesol.pureprivacy.backup.BackupSyncStore.sources

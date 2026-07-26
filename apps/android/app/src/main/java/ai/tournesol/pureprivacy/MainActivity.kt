@@ -2232,6 +2232,7 @@ private fun FilesScreen(vm: AppViewModel) {
     val files by vm.backupFiles.collectAsState()
     val ready by vm.libraryReady.collectAsState()
     val uploading by vm.backupUploading.collectAsState()
+    val partProgress by vm.backupPartProgress.collectAsState()
     val notice by vm.backupNotice.collectAsState()
     val scope = rememberCoroutineScope()
     val ctx = LocalContext.current
@@ -2253,10 +2254,13 @@ private fun FilesScreen(vm: AppViewModel) {
         if (uri != null && f != null) {
             scope.launch {
                 vm.backupNotice.value = "Downloading ${f.name}…"
-                val bytes = vm.fetchBackupBytes(f)
-                val ok = bytes != null && runCatching {
-                    ctx.contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
-                }.isSuccess
+                // Stream straight to the chosen file — a chunked multi-GB download must never
+                // be assembled in memory first.
+                val ok = runCatching {
+                    ctx.contentResolver.openOutputStream(uri)?.use { out ->
+                        vm.downloadBackupTo(f, out)
+                    } ?: false
+                }.getOrDefault(false)
                 vm.backupNotice.value = if (ok) "Saved ${f.name}." else "Couldn't download ${f.name}."
             }
         }
@@ -2324,8 +2328,13 @@ private fun FilesScreen(vm: AppViewModel) {
                 ) {
                     CircularProgressIndicator(Modifier.size(18.dp), color = Sunflower, strokeWidth = 2.dp)
                     Spacer(Modifier.width(12.dp))
-                    Text("Backing up $uploading ${if (uploading == 1) "file" else "files"}…",
-                        color = Paper, fontSize = 13.sp)
+                    Text(
+                        buildString {
+                            append("Backing up $uploading ${if (uploading == 1) "file" else "files"}…")
+                            if (partProgress.isNotBlank()) append("  ·  $partProgress")
+                        },
+                        color = Paper, fontSize = 13.sp,
+                    )
                 }
             }
             notice?.let {
@@ -2520,11 +2529,21 @@ private fun BackupFileRow(f: MatrixRepo.BackupFile, onDownload: () -> Unit) {
             Text(f.name, color = Paper, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
             val meta = buildString {
                 if (f.sizeBytes > 0) append(fmtSize(f.sizeBytes))
-                if (f.sending) { if (isNotEmpty()) append(" · "); append("backing up…") }
+                // A part-uploaded file says so plainly instead of looking finished (feature I).
+                if (f.partsTotal > 0 && !f.complete) {
+                    if (isNotEmpty()) append(" · ")
+                    append("${f.partsHave} of ${f.partsTotal} parts — pick it again to resume")
+                } else if (f.sending) {
+                    if (isNotEmpty()) append(" · "); append("backing up…")
+                }
             }
-            if (meta.isNotEmpty()) Text(meta, color = PaperDim, fontSize = 11.sp)
+            if (meta.isNotEmpty()) {
+                Text(meta, color = if (f.partsTotal > 0 && !f.complete) Sunflower else PaperDim,
+                    fontSize = 11.sp)
+            }
         }
-        if (!f.sending) {
+        // Only a COMPLETE file can be downloaded — never hand back a truncated one.
+        if (!f.sending && f.complete) {
             IconButton(onClick = onDownload) {
                 Icon(Icons.Filled.Download, "download", tint = Sunflower)
             }
