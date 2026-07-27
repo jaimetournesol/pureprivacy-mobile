@@ -12,21 +12,49 @@ the **Tournesol** organization. Docs in this folder:
 - [ ] Company-owned **Google account** (a Workspace role account on `tournesol.ai`).
 - [ ] **D-U-N-S number** for Tournesol (free, from Dun & Bradstreet; can take up to ~30 days). ⚠️ gating item
 - [ ] Create Play Console account → **Organization**, pay **$25**, enter the D-U-N-S, verify.
-- [ ] **Closed testing:** ≥12 testers opted-in for ≥14 continuous days before applying for
-      production. Recruit testers in parallel with everything else.
+- [ ] **Closed testing (≥12 testers, ≥14 days)** — this rule targets **personal** developer
+      accounts. An **organization** account is normally exempt; confirm in Console once the
+      account exists rather than assuming either way. If it does apply, it becomes the long pole.
 
 ## Technical — status
 
 - [x] **16 KB native libs** — verified: tor, matrix-rust-sdk, JNA, graphics.path all 16 KB-aligned.
-- [x] **App Bundle** — `./gradlew :app:bundleRelease` produces a valid signed `.aab`.
-- [x] **Foreground-service audit** — one service (`PpSyncService`, `dataSync`); no mic/cam FGS.
+- [x] **App Bundle** — `./gradlew :app:bundleRelease` produces a signed `.aab` (re-verified 2026-07-27, 68.7 MB at 0.1.46).
+- [x] **Foreground-service audit** — **two** now, both `dataSync`: `PpSyncService` (keeps Tor +
+      Matrix sync alive; no FCM is possible on a Tor-only app) and WorkManager's
+      `SystemForegroundService` (chunked/continuous backup uploads). Both must be justified in
+      the FGS declaration; Android 15 also caps `dataSync` at ~6h/day, which continuous sync
+      must tolerate.
 - [x] **64-bit** — ships `arm64-v8a` (+ `x86_64` for emulators).
-- [ ] **Upload key** — generate a dedicated secret key (see `apps/android/keystore.properties.example`),
-      point `keystore.properties` at it, enroll in **Play App Signing**. *(Currently the release
-      config signs with the debug cert — fine for sideloading, replace for Play.)*
-- [ ] **`targetSdk` 34 → 35** — Play's floor is Android 15 now (`compileSdk` is already 36). Bump
-      + test on-device (Android 15 turns on edge-to-edge + a ~6h `dataSync` FGS cap).
+- [x] **`targetSdk` 35** — done in 0.1.36; edge-to-edge handled (chat composer inset fix, 0.1.42).
+- [ ] **Upload key — DECIDE FIRST, it's a one-way door.** The release config signs with the
+      debug-derived cert `96a71aa6…` (alias `androiddebugkey`) that EVERY sideloaded build and
+      GitHub release has used. Two options:
+      - **Recommended:** upload that existing key to Play as the *app signing key*. Play-signed
+        and GitHub-sideloaded builds then have the same signature, so users can move between
+        them freely (Arnaud, jaimephone, testers).
+      - Generate a fresh upload key: cleaner hygiene, but Play builds and our GitHub APKs become
+        **mutually un-installable** — switching requires uninstall + re-pair. Don't do this
+        without deciding sideloading is going away.
 - [ ] (Optional) **R8/minify** — currently off; needs keep-rules for matrix-rust-sdk + JNA, tested.
+
+## NEW policy surface added since this list was written (0.1.39 → 0.1.46)
+
+- [ ] **Photo & video permissions declaration — highest new rejection risk.** Continuous backup
+      (feature G) added `READ_MEDIA_IMAGES` / `READ_MEDIA_VIDEO`, i.e. **broad** media access.
+      Google's default expectation is the Android Photo Picker, and broad access needs a written
+      justification in Console. Ours is genuine — the app must *detect new photos on its own* to
+      back them up continuously, which the picker cannot do — but it has to be argued, and it may
+      draw scrutiny. (The one-time "Back up files" path already uses the system picker.)
+- [ ] **Data-safety form needs redoing** — `DATA-SAFETY.md` predates Backup Sync. It must now
+      cover photos/videos and files. Key framing: they are uploaded **to the user's own box**,
+      end-to-end encrypted, never to us, and we operate no server — so "collected/shared" is
+      **no**, with the transfer explained.
+- [ ] **Pre-empt "self-updating app"** in the reviewer notes. The box-update feature (0.1.43+)
+      makes the app show an update for the **user's own server** and send an approval. The APK
+      never downloads or runs code — that stays entirely on the box. Say so explicitly; a
+      reviewer skimming "update available → install" could misread it as violating the
+      Device & Network Abuse policy.
 
 ## Store listing & policy
 
