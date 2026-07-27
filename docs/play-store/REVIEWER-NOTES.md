@@ -41,8 +41,15 @@ Notes for review:
 - All traffic is over Tor to the box above; first connection can be slow. If it stalls, tap
   "Try again" — a fresh Tor circuit usually connects.
 - USE_FULL_SCREEN_INTENT is used for the incoming-call screen (this is a calling app).
-- The dataSync foreground service keeps the Tor message connection alive (the app uses no
-  Google/FCM push).
+- Two dataSync foreground services are used: one keeps the Tor message connection alive (the
+  app cannot use Google/FCM push — it is Tor-only), the other runs backup uploads. Neither
+  uses the microphone or camera.
+- The app never downloads or executes code. See "Not a self-updating app" below.
+
+To see the Backup feature (optional):
+8. From the app home, open "Backup". Tap "Back up files", pick any file — it uploads to the
+   demo box over Tor and then appears in the list, where it can be downloaded again.
+   Large files are split into pieces and show progress as "part N of M".
 - No ads, no analytics, no data sent to the developer.
 ```
 
@@ -56,3 +63,37 @@ running until the review completes (and for each future update review).
   it uses full-screen intent for the incoming-call screen.
 - **Foreground service:** declare the `dataSync` service — keeps the Tor connection alive to
   deliver messages (the app has no FCM/Google push alternative).
+
+## Not a self-updating app (please read before flagging)
+
+Version 0.1.43+ shows a "Software update" card in **PP Config**. This updates the **user's own
+server** — the box — and **not this app**.
+
+- The APK never downloads, installs or executes any code. It has no updater for itself; app
+  updates come only from Google Play (or, for sideloaded builds, the user).
+- What the card does: the box checks for its own update over Tor, verifies a cryptographic
+  signature against a key compiled into the box software, and reports what it found. The phone
+  simply displays that and sends an "approve" message. All downloading and installing happens
+  on the user's own machine, never on the phone.
+- Where the box cannot update itself (it runs in Docker, or on an OS we do not publish a build
+  for), the app just shows the user a command to run on their own computer.
+
+This is a remote-administration UI for the user's own server, comparable to a router or NAS
+admin app, and involves no dynamic code loading in the app.
+
+## Why the app asks for photo access
+
+Broad photo/video access is requested **only** if the user turns on "Auto-back up photos &
+videos" in the Backup screen, and only at that moment — never at startup, and not for any
+other feature. It exists so the app can notice newly-taken photos and copy them to the user's
+own server; the system Photo Picker cannot detect new media, so it cannot implement automatic
+backup. Every other media flow in the app (chat attachments, profile photo, one-time backup,
+choosing a folder) uses the system picker. Full justification: `PHOTO-PERMISSIONS.md`.
+
+## What the app does NOT do
+
+- No advertising, analytics, tracking or crash-reporting SDKs of any kind.
+- No Google Play Services dependency; no Advertising ID.
+- No access to the device address book, location, or accounts.
+- No developer-operated server exists — the developer cannot receive user data even in
+  principle. Every byte goes to the box the user runs.

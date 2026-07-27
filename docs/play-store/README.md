@@ -6,6 +6,7 @@ the **Tournesol** organization. Docs in this folder:
 - [`PRIVACY-POLICY.md`](PRIVACY-POLICY.md) — the privacy policy (needs hosting at a public URL).
 - [`DATA-SAFETY.md`](DATA-SAFETY.md) — exact answers for the Play Console Data-safety form.
 - [`REVIEWER-NOTES.md`](REVIEWER-NOTES.md) — App-access instructions + demo box for reviewers.
+- [`PHOTO-PERMISSIONS.md`](PHOTO-PERMISSIONS.md) — justification for broad photo/video access.
 
 ## Account (longest lead time — start now)
 
@@ -40,17 +41,19 @@ the **Tournesol** organization. Docs in this folder:
 
 ## NEW policy surface added since this list was written (0.1.39 → 0.1.46)
 
-- [ ] **Photo & video permissions declaration — highest new rejection risk.** Continuous backup
+- [x] **Photo & video permissions declaration** — drafted in [`PHOTO-PERMISSIONS.md`](PHOTO-PERMISSIONS.md);
+      paste into Console. *Highest new rejection risk.* Continuous backup
       (feature G) added `READ_MEDIA_IMAGES` / `READ_MEDIA_VIDEO`, i.e. **broad** media access.
       Google's default expectation is the Android Photo Picker, and broad access needs a written
       justification in Console. Ours is genuine — the app must *detect new photos on its own* to
       back them up continuously, which the picker cannot do — but it has to be argued, and it may
       draw scrutiny. (The one-time "Back up files" path already uses the system picker.)
-- [ ] **Data-safety form needs redoing** — `DATA-SAFETY.md` predates Backup Sync. It must now
+- [x] **Data-safety answers updated for Backup Sync** — `DATA-SAFETY.md` now covers it.
+      *(Was: predates Backup Sync.)* It must now
       cover photos/videos and files. Key framing: they are uploaded **to the user's own box**,
       end-to-end encrypted, never to us, and we operate no server — so "collected/shared" is
       **no**, with the transfer explained.
-- [ ] **Pre-empt "self-updating app"** in the reviewer notes. The box-update feature (0.1.43+)
+- [x] **"Self-updating app" pre-empted** in `REVIEWER-NOTES.md`. The box-update feature (0.1.43+)
       makes the app show an update for the **user's own server** and send an approval. The APK
       never downloads or runs code — that stays entirely on the box. Say so explicitly; a
       reviewer skimming "update available → install" could misread it as violating the

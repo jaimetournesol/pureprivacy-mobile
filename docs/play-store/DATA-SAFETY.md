@@ -5,6 +5,14 @@ real behaviour: user data is **end-to-end encrypted**, travels **only over Tor**
 **only to the user's own box** — never to Tournesol or any third party. We (the developer)
 receive nothing.
 
+> **Backup Sync changes the scale, not the story (0.1.39–0.1.46).** The app can now copy a
+> user's photos, videos and chosen folders to their own box — including automatically, in the
+> background, as new photos are taken. That is still *user data leaving the device to the
+> user's own server*, E2EE, over Tor, with no developer server anywhere in the path. It does
+> **not** add a new Google data category (Photos/videos and Files/docs were already declared),
+> but the answers must describe backup as well as chat, and the free-text must say so plainly.
+> Reviewers who see broad photo access and only a chat description will (rightly) question it.
+>
 > **Disclosure stance.** Google defines "collected" as *data transmitted off the device*. The
 > app *does* transmit messages/media off the device (to the user's own box), so the safe,
 > non-removable answer is to **declare those data types as collected but NOT shared**, purpose
@@ -31,9 +39,9 @@ for tracking.
 | Data type (Google category) | Why it applies | Notes |
 |---|---|---|
 | **Messages → In-app messages** | The core feature — chats | E2EE; only to the user's box + paired peers |
-| **Photos and videos** | Sending images/video in chat | E2EE |
+| **Photos and videos** | (a) sending images/video in chat, (b) **Backup**: copying photos/videos to the user's own box, incl. automatic backup of new ones | E2EE; stored only on the user's box |
 | **Audio → Voice or sound recordings** | Voice notes + voice/video calls | Voice notes E2EE; call media relayed by the user's own box's SFU |
-| **Files and docs** | Sending files in chat | E2EE, 15 MB cap |
+| **Files and docs** | (a) sending files in chat, (b) **Backup**: copying files/folders to the user's own box | E2EE; large files are split into ≤16 MB pieces (0.1.46) |
 | **Personal info → User IDs** | The username you pick at sign-in | Authenticates you to your own box; not a real name |
 
 ## Do NOT declare (the app does not touch these)
@@ -47,8 +55,16 @@ for tracking.
 
 ## Free-text clarification (paste where allowed)
 
-> PurePrivacy is a self-hosted, Tor-only, end-to-end-encrypted messenger. All user data is
-> end-to-end encrypted and is transmitted only over the Tor network to a server ("box") that
-> the user themselves runs. The developer operates no servers and receives, stores, or shares
-> no user data. Data is deletable by uninstalling, by the in-app erase feature, or by resetting
-> the box.
+> PurePrivacy is a self-hosted, Tor-only, end-to-end-encrypted messenger and personal backup
+> app. All user data — messages, calls, and any photos, videos or files the user chooses to
+> back up — is end-to-end encrypted and transmitted only over the Tor network to a server
+> ("box") that the user themselves runs and controls. The developer operates no servers and
+> receives, stores, or shares no user data whatsoever; there is no analytics, advertising or
+> tracking SDK in the app.
+>
+> The optional Backup feature copies files the user selects, and (if the user switches it on)
+> new photos and videos, from the phone to that same self-hosted box. Nothing is uploaded
+> unless the user enables it, and the destination is always the user's own machine.
+>
+> Data is deletable by uninstalling the app, by the in-app erase feature, or by resetting the
+> box — which destroys the server-side copy.
