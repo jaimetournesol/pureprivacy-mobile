@@ -47,7 +47,8 @@ sell, share, or hand over, because we never receive it.
 ## No sharing with third parties
 
 We do not share your data with anyone, because we do not have it. The app does not integrate
-any third-party service that receives your data. All connections are to your own box, over Tor.
+any third-party service that receives your data. All connections are to your own box, over Tor
+— including the in-call interface, which your box serves itself (see above).
 
 ## Permissions and why the app asks for them
 
@@ -66,6 +67,10 @@ The app does **not** request location, contacts, SMS, or broad storage access.
 - Messages and media are **end-to-end encrypted**; only you and the people you pair with can
   read them.
 - All network traffic runs over **Tor** to onion addresses — there is no clearnet exposure.
+  Since app 0.1.47 / box 0.1.5 this includes the in-call interface, which your **own box**
+  serves. Earlier versions fetched that interface from a third party (`call.element.io`) —
+  over Tor, so your IP was never exposed, but it was a clearnet request to someone other than
+  your box. It no longer happens.
 - On-device secrets (session token, passcode hash) are encrypted with the **Android Keystore**.
 - The app supports a **duress passcode** that irreversibly erases all app data on your device,
   and (from PP Config) a **box reset** that wipes your box's identity — both are yours to use.

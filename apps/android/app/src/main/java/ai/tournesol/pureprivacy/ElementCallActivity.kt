@@ -94,7 +94,7 @@ class ElementCallActivity : ComponentActivity() {
     private val MATCH = FrameLayout.LayoutParams.MATCH_PARENT
 
     companion object {
-        const val EC_LOCAL = 11080   // -> call.element.io (Element Call app, over Tor)
+        const val EC_LOCAL = 11080   // -> the BOX's own Element Call bundle (onion:8444, over Tor)
         const val HS_LOCAL = 18009   // -> own homeserver client API (onion:8009)
         const val JWT_LOCAL = 18443  // -> own lk-jwt (onion:8443)
         const val SFU_LOCAL = 17443  // -> own LiveKit SFU (onion:7443, wss)
@@ -198,7 +198,10 @@ class ElementCallActivity : ComponentActivity() {
         // 127.0.0.1 — a secure, PRIVATE origin in Chromium. Then all its calls to
         // our other 127.0.0.1 bridges are private->private (no Private Network
         // Access block) and localhost is a secure context (getUserMedia works).
-        TorNet.startHttpProxy(EC_LOCAL, "https://call.element.io", TorManager.HTTP_PORT, ecRewrites, turnPatch + audioPatch)
+        // Feature J: the Element Call web app is served BY THE BOX (onion:8444), not fetched
+        // from call.element.io. A call now pulls nothing from the clearnet and contacts no
+        // third party — which is what our privacy policy has always claimed.
+        TorNet.startHttpProxy(EC_LOCAL, "https://$onion:8444", TorManager.HTTP_PORT, ecRewrites, turnPatch + audioPatch)
         TorNet.startHttpProxy(HS_LOCAL, "https://$onion:8009", TorManager.HTTP_PORT, ecRewrites)
         TorNet.startHttpProxy(JWT_LOCAL, "https://$onion:8443", TorManager.HTTP_PORT, ecRewrites)
         TorNet.startTlsForwarder(SFU_LOCAL, onion, 7443, TorManager.SOCKS_PORT)
@@ -214,8 +217,9 @@ class ElementCallActivity : ComponentActivity() {
         // NO global WebView proxy: a WebView proxy routes even 127.0.0.1 through Tor,
         // and Tor can't CONNECT to loopback (so the bridges were never hit). Instead
         // the WebView reaches our bridges directly on 127.0.0.1, and the bridges
-        // tunnel the box's onion services over Tor. The only clearnet load is the
-        // generic Element Call app bundle (call.element.io) — no peer/box metadata.
+        // tunnel the box's onion services over Tor. Since feature J every one of those
+        // targets — including the Element Call bundle itself — is the user's own box, so a
+        // call makes NO clearnet request at all.
 
         web = WebView(this).apply {
             settings.apply {
