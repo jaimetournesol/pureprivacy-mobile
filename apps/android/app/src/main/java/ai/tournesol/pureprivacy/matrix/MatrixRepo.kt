@@ -72,6 +72,13 @@ data class RoomSummary(
     val invited: Boolean = false,
     val paired: Boolean = false,
     val outgoing: Boolean = false,
+    /** This room's counterpart is an AI agent, not a person — it belongs to the Agents
+     *  app and MUST NOT appear in Messaging. Decided by the box-published agent registry
+     *  (see [MatrixRepo.AGENTS_TYPE]), never by guessing from the user id. */
+    val isAgent: Boolean = false,
+    /** Optional group this agent is filed under in the Agents app ("Work", "Home", …).
+     *  Null/blank means ungrouped. Only meaningful when [isAgent]. */
+    val agentGroup: String? = null,
     /** The contact's full @name:onion, when resolvable (heroes), for read-back. */
     val peerId: String? = null,
     /** Short preview of the latest event ("You: hi", "📎 file.pdf", "📞 Call"). */
@@ -158,6 +165,12 @@ object MatrixRepo {
     private const val UPDATE_PREFS_TYPE = "ai.tournesol.pureprivacy.update_prefs"
     private const val COMMAND_RESULT_TYPE = "ai.tournesol.pureprivacy.command_result"
     private const val BACKUP_TYPE = "ai.tournesol.pureprivacy.backup"
+    /** The box's agent registry: which Matrix users on this box are AI agents, and how
+     *  they're grouped. This is the ONLY thing that makes a room an agent room. We do not
+     *  infer it from the user id: a username is just a string a remote box can choose, so
+     *  a name-based rule could let a federated peer masquerade as (or hide) an AI. The
+     *  registry is our own account data, published by our own box — not spoofable. */
+    private const val AGENTS_TYPE = "ai.tournesol.pureprivacy.agents"
     // Auto-accepting a freshly-scanned contact's invite is a federated round-trip to
     // their box; the FIRST contact over a cold Tor circuit routinely fails. Retry the
     // join this many times (warming the circuit) before leaving it for the next cycle.
@@ -899,10 +912,14 @@ object MatrixRepo {
             // automatically the moment the first consent read succeeds.
             val consentReady = consent.lastReadMs != 0L
             val paired = peerIn && (peerOnion == null || !consentReady || peerOnion in consent)
+            // Agent rooms are decided by the registry, matched on the room's counterpart.
+            val agent = peerId(r)?.let { agents.value[it] }
             RoomSummary(
                 r.id(), roomName(r),
                 invited = mem == Membership.INVITED,
                 paired = paired,
+                isAgent = agent != null,
+                agentGroup = agent?.group?.ifBlank { null },
                 // I'm joined but the peer isn't (and they didn't invite me): I scanned
                 // them and I'm waiting for them to scan me back → a pending OUTGOING row.
                 // Excludes the box's @conduit Admin Room / stray empty rooms (no human
@@ -924,33 +941,49 @@ object MatrixRepo {
             if (s.paired && p != null) { val cur = canonical[p]; if (cur == null || s.id < cur) canonical[p] = s.id }
         }
         // Invites first (actionable), then pending outgoing, then most-recently-active.
-        rooms.value = all
+        val visible = all
             .filter { s -> val p = s.peerId; !s.paired || p == null || canonical[p] == s.id }
             .sortedWith(
                 compareByDescending<RoomSummary> { it.invited }
                     .thenByDescending { it.outgoing }
                     .thenByDescending { it.ts }
             )
-        Log.i(TAG, "rebuildRooms: ${rooms.value.size} rooms (" +
+        // THE human/AI split. Messaging shows people; the Agents app shows agents. This
+        // partition is the whole guarantee — if agent rooms ever leak back into `rooms`,
+        // an AI turns up in the chat list next to real contacts, which is exactly what the
+        // Agents app exists to prevent. Keep it as the last thing that touches the list.
+        val (agentSide, humanSide) = visible.partition { it.isAgent }
+        rooms.value = humanSide
+        agentRooms.value = agentSide.sortedWith(
+            compareByDescending<RoomSummary> { it.invited }.thenByDescending { it.ts }
+        )
+        Log.i(TAG, "rebuildRooms: ${rooms.value.size} chats (" +
             "${rooms.value.count { it.paired }} paired, ${rooms.value.count { it.invited }} invited, " +
-            "${rooms.value.count { it.outgoing }} pending-outgoing)")
+            "${rooms.value.count { it.outgoing }} pending-outgoing), " +
+            "${agentRooms.value.size} agent room(s) held out of Messaging")
     }
 
     /** Cheap refresh of just the chat-list previews + timestamps (and re-sort) from the
      *  cached latest events — no membership re-fetch. Keeps the list current when a new
      *  message arrives to a room that doesn't reorder. Preserves name/paired/invited. */
     private suspend fun refreshPreviews() {
-        val current = rooms.value
-        if (current.isEmpty()) return
         val handles = synchronized(roomHandles) { LinkedHashMap(roomHandles) }
-        var changed = false
-        val updated = current.map { rs ->
-            val r = handles[rs.id] ?: return@map rs
-            val (preview, ts) = latestPreview(r)
-            if (preview != rs.preview || ts != rs.ts) { changed = true; rs.copy(preview = preview, ts = ts) } else rs
+        // Refresh both lists. They're already partitioned, so this can't move a room
+        // across the human/AI boundary — it only updates preview text + timestamps.
+        suspend fun refresh(flow: MutableStateFlow<List<RoomSummary>>) {
+            val current = flow.value
+            if (current.isEmpty()) return
+            var changed = false
+            val updated = current.map { rs ->
+                val r = handles[rs.id] ?: return@map rs
+                val (preview, ts) = latestPreview(r)
+                if (preview != rs.preview || ts != rs.ts) { changed = true; rs.copy(preview = preview, ts = ts) } else rs
+            }
+            if (changed) flow.value =
+                updated.sortedWith(compareByDescending<RoomSummary> { it.invited }.thenByDescending { it.ts })
         }
-        if (changed) rooms.value =
-            updated.sortedWith(compareByDescending<RoomSummary> { it.invited }.thenByDescending { it.ts })
+        refresh(rooms)
+        refresh(agentRooms)
     }
 
     /** A short preview (text + timestamp ms) of a room's latest event, for the chat
@@ -2128,6 +2161,70 @@ object MatrixRepo {
         val pairedCount: Int,
         val updatedTs: Long,
     )
+
+    // --- Agents (the Agents app) ----------------------------------------------------------
+    // Agents are Hermes profiles, each with its own Matrix account on this box. The box
+    // publishes the roster to AGENTS_TYPE; the phone reads it to (a) keep agent rooms OUT
+    // of Messaging and (b) render + group them in the Agents app.
+
+    /** One AI agent on this box. [userId] is its full @agent:onion. */
+    data class AgentInfo(
+        val userId: String,
+        val displayName: String,
+        /** Group it's filed under ("Work", "Home", …); blank = ungrouped. */
+        val group: String = "",
+        /** One-line "what this agent is for", shown under its name. */
+        val description: String = "",
+    )
+
+    /** The agent roster, keyed by user id. Empty until the box publishes one — and an
+     *  empty roster means "no agents", which correctly leaves Messaging untouched. */
+    val agents = MutableStateFlow<Map<String, AgentInfo>>(emptyMap())
+
+    /** Agent rooms, split out of [rooms] so Messaging never renders them. */
+    val agentRooms = MutableStateFlow<List<RoomSummary>>(emptyList())
+
+    /**
+     * Read the box's agent registry.
+     *
+     * Shape (all fields but `user_id` optional):
+     * ```json
+     * {"agents":[{"user_id":"@hermes-research-ai:xyz.onion","display_name":"Research",
+     *             "group":"Work","description":"Digs through papers"}]}
+     * ```
+     */
+    suspend fun readAgents(): Map<String, AgentInfo> = runCatching {
+        val raw = client?.accountData(AGENTS_TYPE)
+        if (raw.isNullOrBlank()) return@runCatching emptyMap<String, AgentInfo>()
+        val arr = org.json.JSONObject(raw).optJSONArray("agents") ?: return@runCatching emptyMap()
+        val out = LinkedHashMap<String, AgentInfo>()
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            val uid = o.optString("user_id").trim()
+            if (uid.isEmpty()) continue
+            out[uid] = AgentInfo(
+                userId = uid,
+                // Fall back to the localpart so a registry entry with no display name
+                // still renders as something a human can read.
+                displayName = o.optString("display_name").ifBlank {
+                    uid.removePrefix("@").substringBefore(":")
+                },
+                group = o.optString("group").trim(),
+                description = o.optString("description").trim(),
+            )
+        }
+        out
+    }.getOrElse { emptyMap() }
+
+    /** Refresh the roster from account data. Safe to call often; cheap (local store read). */
+    suspend fun refreshAgents() {
+        val next = readAgents()
+        if (next != agents.value) {
+            agents.value = next
+            Log.i(TAG, "agents: roster now ${next.size} agent(s)")
+            rebuildRooms()   // re-split: a newly-registered agent must leave Messaging at once
+        }
+    }
 
     /** Read the box's published status (health, address, version, pairings). */
     suspend fun readBoxStatus(): BoxStatus? = runCatching {

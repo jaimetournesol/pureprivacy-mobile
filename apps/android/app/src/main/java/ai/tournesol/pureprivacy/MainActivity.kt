@@ -33,6 +33,7 @@ import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.CloudUpload
+import androidx.compose.material.icons.filled.SmartToy
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.RestartAlt
@@ -191,6 +192,7 @@ class MainActivity : ComponentActivity() {
                                 is Screen.Rooms -> RoomsScreen(vm)
                                 is Screen.Config -> ConfigScreen(vm)
                                 is Screen.Files -> FilesScreen(vm)
+                                is Screen.Agents -> AgentsScreen(vm)
                                 is Screen.Profile -> ProfileScreen(vm)
                                 is Screen.Paused -> PausedScreen(vm)
                                 is Screen.Chat -> ChatScreen(vm, s.roomId, s.roomName)
@@ -1795,7 +1797,10 @@ private fun HomeScreen(vm: AppViewModel) {
         Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
             AppTile(Modifier.weight(1f), "Backup", "Your files on your box",
                 Icons.Filled.CloudUpload, Sunflower, true) { vm.openFilesApp() }
-            Spacer(Modifier.weight(1f))
+            // Agents is its own app on purpose — never a tab inside Messaging, so it's
+            // always unambiguous whether the thing you're talking to is a person or an AI.
+            AppTile(Modifier.weight(1f), "Agents", "AI that runs on your box",
+                Icons.Filled.SmartToy, Sunflower, true) { vm.openAgents() }
         }
     }
 }
@@ -1822,6 +1827,97 @@ private fun AppTile(
         Spacer(Modifier.height(14.dp))
         Text(title, color = Paper, fontSize = 16.sp, fontWeight = FontWeight.Bold)
         Text(sub, color = PaperDim, fontSize = 12.sp)
+    }
+}
+
+/**
+ * Agents — the AI agents your box runs, grouped.
+ *
+ * A separate app from Messaging by design. Every agent here is an AI; every contact in
+ * Messaging is a person. Membership comes from the box's agent registry, so an agent can
+ * never drift into the chat list (and a contact can never be mistaken for an agent).
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun AgentsScreen(vm: AppViewModel) {
+    val groups by vm.agentGroups.collectAsState()
+    val loading by vm.agentsLoading.collectAsState()
+    BackHandler { vm.goHome() }
+
+    Scaffold(
+        containerColor = Ink,
+        topBar = {
+            TopAppBar(
+                title = { Text("Agents", color = Paper, fontWeight = FontWeight.Bold) },
+                navigationIcon = {
+                    IconButton(onClick = { vm.goHome() }) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, "back to apps", tint = Sunflower)
+                    }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = InkSoft),
+            )
+        },
+    ) { pad ->
+        if (groups.isEmpty()) {
+            Column(
+                Modifier.fillMaxSize().padding(pad).padding(horizontal = 24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Spacer(Modifier.height(96.dp))
+                Icon(Icons.Filled.SmartToy, null, tint = SunflowerDim, modifier = Modifier.size(48.dp))
+                Spacer(Modifier.height(16.dp))
+                Text(
+                    if (loading) "Looking for agents…" else "No agents yet",
+                    color = Paper, fontSize = 18.sp, fontWeight = FontWeight.Bold,
+                )
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "Agents run on your box, over Tor, like everything else. " +
+                        "Add one from PP Config on your box and it shows up here — " +
+                        "never in Messaging.",
+                    color = PaperDim, fontSize = 13.sp, textAlign = TextAlign.Center,
+                )
+            }
+            return@Scaffold
+        }
+        LazyColumn(
+            Modifier.fillMaxSize().padding(pad).padding(horizontal = 24.dp),
+            contentPadding = PaddingValues(top = 8.dp, bottom = 24.dp),
+        ) {
+            groups.forEach { (group, rows) ->
+                item(key = "hdr-$group") {
+                    Text(
+                        group.uppercase(),
+                        color = PaperDim, fontSize = 11.sp, fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(top = 18.dp, bottom = 8.dp),
+                    )
+                }
+                items(rows, key = { it.id }) { r -> AgentRow(r) { vm.openRoom(r.id, r.name) } }
+            }
+        }
+    }
+}
+
+/** One agent in the Agents list. Visually distinct from a chat row on purpose. */
+@Composable
+private fun AgentRow(r: RoomSummary, onClick: () -> Unit) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(vertical = 4.dp)
+            .clip(RoundedCornerShape(16.dp))
+            .background(InkCard)
+            .clickable(role = Role.Button, onClick = onClick)
+            .padding(16.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(Icons.Filled.SmartToy, null, tint = Sunflower, modifier = Modifier.size(26.dp))
+        Spacer(Modifier.width(14.dp))
+        Column(Modifier.weight(1f)) {
+            Text(r.name, color = Paper, fontSize = 15.sp, fontWeight = FontWeight.Bold, maxLines = 1)
+            val sub = r.preview ?: "AI agent on your box"
+            Text(sub, color = PaperDim, fontSize = 12.sp, maxLines = 1)
+        }
     }
 }
 

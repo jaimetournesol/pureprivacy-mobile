@@ -4,6 +4,7 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import ai.tournesol.pureprivacy.matrix.MatrixRepo
+import ai.tournesol.pureprivacy.matrix.RoomSummary
 import ai.tournesol.pureprivacy.security.PasscodeStore
 import ai.tournesol.pureprivacy.tor.TorManager
 import ai.tournesol.pureprivacy.util.mapError
@@ -11,6 +12,10 @@ import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
 sealed class Screen {
@@ -25,6 +30,10 @@ sealed class Screen {
     data object Config : Screen()
     /** Backup Sync — sync phone files to the box + browse/download (feature F). */
     data object Files : Screen()
+    /** Agents — the AI agents your box runs, grouped. Deliberately its OWN app, not a
+     *  section of Messaging: people must always know whether they're talking to a human
+     *  or an AI, and a shared list can't carry that guarantee. */
+    data object Agents : Screen()
     data object Profile : Screen()
     /** "Go dark": Tor + sync are torn down and the chat list is hidden behind a calm
      *  offline wall. A privacy control — nothing goes in or out until Resume. Survives
@@ -525,6 +534,37 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun openConfig() {
         error.value = null; screen.value = Screen.Config
         loadBoxStatus(); loadUpdateInfo()
+    }
+
+    // --- Agents app ---------------------------------------------------------------------
+    /** Agent rooms, already held out of [rooms] by the repo — never merge these back. */
+    val agentRooms = MatrixRepo.agentRooms
+    val agents = MatrixRepo.agents
+    val agentsLoading = MutableStateFlow(false)
+
+    /**
+     * Agent rooms bucketed by group, ready to render. Ungrouped agents collect under a
+     * trailing "Other" heading so nothing is silently dropped when the box publishes an
+     * agent with no group.
+     */
+    val agentGroups: StateFlow<List<Pair<String, List<RoomSummary>>>> =
+        agentRooms.map { list ->
+            val byGroup = list.groupBy { it.agentGroup?.takeIf { g -> g.isNotBlank() } }
+            val named = byGroup.filterKeys { it != null }
+                .map { (g, rs) -> g!! to rs }
+                .sortedBy { it.first.lowercase() }
+            val ungrouped = byGroup[null].orEmpty()
+            if (ungrouped.isEmpty()) named else named + ("Other" to ungrouped)
+        }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    fun openAgents() {
+        error.value = null
+        screen.value = Screen.Agents
+        viewModelScope.launch(Dispatchers.IO) {
+            agentsLoading.value = true
+            runCatching { MatrixRepo.refreshAgents() }
+            agentsLoading.value = false
+        }
     }
 
     // --- Backup Sync app (feature F) ----------------------------------------------------
