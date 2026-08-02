@@ -55,6 +55,16 @@ android {
     buildTypes {
         debug {
             isMinifyEnabled = false
+            // Install side-by-side with a released build instead of colliding with it.
+            // The release APK is signed with the durable key below; a debug APK carries
+            // the local debug key, so same-applicationId install fails with
+            // INSTALL_FAILED_UPDATE_INCOMPATIBLE and the only way through is to
+            // uninstall the real app — which destroys the user's Matrix session and
+            // E2EE keys. A distinct id keeps a dev build off that path entirely.
+            // Safe here: nothing hardcodes the package (no FileProvider authority,
+            // no ${'$'}{applicationId} placeholders).
+            applicationIdSuffix = ".debug"
+            versionNameSuffix = "-debug"
         }
         release {
             isMinifyEnabled = false
