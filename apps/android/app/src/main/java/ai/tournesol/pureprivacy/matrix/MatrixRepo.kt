@@ -2421,6 +2421,7 @@ object MatrixRepo {
         action: String,
         passphrase: String? = null,
         targetVersion: String? = null,
+        agentName: String? = null,
     ): String? = runCatching {
         val c = client ?: return@runCatching null
         val id = java.util.UUID.randomUUID().toString()
@@ -2431,6 +2432,9 @@ object MatrixRepo {
             .put("issued_ts", now)
             .put("expires_ts", now + 90_000L)
         if (!passphrase.isNullOrEmpty()) cmd.put("passphrase", passphrase)
+        // Naming an agent is what turns "set agents up" into "add another one". Absent =
+        // the first-run one-tap setup, which stays idempotent on a box that already has one.
+        if (!agentName.isNullOrBlank()) cmd.put("agent_name", agentName.trim())
         // Feature H: naming the version we're approving means an "update" command can't be
         // replayed later against a DIFFERENT release — the box rejects a mismatch.
         if (!targetVersion.isNullOrEmpty()) cmd.put("target_version", targetVersion)

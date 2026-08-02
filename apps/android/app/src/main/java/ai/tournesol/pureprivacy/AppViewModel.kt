@@ -681,18 +681,25 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * lands — a box that provisioned successfully but failed to publish an outcome should
      * not look like a failure.
      */
-    fun setUpAgents(webuiPassword: String? = null) {
+    fun setUpAgents(webuiPassword: String? = null, agentName: String? = null) {
         if (agentSetupBusy.value) return
         viewModelScope.launch(Dispatchers.IO) {
             agentSetupBusy.value = true
             agentSetupSucceeded.value = false
-            agentSetupNotice.value = "Asking your box to set up agents…"
+            agentSetupNotice.value = if (agentName.isNullOrBlank())
+                "Asking your box to set up agents…"
+            else
+                "Asking your box to add ${agentName.trim()}…"
             // The password rides the command channel, not account data — the box reads it and
             // clears the command immediately, exactly as it does for the backup passphrase.
             // Blank means "keep whatever the box has" (on a fresh install, the one the agent
             // container generates for itself).
             val id = runCatching {
-                MatrixRepo.sendBoxCommand("agent_setup", passphrase = webuiPassword?.takeIf { it.isNotBlank() })
+                MatrixRepo.sendBoxCommand(
+                    "agent_setup",
+                    passphrase = webuiPassword?.takeIf { it.isNotBlank() },
+                    agentName = agentName?.takeIf { it.isNotBlank() },
+                )
             }.getOrNull()
             if (id == null) {
                 agentSetupNotice.value = "Couldn't reach your box."

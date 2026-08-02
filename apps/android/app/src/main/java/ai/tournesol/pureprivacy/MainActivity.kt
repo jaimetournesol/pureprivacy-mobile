@@ -2018,6 +2018,49 @@ private fun AddAgentsScreen(vm: AppViewModel) {
     }
 }
 
+/** Name a new agent. The name becomes its display name AND — slugified by the box — its
+ *  Matrix localpart and Hermes profile name, so it has to survive both: the box rejects a
+ *  name with nothing alphanumeric in it, and reserves the first agent's own name. We only
+ *  do the cheap client-side checks here and let the box own the real rules, so the two can
+ *  never disagree about what is valid. */
+@Composable
+private fun AddAgentDialog(busy: Boolean, onDismiss: () -> Unit, onAdd: (String) -> Unit) {
+    var name by remember { mutableStateOf("") }
+    val trimmed = name.trim()
+    val usable = trimmed.any { it.isLetterOrDigit() }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = InkSoft,
+        title = { Text("Add an agent", color = Paper, fontWeight = FontWeight.Bold) },
+        text = {
+            Column {
+                Text(
+                    "It gets its own account, its own chat, and its own settings — so it " +
+                        "can run a different model from your other agents.",
+                    color = PaperDim, fontSize = 14.sp,
+                )
+                Spacer(Modifier.height(16.dp))
+                PpField(value = name, onChange = { name = it }, label = "Name")
+                if (trimmed.isNotEmpty() && !usable) {
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "Use at least one letter or number.",
+                        color = Sunflower, fontSize = 12.sp,
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { onAdd(trimmed) }, enabled = usable && !busy) {
+                Text("Add", color = if (usable && !busy) Sunflower else SunflowerDim)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel", color = PaperDim) }
+        },
+    )
+}
+
 /**
  * Agents — the AI agents your box runs, grouped.
  *
@@ -2034,7 +2077,14 @@ private fun AgentsScreen(vm: AppViewModel) {
     val setupNotice by vm.agentSetupNotice.collectAsState()
     val webui by vm.agentWebui.collectAsState()
     val ctx = LocalContext.current
+    var addOpen by remember { mutableStateOf(false) }
     BackHandler { vm.goHome() }
+
+    if (addOpen) AddAgentDialog(
+        busy = setupBusy,
+        onDismiss = { addOpen = false },
+        onAdd = { name -> addOpen = false; vm.setUpAgents(agentName = name) },
+    )
 
     Scaffold(
         containerColor = Ink,
@@ -2047,6 +2097,15 @@ private fun AgentsScreen(vm: AppViewModel) {
                     }
                 },
                 actions = {
+                    // Add another agent. Each one gets its own Matrix account and its own
+                    // Hermes profile, so it can run a different model — or a different
+                    // subscription — from the ones already here.
+                    IconButton(onClick = { addOpen = true }, enabled = !setupBusy) {
+                        Icon(
+                            Icons.Filled.AddCircle, "add an agent",
+                            tint = if (setupBusy) SunflowerDim else Sunflower,
+                        )
+                    }
                     // Change the Agent settings password. Lives here because once agents
                     // exist the "Add agents" tile is gone, and the password would otherwise
                     // be set-once — which is not a password, it's a fixed secret.
