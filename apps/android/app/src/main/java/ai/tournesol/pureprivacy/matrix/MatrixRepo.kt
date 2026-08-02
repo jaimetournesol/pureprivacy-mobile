@@ -2422,6 +2422,10 @@ object MatrixRepo {
         passphrase: String? = null,
         targetVersion: String? = null,
         agentName: String? = null,
+        provider: String? = null,
+        apiKey: String? = null,
+        baseUrl: String? = null,
+        model: String? = null,
     ): String? = runCatching {
         val c = client ?: return@runCatching null
         val id = java.util.UUID.randomUUID().toString()
@@ -2435,6 +2439,12 @@ object MatrixRepo {
         // Naming an agent is what turns "set agents up" into "add another one". Absent =
         // the first-run one-tap setup, which stays idempotent on a box that already has one.
         if (!agentName.isNullOrBlank()) cmd.put("agent_name", agentName.trim())
+        // The wizard's answers. api_key is secret and rides HERE, on the command channel the
+        // box clears the moment it reads it — never in the roster or any other account data.
+        if (!provider.isNullOrBlank()) cmd.put("provider", provider.trim())
+        if (!apiKey.isNullOrBlank()) cmd.put("api_key", apiKey.trim())
+        if (!baseUrl.isNullOrBlank()) cmd.put("base_url", baseUrl.trim())
+        if (!model.isNullOrBlank()) cmd.put("model", model.trim())
         // Feature H: naming the version we're approving means an "update" command can't be
         // replayed later against a DIFFERENT release — the box rejects a mismatch.
         if (!targetVersion.isNullOrEmpty()) cmd.put("target_version", targetVersion)

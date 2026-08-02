@@ -681,7 +681,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * lands — a box that provisioned successfully but failed to publish an outcome should
      * not look like a failure.
      */
-    fun setUpAgents(webuiPassword: String? = null, agentName: String? = null) {
+    fun setUpAgents(
+        webuiPassword: String? = null,
+        agentName: String? = null,
+        provider: String? = null,
+        apiKey: String? = null,
+        baseUrl: String? = null,
+        model: String? = null,
+    ) {
         if (agentSetupBusy.value) return
         viewModelScope.launch(Dispatchers.IO) {
             agentSetupBusy.value = true
@@ -699,6 +706,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     "agent_setup",
                     passphrase = webuiPassword?.takeIf { it.isNotBlank() },
                     agentName = agentName?.takeIf { it.isNotBlank() },
+                    provider = provider?.takeIf { it.isNotBlank() },
+                    apiKey = apiKey?.takeIf { it.isNotBlank() },
+                    baseUrl = baseUrl?.takeIf { it.isNotBlank() },
+                    model = model?.takeIf { it.isNotBlank() },
                 )
             }.getOrNull()
             if (id == null) {

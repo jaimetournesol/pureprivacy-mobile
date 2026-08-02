@@ -2018,56 +2018,160 @@ private fun AddAgentsScreen(vm: AppViewModel) {
     }
 }
 
-/** Name a new agent. The name becomes its display name AND — slugified by the box — its
- *  Matrix localpart and Hermes profile name, so it has to survive both: the box rejects a
- *  name with nothing alphanumeric in it, and reserves the first agent's own name. We only
- *  do the cheap client-side checks here and let the box own the real rules, so the two can
- *  never disagree about what is valid. */
+/** What an agent can run on. `id` is the provider name Hermes uses in `model.provider`.
+ *
+ *  `oauth` is the load-bearing distinction. An API-key provider can be finished here, on
+ *  the phone, with one text field. An OAuth one CANNOT: a Codex subscription is
+ *  `auth_type = "oauth_external"` in Hermes — it keeps its own OAuth session and there is
+ *  no key to type. So we create the agent, say so plainly, and point at Agent settings
+ *  rather than showing a field that cannot work. */
+private data class AgentProvider(
+    val id: String,
+    val label: String,
+    val hint: String,
+    val oauth: Boolean = false,
+    val needsBaseUrl: Boolean = false,
+)
+
+private val AGENT_PROVIDERS = listOf(
+    AgentProvider("", "Same as my other agents", "Copies the setup you already have."),
+    AgentProvider("openai-codex", "OpenAI Codex", "Your ChatGPT/Codex subscription.", oauth = true),
+    AgentProvider("openai-api", "OpenAI API", "Pay-as-you-go API key."),
+    AgentProvider("anthropic", "Anthropic", "Claude, with an API key."),
+    AgentProvider("openrouter", "OpenRouter", "One key, many models."),
+    AgentProvider("custom", "Custom endpoint", "Anything OpenAI-compatible.", needsBaseUrl = true),
+)
+
+/** Name a new agent, choose what it runs on, and hand over a key if that provider needs one.
+ *
+ *  Client-side validation stays deliberately thin — only "is there a letter or digit in the
+ *  name" — because the box owns the real rules (slugification, the reserved first-agent
+ *  name, duplicates). Duplicating them here is how the two drift into disagreeing. */
 @Composable
-private fun AddAgentDialog(busy: Boolean, onDismiss: () -> Unit, onAdd: (String) -> Unit) {
+private fun AddAgentDialog(
+    busy: Boolean,
+    onDismiss: () -> Unit,
+    onAdd: (name: String, provider: String, apiKey: String, baseUrl: String) -> Unit,
+) {
+    var step by remember { mutableStateOf(0) }
     var name by remember { mutableStateOf("") }
+    var provider by remember { mutableStateOf(AGENT_PROVIDERS.first()) }
+    var apiKey by remember { mutableStateOf("") }
+    var baseUrl by remember { mutableStateOf("") }
+
     val trimmed = name.trim()
-    val usable = trimmed.any { it.isLetterOrDigit() }
+    val nameOk = trimmed.any { it.isLetterOrDigit() }
+    // "Same as my other agents" and the OAuth providers both have nothing to type here, so
+    // the wizard is two steps for them and three for an API-key provider.
+    val needsCredentials = provider.id.isNotEmpty() && !provider.oauth
+    val credentialsOk = !needsCredentials ||
+        (apiKey.isNotBlank() && (!provider.needsBaseUrl || baseUrl.isNotBlank()))
+
+    fun finish() = onAdd(trimmed, provider.id, apiKey.trim(), baseUrl.trim())
+
     AlertDialog(
         onDismissRequest = onDismiss,
         containerColor = InkSoft,
-        title = { Text("Add an agent", color = Paper, fontWeight = FontWeight.Bold) },
+        title = {
+            Text(
+                when (step) {
+                    0 -> "Add an agent"
+                    1 -> "What should it run on?"
+                    else -> provider.label
+                },
+                color = Paper, fontWeight = FontWeight.Bold,
+            )
+        },
         text = {
-            Column {
-                Text(
-                    "It gets its own account, its own chat, and its own settings — so it " +
-                        "can run a different model from your other agents.",
-                    color = PaperDim, fontSize = 14.sp,
-                )
-                Spacer(Modifier.height(16.dp))
-                PpField(value = name, onChange = { name = it }, label = "Name")
-                if (trimmed.isNotEmpty() && !usable) {
-                    Spacer(Modifier.height(8.dp))
-                    Text(
-                        "Use at least one letter or number.",
-                        color = Sunflower, fontSize = 12.sp,
-                    )
+            Column(Modifier.verticalScroll(rememberScrollState())) {
+                when (step) {
+                    0 -> {
+                        Text(
+                            "It gets its own account, its own chat, and its own settings — " +
+                                "so it can run a different model from your other agents.",
+                            color = PaperDim, fontSize = 14.sp,
+                        )
+                        Spacer(Modifier.height(16.dp))
+                        PpField(value = name, onChange = { name = it }, label = "Name")
+                        if (trimmed.isNotEmpty() && !nameOk) {
+                            Spacer(Modifier.height(8.dp))
+                            Text("Use at least one letter or number.", color = Sunflower, fontSize = 12.sp)
+                        }
+                    }
+                    1 -> AGENT_PROVIDERS.forEach { p ->
+                        val on = p.id == provider.id
+                        Row(
+                            Modifier.fillMaxWidth()
+                                .clickable { provider = p }
+                                .padding(vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            RadioButton(selected = on, onClick = { provider = p })
+                            Spacer(Modifier.width(4.dp))
+                            Column {
+                                Text(p.label, color = Paper, fontSize = 15.sp)
+                                Text(p.hint, color = PaperDim, fontSize = 12.sp)
+                            }
+                        }
+                    }
+                    else -> if (provider.oauth) {
+                        // No field, on purpose — see AgentProvider.oauth.
+                        Text(
+                            "${provider.label} signs in through a browser, so there's no key " +
+                                "to type here.",
+                            color = Paper, fontSize = 14.sp,
+                        )
+                        Spacer(Modifier.height(12.dp))
+                        Text(
+                            "Your agent will be created now. To finish signing in, open " +
+                                "Agent settings, switch to the ${trimmed} profile, and sign " +
+                                "in there.",
+                            color = PaperDim, fontSize = 13.sp,
+                        )
+                    } else {
+                        if (provider.needsBaseUrl) {
+                            PpField(value = baseUrl, onChange = { baseUrl = it }, label = "Base URL")
+                            Spacer(Modifier.height(12.dp))
+                        }
+                        PpField(
+                            value = apiKey, onChange = { apiKey = it },
+                            label = "API key", password = true,
+                        )
+                        Spacer(Modifier.height(12.dp))
+                        Text(
+                            "The key goes straight to your box and is stored there, only " +
+                                "readable by this agent.",
+                            color = PaperDim, fontSize = 12.sp,
+                        )
+                    }
                 }
             }
         },
         confirmButton = {
-            TextButton(onClick = { onAdd(trimmed) }, enabled = usable && !busy) {
-                Text("Add", color = if (usable && !busy) Sunflower else SunflowerDim)
+            val last = step == 2 || (step == 1 && provider.id.isEmpty())
+            val ready = when (step) {
+                0 -> nameOk
+                1 -> true
+                else -> credentialsOk
+            }
+            TextButton(
+                onClick = { if (last) finish() else step++ },
+                enabled = ready && !busy,
+            ) {
+                Text(
+                    if (last) "Add" else "Next",
+                    color = if (ready && !busy) Sunflower else SunflowerDim,
+                )
             }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Cancel", color = PaperDim) }
+            TextButton(onClick = { if (step == 0) onDismiss() else step-- }) {
+                Text(if (step == 0) "Cancel" else "Back", color = PaperDim)
+            }
         },
     )
 }
 
-/**
- * Agents — the AI agents your box runs, grouped.
- *
- * A separate app from Messaging by design. Every agent here is an AI; every contact in
- * Messaging is a person. Membership comes from the box's agent registry, so an agent can
- * never drift into the chat list (and a contact can never be mistaken for an agent).
- */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun AgentsScreen(vm: AppViewModel) {
@@ -2083,7 +2187,13 @@ private fun AgentsScreen(vm: AppViewModel) {
     if (addOpen) AddAgentDialog(
         busy = setupBusy,
         onDismiss = { addOpen = false },
-        onAdd = { name -> addOpen = false; vm.setUpAgents(agentName = name) },
+        onAdd = { name, provider, apiKey, baseUrl ->
+            addOpen = false
+            vm.setUpAgents(
+                agentName = name, provider = provider,
+                apiKey = apiKey, baseUrl = baseUrl,
+            )
+        },
     )
 
     Scaffold(
