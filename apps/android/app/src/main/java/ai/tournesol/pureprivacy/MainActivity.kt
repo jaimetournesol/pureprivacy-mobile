@@ -1933,7 +1933,7 @@ private fun AgentsScreen(vm: AppViewModel) {
                     )
                 }
                 items(rows, key = { it.userId }) { r ->
-                    AgentRow(r) { r.roomId?.let { id -> vm.openRoom(id, r.name) } }
+                    AgentRow(r) { r.roomId?.let { id -> vm.openAgentRoom(id, r.name) } }
                 }
             }
         }

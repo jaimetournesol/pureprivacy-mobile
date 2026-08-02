@@ -1173,6 +1173,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** Open an agent's room, returning to Agents (not Messaging) when it's closed. */
+    fun openAgentRoom(id: String, name: String) {
+        chatReturn = Screen.Agents
+        openRoom(id, name)
+    }
+
     fun openRoom(id: String, name: String) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
@@ -1245,7 +1251,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun back() { MatrixRepo.currentRoomId = null; screen.value = Screen.Rooms }
+    /** Where leaving a chat returns to. A chat can be reached from Messaging OR from the
+     *  Agents app, and always returning to Messaging dumped you into the human chat list
+     *  after talking to an agent — which is doubly wrong here, since keeping those two
+     *  places distinct is the whole point of a separate Agents app. */
+    private var chatReturn: Screen = Screen.Rooms
+
+    fun back() {
+        MatrixRepo.currentRoomId = null
+        screen.value = chatReturn
+        chatReturn = Screen.Rooms
+    }
     fun clearError() { error.value = null }
 
     /** Open a room from a tapped notification — wait for login/sync if we were
