@@ -34,6 +34,7 @@ import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.CloudUpload
 import androidx.compose.material.icons.filled.SmartToy
+import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -1786,6 +1787,8 @@ private fun fmtDuration(ms: Long): String {
 /** The ecosystem home: a grid of apps shown after unlock. */
 @Composable
 private fun HomeScreen(vm: AppViewModel) {
+    val ctx = LocalContext.current
+    val webui by vm.agentWebui.collectAsState()
     Column(Modifier.fillMaxSize().background(Ink).systemBarsPadding().padding(horizontal = 24.dp)) {
         Spacer(Modifier.height(64.dp))
         Text("PurePrivacy", color = Paper, fontSize = 28.sp, fontWeight = FontWeight.Bold)
@@ -1805,6 +1808,17 @@ private fun HomeScreen(vm: AppViewModel) {
             // always unambiguous whether the thing you're talking to is a person or an AI.
             AppTile(Modifier.weight(1f), "Agents", "AI that runs on your box",
                 Icons.Filled.SmartToy, Sunflower, true) { vm.openAgents() }
+        }
+        Spacer(Modifier.height(16.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+            // Administering agents is a different act from talking to them, so it's a
+            // different app. Disabled until the box publishes the WebUI's address — which
+            // only happens once the agents add-on is actually installed.
+            AppTile(Modifier.weight(1f), "Agent settings", "Configure your agents",
+                Icons.Filled.Tune, Sunflower, webui != null) {
+                ctx.startActivity(Intent(ctx, AgentSettingsActivity::class.java))
+            }
+            Spacer(Modifier.weight(1f))
         }
     }
 }
@@ -1848,6 +1862,8 @@ private fun AgentsScreen(vm: AppViewModel) {
     val loading by vm.agentsLoading.collectAsState()
     val setupBusy by vm.agentSetupBusy.collectAsState()
     val setupNotice by vm.agentSetupNotice.collectAsState()
+    val webui by vm.agentWebui.collectAsState()
+    val ctx = LocalContext.current
     BackHandler { vm.goHome() }
 
     Scaffold(
@@ -1858,6 +1874,15 @@ private fun AgentsScreen(vm: AppViewModel) {
                 navigationIcon = {
                     IconButton(onClick = { vm.goHome() }) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, "back to apps", tint = Sunflower)
+                    }
+                },
+                actions = {
+                    // Shortcut to the same app as the home tile — you're most likely to want
+                    // to configure an agent while looking at the list of them.
+                    if (webui != null) {
+                        IconButton(onClick = {
+                            ctx.startActivity(Intent(ctx, AgentSettingsActivity::class.java))
+                        }) { Icon(Icons.Filled.Tune, "agent settings", tint = Sunflower) }
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = InkSoft),

@@ -65,6 +65,13 @@
             android:theme="@style/Theme.PurePrivacy" />
 
         <activity
+            android:name=".AgentSettingsActivity"
+            android:exported="false"
+            android:hardwareAccelerated="true"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:theme="@style/Theme.PurePrivacy" />
+
+        <activity
             android:name=".IncomingCallActivity"
             android:exported="false"
             android:launchMode="singleTask"

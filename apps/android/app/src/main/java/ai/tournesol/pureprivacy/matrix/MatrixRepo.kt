@@ -2198,6 +2198,18 @@ object MatrixRepo {
     val agentRooms = MutableStateFlow<List<RoomSummary>>(emptyList())
 
     /**
+     * How to reach the agent's control UI (Hermes WebUI), as published by the box.
+     *
+     * A SECOND hidden service, not the box's main onion: this UI can run shell commands,
+     * and the main address is known to every paired peer box. [password] is the WebUI's
+     * own login — the box hands it to the owner so the app can fill it in.
+     */
+    data class AgentWebui(val onion: String, val port: Int, val password: String)
+
+    /** Null until the box publishes an agent WebUI (i.e. until the add-on is installed). */
+    val agentWebui = MutableStateFlow<AgentWebui?>(null)
+
+    /**
      * Read the box's agent registry.
      *
      * Shape (all fields but `user_id` optional):
@@ -2210,7 +2222,17 @@ object MatrixRepo {
         val raw = client?.accountData(AGENTS_TYPE)
         Log.i(TAG, "agents: raw account-data ${if (raw == null) "NULL" else "${raw.length} chars"}")
         if (raw.isNullOrBlank()) return@runCatching emptyMap<String, AgentInfo>()
-        val arr = org.json.JSONObject(raw).optJSONArray("agents") ?: return@runCatching emptyMap()
+        val root = org.json.JSONObject(raw)
+        // Where the agent's control UI lives, alongside the roster because it's the same
+        // "what agents does this box run" answer. Its own onion, never the box's main one.
+        root.optString("webui_onion").trim().takeIf { it.isNotEmpty() }?.let { onion ->
+            agentWebui.value = AgentWebui(
+                onion = onion,
+                port = root.optInt("webui_port", 8788),
+                password = root.optString("webui_password").trim(),
+            )
+        }
+        val arr = root.optJSONArray("agents") ?: return@runCatching emptyMap()
         val out = LinkedHashMap<String, AgentInfo>()
         for (i in 0 until arr.length()) {
             val o = arr.optJSONObject(i) ?: continue

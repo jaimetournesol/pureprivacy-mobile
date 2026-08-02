@@ -542,6 +542,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     val agentRooms = MatrixRepo.agentRooms
     val agents = MatrixRepo.agents
     val agentsLoading = MutableStateFlow(false)
+    /** Where the agents' control UI lives; null until the add-on is installed. */
+    val agentWebui = MatrixRepo.agentWebui
 
     /** One row in the Agents app. [roomId] is null until the agent's room is live. */
     data class AgentRow(
