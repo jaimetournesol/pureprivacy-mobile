@@ -890,6 +890,10 @@ object MatrixRepo {
     /** Rebuild the chat list with accurate per-room state (incl. the bot-aware
      *  paired check). Runs in a coroutine; assigns `rooms` once when done. */
     private suspend fun rebuildRooms() {
+        // Refresh the roster FIRST, every time. The split below is only as correct as this
+        // map: previously it was loaded only when the Agents screen opened, so on every
+        // other path the roster was empty and agent rooms rendered in Messaging.
+        loadAgents()
         val handles = synchronized(roomHandles) { roomHandles.values.toList() }
         val all = handles.map { r ->
             val mem = runCatching { r.membership() }.getOrNull()
@@ -912,8 +916,12 @@ object MatrixRepo {
             // automatically the moment the first consent read succeeds.
             val consentReady = consent.lastReadMs != 0L
             val paired = peerIn && (peerOnion == null || !consentReady || peerOnion in consent)
-            // Agent rooms are decided by the registry, matched on the room's counterpart.
-            val agent = peerId(r)?.let { agents.value[it] }
+            // Agent rooms are decided by the registry — by room id first, then by the
+            // room's counterpart. Room id is the reliable half: a freshly provisioned agent
+            // is invited but not yet joined, so it isn't a hero and peer-id lookup misses,
+            // which would drop its room into Messaging next to real people.
+            val agent = agents.value.values.firstOrNull { it.roomId.isNotBlank() && it.roomId == r.id() }
+                ?: peerId(r)?.let { agents.value[it] }
             RoomSummary(
                 r.id(), roomName(r),
                 invited = mem == Membership.INVITED,
@@ -2175,6 +2183,11 @@ object MatrixRepo {
         val group: String = "",
         /** One-line "what this agent is for", shown under its name. */
         val description: String = "",
+        /** The agent's room, as published by the box. Matching on this is what makes the
+         *  split work before the agent has joined: an invited-but-not-yet-joined agent
+         *  isn't a room "hero", so peer-id matching alone misses it — and the room then
+         *  shows up in Messaging, which is precisely the leak we must not have. */
+        val roomId: String = "",
     )
 
     /** The agent roster, keyed by user id. Empty until the box publishes one — and an
@@ -2195,6 +2208,7 @@ object MatrixRepo {
      */
     suspend fun readAgents(): Map<String, AgentInfo> = runCatching {
         val raw = client?.accountData(AGENTS_TYPE)
+        Log.i(TAG, "agents: raw account-data ${if (raw == null) "NULL" else "${raw.length} chars"}")
         if (raw.isNullOrBlank()) return@runCatching emptyMap<String, AgentInfo>()
         val arr = org.json.JSONObject(raw).optJSONArray("agents") ?: return@runCatching emptyMap()
         val out = LinkedHashMap<String, AgentInfo>()
@@ -2211,19 +2225,61 @@ object MatrixRepo {
                 },
                 group = o.optString("group").trim(),
                 description = o.optString("description").trim(),
+                roomId = o.optString("room_id").trim(),
             )
         }
         out
     }.getOrElse { emptyMap() }
 
-    /** Refresh the roster from account data. Safe to call often; cheap (local store read). */
-    suspend fun refreshAgents() {
-        val next = readAgents()
-        if (next != agents.value) {
-            agents.value = next
-            Log.i(TAG, "agents: roster now ${next.size} agent(s)")
-            rebuildRooms()   // re-split: a newly-registered agent must leave Messaging at once
+    /**
+     * Known agent user ids, remembered across restarts.
+     *
+     * The human/AI split MUST fail closed. If the roster read comes back empty — a cold
+     * start before the first sync, a transient store miss — treating that as "no agents"
+     * silently moves every agent room into Messaging, next to real people. That is the one
+     * outcome this feature exists to prevent, so once a user id is known to be an agent it
+     * stays one until the box explicitly publishes a roster without it.
+     */
+    private val knownAgentIds = java.util.Collections.synchronizedSet(HashSet<String>())
+    private var agentPrefs: android.content.SharedPreferences? = null
+
+    fun initAgentMemory(ctx: android.content.Context) {
+        val p = ctx.getSharedPreferences("pp_agents", android.content.Context.MODE_PRIVATE)
+        agentPrefs = p
+        knownAgentIds.addAll(p.getStringSet("known", emptySet()).orEmpty())
+    }
+
+    /** Load the roster into [agents]. Pure read — never triggers a rebuild (it is called
+     *  FROM the rebuild, so recursing would be an infinite loop). */
+    private suspend fun loadAgents() {
+        val fresh = readAgents()
+        if (fresh.isNotEmpty()) {
+            // An authoritative roster is the source of truth: adopt it wholesale, including
+            // removals, and re-baseline what we remember.
+            knownAgentIds.clear()
+            knownAgentIds.addAll(fresh.keys)
+            agentPrefs?.edit()?.putStringSet("known", fresh.keys.toSet())?.apply()
+            if (fresh != agents.value) Log.i(TAG, "agents: roster now ${fresh.size} agent(s)")
+            agents.value = fresh
+        } else if (knownAgentIds.isNotEmpty()) {
+            // Empty read with agents previously known = almost certainly "not synced yet",
+            // not "the owner deleted every agent". Keep them classified as agents.
+            val remembered = knownAgentIds.associateWith { uid ->
+                agents.value[uid] ?: AgentInfo(uid, uid.removePrefix("@").substringBefore(":"))
+            }
+            if (remembered != agents.value) {
+                Log.i(TAG, "agents: roster unavailable — holding ${remembered.size} known agent(s)")
+                agents.value = remembered
+            }
         }
+    }
+
+    /** Refresh the roster and re-split the room lists. Used when the Agents app opens and
+     *  right after setup, so a newly-registered agent leaves Messaging immediately. */
+    suspend fun refreshAgents() {
+        val before = agents.value
+        loadAgents()
+        if (agents.value != before) rebuildRooms()
     }
 
     /** Read the box's published status (health, address, version, pairings). */
@@ -2802,6 +2858,12 @@ object MatrixRepo {
         if (raw.isNullOrBlank()) return@runCatching null
         val o = org.json.JSONObject(raw)
         if (o.optString("id") != id) return@runCatching null
+        // A long-running command (agent setup) publishes interim progress under the SAME
+        // key with done=false. Without this guard that blob reads as a finished command
+        // with no "ok" field — i.e. a failure — and a job that is merely still working
+        // reports as failed. Defaults to true, so commands that never set `done` (restart,
+        // backup, update) behave exactly as before.
+        if (!o.optBoolean("done", true)) return@runCatching null
         val ok = o.optBoolean("ok", false)
         CommandOutcome(ok, (if (ok) o.optString("message") else o.optString("error")).ifBlank { null })
     }.getOrNull()

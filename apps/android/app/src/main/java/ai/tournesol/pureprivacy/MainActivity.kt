@@ -1932,7 +1932,9 @@ private fun AgentsScreen(vm: AppViewModel) {
                         modifier = Modifier.padding(top = 18.dp, bottom = 8.dp),
                     )
                 }
-                items(rows, key = { it.id }) { r -> AgentRow(r) { vm.openRoom(r.id, r.name) } }
+                items(rows, key = { it.userId }) { r ->
+                    AgentRow(r) { r.roomId?.let { id -> vm.openRoom(id, r.name) } }
+                }
             }
         }
     }
@@ -1940,14 +1942,18 @@ private fun AgentsScreen(vm: AppViewModel) {
 
 /** One agent in the Agents list. Visually distinct from a chat row on purpose. */
 @Composable
-private fun AgentRow(r: RoomSummary, onClick: () -> Unit) {
+private fun AgentRow(r: AppViewModel.AgentRow, onClick: () -> Unit) {
+    val ready = r.roomId != null
     Row(
         Modifier
             .fillMaxWidth()
             .padding(vertical = 4.dp)
             .clip(RoundedCornerShape(16.dp))
             .background(InkCard)
-            .clickable(role = Role.Button, onClick = onClick)
+            // Not tappable until there's a room to open — an agent is listed as soon as the
+            // box registers it, which can be before its room exists.
+            .then(if (ready) Modifier.clickable(role = Role.Button, onClick = onClick) else Modifier)
+            .alpha(if (ready) 1f else 0.6f)
             .padding(16.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -1955,7 +1961,9 @@ private fun AgentRow(r: RoomSummary, onClick: () -> Unit) {
         Spacer(Modifier.width(14.dp))
         Column(Modifier.weight(1f)) {
             Text(r.name, color = Paper, fontSize = 15.sp, fontWeight = FontWeight.Bold, maxLines = 1)
-            val sub = r.preview ?: "AI agent on your box"
+            val sub = r.preview
+                ?: if (ready) r.description.ifBlank { "AI agent on your box" }
+                else "Starting up…"
             Text(sub, color = PaperDim, fontSize = 12.sp, maxLines = 1)
         }
     }

@@ -14,6 +14,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -542,14 +543,45 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     val agents = MatrixRepo.agents
     val agentsLoading = MutableStateFlow(false)
 
+    /** One row in the Agents app. [roomId] is null until the agent's room is live. */
+    data class AgentRow(
+        val userId: String,
+        val name: String,
+        val group: String,
+        val description: String,
+        val roomId: String?,
+        val preview: String?,
+    )
+
     /**
-     * Agent rooms bucketed by group, ready to render. Ungrouped agents collect under a
-     * trailing "Other" heading so nothing is silently dropped when the box publishes an
-     * agent with no group.
+     * Agents bucketed by group, ready to render.
+     *
+     * Driven by the REGISTRY, not by the room list. An agent exists the moment the box
+     * publishes it; its room may lag (it has to be created, invited to, and joined) and on
+     * a fresh setup it hasn't happened yet. Keying the UI off rooms meant a successfully
+     * provisioned agent rendered as "No agents yet", which reads as a failed setup. Rooms
+     * are joined in when present, so a row becomes tappable once there's somewhere to talk.
+     *
+     * Ungrouped agents collect under a trailing "Other" so nothing is silently dropped.
      */
-    val agentGroups: StateFlow<List<Pair<String, List<RoomSummary>>>> =
-        agentRooms.map { list ->
-            val byGroup = list.groupBy { it.agentGroup?.takeIf { g -> g.isNotBlank() } }
+    val agentGroups: StateFlow<List<Pair<String, List<AgentRow>>>> =
+        combine(agents, agentRooms) { roster, rooms ->
+            val byUser = rooms.associateBy { it.peerId }
+            val byId = rooms.associateBy { it.id }
+            val rows = roster.values.map { a ->
+                // Same precedence as the repo's split: room id is authoritative, peer id
+                // is the fallback for agents the box registered without a room.
+                val room = a.roomId.takeIf { it.isNotBlank() }?.let { byId[it] } ?: byUser[a.userId]
+                AgentRow(
+                    userId = a.userId,
+                    name = a.displayName,
+                    group = a.group,
+                    description = a.description,
+                    roomId = room?.id,
+                    preview = room?.preview,
+                )
+            }
+            val byGroup = rows.groupBy { it.group.takeIf { g -> g.isNotBlank() } }
             val named = byGroup.filterKeys { it != null }
                 .map { (g, rs) -> g!! to rs }
                 .sortedBy { it.first.lowercase() }

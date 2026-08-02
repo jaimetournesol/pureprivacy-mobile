@@ -7,6 +7,10 @@ import ai.tournesol.pureprivacy.matrix.MatrixRepo
 class PpApp : Application() {
     override fun onCreate() {
         super.onCreate()
+        // Load the remembered agent ids before ANY room list is built. The human/AI split
+        // consults them, and it has to fail closed: on a cold start the roster hasn't
+        // synced yet, and without this an agent room would render in Messaging until it did.
+        runCatching { MatrixRepo.initAgentMemory(this) }
         // [C4] Bring the sync service up on process start when there's a session to
         // restore — so it survives process death (a low-memory kill, or a cold restart to
         // deliver a notification/broadcast), not only the START_STICKY self-restart. The
