@@ -641,6 +641,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     val agentSetupNotice = MutableStateFlow<String?>(null)
     fun clearAgentSetupNotice() { agentSetupNotice.value = null }
 
+    /**
+     * One-shot: setup finished successfully, so hand the owner straight to Agent settings.
+     *
+     * Saving a password is a step in getting agents working, not an end in itself — leaving
+     * someone parked on the form they just submitted makes them guess what comes next. The
+     * screen consumes this and clears it, so a config change (or coming back later) doesn't
+     * re-fire it.
+     */
+    val agentSetupSucceeded = MutableStateFlow(false)
+    fun consumeAgentSetupSucceeded() { agentSetupSucceeded.value = false }
+
     /** Open "Add agents" — also the change-the-password screen once agents exist. */
     fun openAddAgents() {
         error.value = null
@@ -674,6 +685,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         if (agentSetupBusy.value) return
         viewModelScope.launch(Dispatchers.IO) {
             agentSetupBusy.value = true
+            agentSetupSucceeded.value = false
             agentSetupNotice.value = "Asking your box to set up agents…"
             // The password rides the command channel, not account data — the box reads it and
             // clears the command immediately, exactly as it does for the backup passphrase.
@@ -701,6 +713,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     agentSetupNotice.value = outcome.message?.takeIf { it.isNotBlank() }
                         ?: if (outcome.ok) "Agents are ready." else "Setup failed on your box."
                     settled = true
+                    if (outcome.ok) agentSetupSucceeded.value = true
                     break
                 }
                 // Roster showing up is success regardless of what the result key says.
@@ -708,6 +721,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 if (MatrixRepo.agents.value.isNotEmpty()) {
                     agentSetupNotice.value = "Agents are ready."
                     settled = true
+                    agentSetupSucceeded.value = true
                     break
                 }
             }

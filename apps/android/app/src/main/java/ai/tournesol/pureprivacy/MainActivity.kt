@@ -1878,9 +1878,31 @@ private fun AddAgentsScreen(vm: AppViewModel) {
     val installed by vm.agentsInstalled.collectAsState()
     val setupBusy by vm.agentSetupBusy.collectAsState()
     val setupNotice by vm.agentSetupNotice.collectAsState()
+    val succeeded by vm.agentSetupSucceeded.collectAsState()
+    val ctx = LocalContext.current
     var password by remember { mutableStateOf("") }
     var confirm by remember { mutableStateOf("") }
     BackHandler { vm.goHome() }
+
+    // Setup finished — carry on into Agent settings, which is where the remaining work lives
+    // (choosing a provider, a model). Stopping at "done" would leave the owner on the form
+    // they just submitted, guessing what comes next.
+    //
+    // The password goes with them: the box republishes the roster on its own schedule and the
+    // phone has to sync it, so for a moment the registry still holds the OLD one. We know the
+    // right password — nobody should be told "invalid password" for the password they just set.
+    LaunchedEffect(succeeded) {
+        if (!succeeded) return@LaunchedEffect
+        vm.consumeAgentSetupSucceeded()
+        vm.openAgents()
+        ctx.startActivity(
+            Intent(ctx, AgentSettingsActivity::class.java).apply {
+                if (password.isNotBlank()) {
+                    putExtra(AgentSettingsActivity.EXTRA_PASSWORD, password)
+                }
+            }
+        )
+    }
 
     // Mismatch is worth blocking on: you can't discover a typo later by "forgot password" —
     // there's no reset on a box only you can reach.
