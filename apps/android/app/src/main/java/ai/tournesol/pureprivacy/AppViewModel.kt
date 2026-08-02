@@ -35,6 +35,9 @@ sealed class Screen {
      *  section of Messaging: people must always know whether they're talking to a human
      *  or an AI, and a shared list can't carry that guarantee. */
     data object Agents : Screen()
+    /** Add agents — the only agent-shaped app you see before the add-on is set up, and
+     *  where the owner chooses the password for their agents' control UI. */
+    data object AddAgents : Screen()
     data object Profile : Screen()
     /** "Go dark": Tor + sync are torn down and the chat list is hidden behind a calm
      *  offline wall. A privacy control — nothing goes in or out until Resume. Survives
@@ -545,6 +548,47 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** Where the agents' control UI lives; null until the add-on is installed. */
     val agentWebui = MatrixRepo.agentWebui
 
+    /**
+     * Has this box got agents at all?
+     *
+     * Drives which tiles the home grid shows: before setup there is nothing to talk to and
+     * nothing to configure, so a single "Add agents" tile replaces both — two dead tiles
+     * would be two invitations to tap something that can't work yet.
+     *
+     * Either signal is sufficient. A roster means agents exist; a published WebUI means the
+     * add-on is running even if no agent has been provisioned yet. Requiring both would hide
+     * the apps from a half-finished install, which is precisely when you need to get back in.
+     */
+    val agentsInstalled: StateFlow<Boolean> =
+        combine(agents, agentWebui) { roster, webui -> roster.isNotEmpty() || webui != null }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
+
+    /**
+     * Take delivery of the agent onion's client-auth key as soon as the box publishes it.
+     *
+     * Tor reads its client-auth directory only at startup and we run it without a control
+     * port, so a key that arrives mid-session needs a bounce. Done HERE, when the key lands,
+     * rather than when the user opens Agent settings: the restart costs a Tor bootstrap, and
+     * paying it in the background beats paying it while someone waits on a blank WebView.
+     * It happens once — on the next cold start the key file is already in place and tor picks
+     * it up on its own.
+     */
+    private fun watchAgentAuthKey() = viewModelScope.launch(Dispatchers.IO) {
+        agentWebui.collect { w ->
+            val key = w?.authKey.orEmpty()
+            if (w == null || key.isBlank()) return@collect
+            val changed = runCatching {
+                TorManager.installClientAuth(getApplication(), w.onion, key)
+            }.getOrDefault(false)
+            if (changed) runCatching { TorManager.restart(getApplication()) }
+        }
+    }
+
+    // Started HERE, not in the class's main `init` block: Kotlin runs initializers in
+    // declaration order, and that block sits above `agentWebui`, so collecting it from there
+    // dereferences a field that hasn't been assigned yet.
+    init { watchAgentAuthKey() }
+
     /** One row in the Agents app. [roomId] is null until the agent's room is live. */
     data class AgentRow(
         val userId: String,
@@ -597,6 +641,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     val agentSetupNotice = MutableStateFlow<String?>(null)
     fun clearAgentSetupNotice() { agentSetupNotice.value = null }
 
+    /** Open "Add agents" — also the change-the-password screen once agents exist. */
+    fun openAddAgents() {
+        error.value = null
+        agentSetupNotice.value = null
+        screen.value = Screen.AddAgents
+    }
+
     fun openAgents() {
         error.value = null
         screen.value = Screen.Agents
@@ -619,12 +670,18 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * lands — a box that provisioned successfully but failed to publish an outcome should
      * not look like a failure.
      */
-    fun setUpAgents() {
+    fun setUpAgents(webuiPassword: String? = null) {
         if (agentSetupBusy.value) return
         viewModelScope.launch(Dispatchers.IO) {
             agentSetupBusy.value = true
             agentSetupNotice.value = "Asking your box to set up agents…"
-            val id = runCatching { MatrixRepo.sendBoxCommand("agent_setup") }.getOrNull()
+            // The password rides the command channel, not account data — the box reads it and
+            // clears the command immediately, exactly as it does for the backup passphrase.
+            // Blank means "keep whatever the box has" (on a fresh install, the one the agent
+            // container generates for itself).
+            val id = runCatching {
+                MatrixRepo.sendBoxCommand("agent_setup", passphrase = webuiPassword?.takeIf { it.isNotBlank() })
+            }.getOrNull()
             if (id == null) {
                 agentSetupNotice.value = "Couldn't reach your box."
                 agentSetupBusy.value = false

@@ -58,6 +58,7 @@ object TorManager {
                 AvoidDiskWrites 1
                 CookieAuthentication 0
                 ControlPort 0
+                ClientOnionAuthDir ${clientAuthDir(ctx).absolutePath}
                 Log notice stdout
                 """.trimIndent()
                 // [H8] Do NOT set "SafeLogging 0": Tor's default SafeLogging 1 scrubs
@@ -109,6 +110,42 @@ object TorManager {
         }
     }
 
+    /**
+     * Where tor looks for the private keys that unlock client-authorised onion services.
+     *
+     * Always declared in the torrc, even when empty — tor reads this directory once, at
+     * startup, and a directory that doesn't exist yet would mean the very first key we ever
+     * install couldn't take effect without also rewriting the config.
+     */
+    private fun clientAuthDir(ctx: Context): File =
+        File(File(ctx.filesDir, "tor"), "auth").apply { mkdirs() }
+
+    /**
+     * Install the private key for a client-authorised onion service (tor v3 client auth).
+     *
+     * This is how the phone proves it may even LOOK UP the agent WebUI's hidden service.
+     * Without the key tor cannot decrypt the service descriptor, so the address resolves to
+     * nothing — the gate sits below HTTP, in the Tor layer, and a stranger who somehow
+     * learned the onion address gets no service to attack.
+     *
+     * Returns true if tor needs restarting to pick this up (i.e. the key is new or changed).
+     * Tor only reads this directory at startup, and there's no control port to ask it
+     * politely, so a changed key means a bounce — hence the "did anything change?" answer
+     * rather than doing it unconditionally on every app start.
+     */
+    fun installClientAuth(ctx: Context, onion: String, privKeyBase32: String): Boolean {
+        val host = onion.removeSuffix(".onion")
+        if (host.isBlank() || privKeyBase32.isBlank()) return false
+        val f = File(clientAuthDir(ctx), "$host.auth_private")
+        val line = "$host:descriptor:x25519:$privKeyBase32"
+        if (f.exists() && runCatching { f.readText().trim() }.getOrNull() == line) return false
+        f.writeText(line)
+        // Owner-only: this key is the credential for an admin surface.
+        runCatching { f.setReadable(false, false); f.setReadable(true, true) }
+        Log.i(TAG, "installed client auth for an onion service — tor restart needed")
+        return true
+    }
+
     private fun findTorExecutable(ctx: Context): File? {
         val libDir = File(ctx.applicationInfo.nativeLibraryDir)
         // tor-android ships the executable as libtor.so
@@ -130,6 +167,19 @@ object TorManager {
         runCatching { process?.destroy() }
         process = null
         _state.value = State.Bootstrapping(0, "retrying")
+        start(ctx)
+    }
+
+    /**
+     * Restart tor unconditionally — including from Ready, which [retry] deliberately won't
+     * do. Needed when the client-auth directory changes: tor reads it only at startup, so a
+     * healthy tor that hasn't seen the new key is exactly the case we must interrupt.
+     */
+    suspend fun restart(ctx: Context) = withContext(Dispatchers.IO) {
+        Log.i(TAG, "Tor restart requested (client auth changed)")
+        runCatching { process?.destroy() }
+        process = null
+        _state.value = State.Bootstrapping(0, "restarting")
         start(ctx)
     }
 

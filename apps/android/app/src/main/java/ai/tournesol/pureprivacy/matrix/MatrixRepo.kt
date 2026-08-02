@@ -2204,7 +2204,14 @@ object MatrixRepo {
      * and the main address is known to every paired peer box. [password] is the WebUI's
      * own login — the box hands it to the owner so the app can fill it in.
      */
-    data class AgentWebui(val onion: String, val port: Int, val password: String)
+    data class AgentWebui(
+        val onion: String,
+        val port: Int,
+        val password: String,
+        /** Private half of the onion's tor v3 client-auth keypair. Without it tor can't even
+         *  resolve [onion] — so it travels with the address it unlocks. */
+        val authKey: String = "",
+    )
 
     /** Null until the box publishes an agent WebUI (i.e. until the add-on is installed). */
     val agentWebui = MutableStateFlow<AgentWebui?>(null)
@@ -2230,6 +2237,7 @@ object MatrixRepo {
                 onion = onion,
                 port = root.optInt("webui_port", 8788),
                 password = root.optString("webui_password").trim(),
+                authKey = root.optString("webui_auth_key").trim(),
             )
         }
         val arr = root.optJSONArray("agents") ?: return@runCatching emptyMap()

@@ -33,6 +33,7 @@ import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.CloudUpload
+import androidx.compose.material.icons.filled.AddCircle
 import androidx.compose.material.icons.filled.SmartToy
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material3.Button
@@ -198,6 +199,7 @@ class MainActivity : ComponentActivity() {
                                 is Screen.Config -> ConfigScreen(vm)
                                 is Screen.Files -> FilesScreen(vm)
                                 is Screen.Agents -> AgentsScreen(vm)
+                                is Screen.AddAgents -> AddAgentsScreen(vm)
                                 is Screen.Profile -> ProfileScreen(vm)
                                 is Screen.Paused -> PausedScreen(vm)
                                 is Screen.Chat -> ChatScreen(vm, s.roomId, s.roomName)
@@ -1789,6 +1791,7 @@ private fun fmtDuration(ms: Long): String {
 private fun HomeScreen(vm: AppViewModel) {
     val ctx = LocalContext.current
     val webui by vm.agentWebui.collectAsState()
+    val installed by vm.agentsInstalled.collectAsState()
     Column(Modifier.fillMaxSize().background(Ink).systemBarsPadding().padding(horizontal = 24.dp)) {
         Spacer(Modifier.height(64.dp))
         Text("PurePrivacy", color = Paper, fontSize = 28.sp, fontWeight = FontWeight.Bold)
@@ -1804,21 +1807,31 @@ private fun HomeScreen(vm: AppViewModel) {
         Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
             AppTile(Modifier.weight(1f), "Backup", "Your files on your box",
                 Icons.Filled.CloudUpload, Sunflower, true) { vm.openFilesApp() }
-            // Agents is its own app on purpose — never a tab inside Messaging, so it's
-            // always unambiguous whether the thing you're talking to is a person or an AI.
-            AppTile(Modifier.weight(1f), "Agents", "AI that runs on your box",
-                Icons.Filled.SmartToy, Sunflower, true) { vm.openAgents() }
-        }
-        Spacer(Modifier.height(16.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-            // Administering agents is a different act from talking to them, so it's a
-            // different app. Disabled until the box publishes the WebUI's address — which
-            // only happens once the agents add-on is actually installed.
-            AppTile(Modifier.weight(1f), "Agent settings", "Configure your agents",
-                Icons.Filled.Tune, Sunflower, webui != null) {
-                ctx.startActivity(Intent(ctx, AgentSettingsActivity::class.java))
+            // Before setup there is nothing to talk to and nothing to configure, so ONE
+            // "Add agents" tile stands in for both. Two greyed-out tiles would just be two
+            // invitations to tap something that can't work yet.
+            if (installed) {
+                // Agents is its own app on purpose — never a tab inside Messaging, so it's
+                // always unambiguous whether the thing you're talking to is a person or an AI.
+                AppTile(Modifier.weight(1f), "Agents", "AI that runs on your box",
+                    Icons.Filled.SmartToy, Sunflower, true) { vm.openAgents() }
+            } else {
+                AppTile(Modifier.weight(1f), "Add agents", "Set up AI on your box",
+                    Icons.Filled.AddCircle, Sunflower, true) { vm.openAddAgents() }
             }
-            Spacer(Modifier.weight(1f))
+        }
+        if (installed) {
+            Spacer(Modifier.height(16.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                // Administering agents is a different act from talking to them, so it's a
+                // different app. Still gated on the WebUI address: a box can have agents
+                // provisioned before it has published where their control UI lives.
+                AppTile(Modifier.weight(1f), "Agent settings", "Configure your agents",
+                    Icons.Filled.Tune, Sunflower, webui != null) {
+                    ctx.startActivity(Intent(ctx, AgentSettingsActivity::class.java))
+                }
+                Spacer(Modifier.weight(1f))
+            }
         }
     }
 }
@@ -1845,6 +1858,141 @@ private fun AppTile(
         Spacer(Modifier.height(14.dp))
         Text(title, color = Paper, fontSize = 16.sp, fontWeight = FontWeight.Bold)
         Text(sub, color = PaperDim, fontSize = 12.sp)
+    }
+}
+
+/**
+ * Add agents — the one agent-shaped app you see before the add-on is set up.
+ *
+ * Also the change-the-password screen afterwards, because it is the same act: the password
+ * is applied by re-running setup, which is idempotent on a box that already has agents.
+ *
+ * Why a password field at all. The agents' control UI can run shell commands, so it must
+ * never be reachable without auth. The container will generate a password if you don't
+ * choose one — that works, but it's a secret you've never seen, held only by your box. Most
+ * people would rather pick their own, and be able to change it.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun AddAgentsScreen(vm: AppViewModel) {
+    val installed by vm.agentsInstalled.collectAsState()
+    val setupBusy by vm.agentSetupBusy.collectAsState()
+    val setupNotice by vm.agentSetupNotice.collectAsState()
+    var password by remember { mutableStateOf("") }
+    var confirm by remember { mutableStateOf("") }
+    BackHandler { vm.goHome() }
+
+    // Mismatch is worth blocking on: you can't discover a typo later by "forgot password" —
+    // there's no reset on a box only you can reach.
+    val mismatch = confirm.isNotEmpty() && password != confirm
+    val tooShort = password.isNotEmpty() && password.length < 8
+    val canSubmit = !setupBusy && !mismatch && !tooShort && (password.isEmpty() || confirm.isNotEmpty())
+
+    Scaffold(
+        containerColor = Ink,
+        topBar = {
+            TopAppBar(
+                title = {
+                    Text(
+                        if (installed) "Agent password" else "Add agents",
+                        color = Paper, fontWeight = FontWeight.Bold,
+                    )
+                },
+                navigationIcon = {
+                    IconButton(onClick = { vm.goHome() }) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, "back to apps", tint = Sunflower)
+                    }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = InkSoft),
+            )
+        },
+    ) { pad ->
+        Column(
+            Modifier.fillMaxSize().padding(pad).padding(horizontal = 24.dp)
+                .verticalScroll(rememberScrollState()),
+        ) {
+            Spacer(Modifier.height(24.dp))
+            Icon(Icons.Filled.SmartToy, null, tint = SunflowerDim, modifier = Modifier.size(44.dp))
+            Spacer(Modifier.height(14.dp))
+            Text(
+                if (installed) "Change your agent password" else "Add agents to your box",
+                color = Paper, fontSize = 20.sp, fontWeight = FontWeight.Bold,
+            )
+            Spacer(Modifier.height(8.dp))
+            Text(
+                if (installed) {
+                    "This is the password for Agent settings — the control panel where your " +
+                        "agents are configured."
+                } else {
+                    "Your box runs the agents itself, over Tor, like everything else. Setup " +
+                        "happens on the box: nothing here needs a terminal."
+                },
+                color = PaperDim, fontSize = 13.sp,
+            )
+            Spacer(Modifier.height(22.dp))
+
+            PpField(password, { password = it }, "Agent settings password", password = true)
+            Spacer(Modifier.height(12.dp))
+            PpField(confirm, { confirm = it }, "Repeat password", password = true)
+            Spacer(Modifier.height(8.dp))
+            Text(
+                when {
+                    mismatch -> "The two passwords don't match."
+                    tooShort -> "Use at least 8 characters."
+                    password.isEmpty() && !installed ->
+                        "Leave blank and your box will generate a strong password for you — " +
+                            "the app fills it in, so you'll never have to type it."
+                    else ->
+                        "Your box keeps this password. It's only ever sent to your box, over Tor."
+                },
+                color = if (mismatch || tooShort) Danger else PaperDim,
+                fontSize = 12.sp,
+            )
+            Spacer(Modifier.height(22.dp))
+
+            // The whole setup happens ON THE BOX: it starts the agent runtime, provisions an
+            // agent account and publishes the roster.
+            Button(
+                onClick = { vm.setUpAgents(password) },
+                enabled = canSubmit,
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Sunflower, contentColor = Ink,
+                    disabledContainerColor = Outline, disabledContentColor = PaperDim,
+                ),
+            ) {
+                if (setupBusy) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(18.dp), strokeWidth = 2.dp, color = Ink,
+                    )
+                    Spacer(Modifier.width(10.dp))
+                    Text("Setting up…", fontWeight = FontWeight.Bold)
+                } else {
+                    Icon(
+                        if (installed) Icons.Filled.Lock else Icons.Filled.AddCircle,
+                        null, modifier = Modifier.size(18.dp),
+                    )
+                    Spacer(Modifier.width(10.dp))
+                    Text(
+                        if (installed) "Save password" else "Set up agents",
+                        fontWeight = FontWeight.Bold,
+                    )
+                }
+            }
+            if (setupBusy) {
+                Spacer(Modifier.height(10.dp))
+                Text(
+                    "This can take a few minutes the first time — your box downloads the " +
+                        "agent runtime over Tor. You can leave this screen.",
+                    color = PaperDim, fontSize = 12.sp,
+                )
+            }
+            setupNotice?.let {
+                Spacer(Modifier.height(14.dp))
+                Text(it, color = Sunflower, fontSize = 13.sp)
+            }
+            Spacer(Modifier.height(32.dp))
+        }
     }
 }
 
@@ -1877,6 +2025,12 @@ private fun AgentsScreen(vm: AppViewModel) {
                     }
                 },
                 actions = {
+                    // Change the Agent settings password. Lives here because once agents
+                    // exist the "Add agents" tile is gone, and the password would otherwise
+                    // be set-once — which is not a password, it's a fixed secret.
+                    IconButton(onClick = { vm.openAddAgents() }) {
+                        Icon(Icons.Filled.Lock, "change the agent password", tint = Sunflower)
+                    }
                     // Shortcut to the same app as the home tile — you're most likely to want
                     // to configure an agent while looking at the list of them.
                     if (webui != null) {
@@ -1908,10 +2062,11 @@ private fun AgentsScreen(vm: AppViewModel) {
                     color = PaperDim, fontSize = 13.sp, textAlign = TextAlign.Center,
                 )
                 Spacer(Modifier.height(24.dp))
-                // The whole setup happens ON THE BOX: it starts the agent runtime, provisions
-                // an agent account and publishes the roster. Nothing here needs a terminal.
+                // One way in, so setup always passes through the screen that asks for a
+                // password — a second, password-less path would silently produce agents whose
+                // control UI the owner can't get into.
                 Button(
-                    onClick = { vm.setUpAgents() },
+                    onClick = { vm.openAddAgents() },
                     enabled = !setupBusy,
                     modifier = Modifier.fillMaxWidth(),
                     colors = ButtonDefaults.buttonColors(
