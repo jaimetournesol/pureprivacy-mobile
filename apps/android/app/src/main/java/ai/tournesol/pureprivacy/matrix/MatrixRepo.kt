@@ -1313,6 +1313,21 @@ object MatrixRepo {
             }
         })
         runCatching { tl.paginateBackwards(50u.toUShort()) }
+        // [queue-unwedge] The SDK disables a room's send queue after an unrecoverable
+        // send error, and a disabled queue is SILENT: later messages sit on "sending…"
+        // forever as NotSentYet, never NotSent — so sendStateOf()'s auto-discard, which
+        // only fires on an observed SendingFailed, never runs. Observed live: two
+        // messages stuck for an hour with the room's last event unchanged, cleared only
+        // by force-stopping the app.
+        //
+        // Re-enabling is idempotent and cheap, but only do it when the flag is actually
+        // false so the log line means something when it appears.
+        runCatching {
+            if (!room.isSendQueueEnabled()) {
+                Log.w(TAG, "send queue was disabled for $roomId — re-enabling")
+                room.enableSendQueue(true)
+            }
+        }.onFailure { Log.w(TAG, "send-queue check failed for $roomId: ${it.message}") }
         maybeMarkRead()   // opening a room counts as reading it (if opted in)
         // [key-warmup] Opening a chat is the "about to converse" signal: pre-fetch the peer's
         // device keys now, in the background over Tor, so by the time the user types + sends
