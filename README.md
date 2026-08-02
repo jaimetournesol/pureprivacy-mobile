@@ -19,9 +19,14 @@ your apps. The phone is how you reach them:
 
 - **✅ Messaging + calls (working today)** — end-to-end encrypted chat and
   voice/video over Tor, box-to-box.
-- **🚧 Social, files, personal agents (planned)** — as your box gains apps, the
-  phone becomes the **launcher**: a home screen of everything your box runs, each
-  opening over the same onion + E2EE rails.
+- **✅ Agents (working today)** — AI agents running on your own box, each with its
+  own account and its own end-to-end encrypted chat. Add one with **+** in the
+  Agents app: name it, pick what it runs on, and the box provisions the rest.
+  Their control panel is its own app, reached over a second onion gated by tor v3
+  client authorisation.
+- **🚧 Social and files (planned)** — as your box gains apps, the phone becomes the
+  **launcher**: a home screen of everything your box runs, each opening over the
+  same onion + E2EE rails.
 
 > **Status: Phase-2 client, in development.** The Android client is real and working
 > (login, contacts, chat, and voice/video calls all run over Tor — see below). iOS
