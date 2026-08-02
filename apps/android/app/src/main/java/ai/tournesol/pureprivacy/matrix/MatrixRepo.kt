@@ -2813,4 +2813,20 @@ object MatrixRepo {
         if (o.optString("id") != id) return@runCatching null
         o.optBoolean("ok", false)
     }.getOrNull()
+
+    /**
+     * Interim progress for a long-running command, distinct from [readCommandOutcome],
+     * which only answers once the box has finished. Agent setup pulls an image and
+     * provisions an account — minutes, not the seconds a restart takes — so a box may
+     * publish `{id, done:false, message}` while it works. Returns null unless the box
+     * is explicitly reporting an unfinished job, so this can never be mistaken for a
+     * verdict on a command that has already completed.
+     */
+    suspend fun readCommandProgress(id: String): String? = runCatching {
+        val raw = client?.accountData(COMMAND_RESULT_TYPE) ?: return@runCatching null
+        val o = org.json.JSONObject(raw)
+        if (o.optString("id") != id) return@runCatching null
+        if (o.optBoolean("done", true)) return@runCatching null
+        o.optString("message").ifBlank { null }
+    }.getOrNull()
 }

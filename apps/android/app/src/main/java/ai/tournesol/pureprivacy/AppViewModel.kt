@@ -557,6 +557,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             if (ungrouped.isEmpty()) named else named + ("Other" to ungrouped)
         }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
+    /** True while the box is provisioning the agent runtime (minutes, not seconds). */
+    val agentSetupBusy = MutableStateFlow(false)
+    /** Human-readable progress / outcome of the last setup attempt. */
+    val agentSetupNotice = MutableStateFlow<String?>(null)
+    fun clearAgentSetupNotice() { agentSetupNotice.value = null }
+
     fun openAgents() {
         error.value = null
         screen.value = Screen.Agents
@@ -564,6 +570,62 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             agentsLoading.value = true
             runCatching { MatrixRepo.refreshAgents() }
             agentsLoading.value = false
+        }
+    }
+
+    /**
+     * One-tap setup of everything the agent runtime needs, done BY THE BOX: start the agent
+     * container, provision an agent's Matrix account, and publish the roster. Rides the same
+     * guarded command channel as restart / update-approve — the phone never touches Docker,
+     * it just asks and watches.
+     *
+     * Deliberately patient: this pulls an image and provisions an account over Tor, so it
+     * polls for up to ~10 minutes. The authoritative success signal is the ROSTER appearing
+     * (that's what the whole app keys off), so we accept that even if the result key never
+     * lands — a box that provisioned successfully but failed to publish an outcome should
+     * not look like a failure.
+     */
+    fun setUpAgents() {
+        if (agentSetupBusy.value) return
+        viewModelScope.launch(Dispatchers.IO) {
+            agentSetupBusy.value = true
+            agentSetupNotice.value = "Asking your box to set up agents…"
+            val id = runCatching { MatrixRepo.sendBoxCommand("agent_setup") }.getOrNull()
+            if (id == null) {
+                agentSetupNotice.value = "Couldn't reach your box."
+                agentSetupBusy.value = false
+                return@launch
+            }
+            var settled = false
+            // A `for` with `break`, not repeat{}: `return@repeat` would only skip the
+            // current iteration, so the poll would keep running after it had an answer.
+            for (attempt in 1..120) {           // 120 × 5s ≈ 10 minutes
+                kotlinx.coroutines.delay(5_000)
+                runCatching { MatrixRepo.readCommandProgress(id) }.getOrNull()
+                    ?.let { agentSetupNotice.value = it }
+                // Reuses the existing outcome reader (the update flow's), so the box's own
+                // wording — or its refusal — reaches the user verbatim.
+                val outcome = runCatching { MatrixRepo.readCommandOutcome(id) }.getOrNull()
+                if (outcome != null) {
+                    agentSetupNotice.value = outcome.message?.takeIf { it.isNotBlank() }
+                        ?: if (outcome.ok) "Agents are ready." else "Setup failed on your box."
+                    settled = true
+                    break
+                }
+                // Roster showing up is success regardless of what the result key says.
+                runCatching { MatrixRepo.refreshAgents() }
+                if (MatrixRepo.agents.value.isNotEmpty()) {
+                    agentSetupNotice.value = "Agents are ready."
+                    settled = true
+                    break
+                }
+            }
+            if (!settled) {
+                agentSetupNotice.value =
+                    "Still working — your box is taking a while. Check back shortly."
+            }
+            runCatching { MatrixRepo.refreshAgents() }
+            agentSetupBusy.value = false
         }
     }
 

@@ -34,6 +34,10 @@ import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.CloudUpload
 import androidx.compose.material.icons.filled.SmartToy
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.RestartAlt
@@ -1842,6 +1846,8 @@ private fun AppTile(
 private fun AgentsScreen(vm: AppViewModel) {
     val groups by vm.agentGroups.collectAsState()
     val loading by vm.agentsLoading.collectAsState()
+    val setupBusy by vm.agentSetupBusy.collectAsState()
+    val setupNotice by vm.agentSetupNotice.collectAsState()
     BackHandler { vm.goHome() }
 
     Scaffold(
@@ -1872,11 +1878,45 @@ private fun AgentsScreen(vm: AppViewModel) {
                 )
                 Spacer(Modifier.height(8.dp))
                 Text(
-                    "Agents run on your box, over Tor, like everything else. " +
-                        "Add one from PP Config on your box and it shows up here — " +
-                        "never in Messaging.",
+                    "Agents run on your box, over Tor, like everything else — and they stay " +
+                        "here, never in Messaging, so it's always clear who's a person.",
                     color = PaperDim, fontSize = 13.sp, textAlign = TextAlign.Center,
                 )
+                Spacer(Modifier.height(24.dp))
+                // The whole setup happens ON THE BOX: it starts the agent runtime, provisions
+                // an agent account and publishes the roster. Nothing here needs a terminal.
+                Button(
+                    onClick = { vm.setUpAgents() },
+                    enabled = !setupBusy,
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Sunflower, contentColor = Ink,
+                    ),
+                ) {
+                    if (setupBusy) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(18.dp), strokeWidth = 2.dp, color = Ink,
+                        )
+                        Spacer(Modifier.width(10.dp))
+                        Text("Setting up…", fontWeight = FontWeight.Bold)
+                    } else {
+                        Icon(Icons.Filled.SmartToy, null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(10.dp))
+                        Text("Set up agents", fontWeight = FontWeight.Bold)
+                    }
+                }
+                if (setupBusy) {
+                    Spacer(Modifier.height(10.dp))
+                    Text(
+                        "This can take a few minutes the first time — your box downloads " +
+                            "the agent runtime over Tor. You can leave this screen.",
+                        color = PaperDim, fontSize = 12.sp, textAlign = TextAlign.Center,
+                    )
+                }
+                setupNotice?.let {
+                    Spacer(Modifier.height(14.dp))
+                    Text(it, color = Sunflower, fontSize = 13.sp, textAlign = TextAlign.Center)
+                }
             }
             return@Scaffold
         }
