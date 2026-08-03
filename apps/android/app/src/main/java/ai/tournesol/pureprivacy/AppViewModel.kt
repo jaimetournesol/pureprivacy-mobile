@@ -58,6 +58,20 @@ enum class Gate {
 }
 
 class AppViewModel(app: Application) : AndroidViewModel(app) {
+    companion object {
+        /** The picker exemption is PROCESS-level state, because the thing it defends against is
+         *  process-level: [ProcessLifecycleOwner] fires for the whole app, and the observer that
+         *  arms the auto-lock lives on MainActivity's view-model. Activities outside that scope
+         *  (AgentSettingsActivity, which launches a chooser on the agent WebUI's behalf) get a
+         *  DIFFERENT view-model instance, so an instance field there would set a flag nobody
+         *  reads and the app would re-lock over their picker. Held here so every launcher in the
+         *  process, whatever its scope, suppresses the same lock. */
+        @Volatile private var pickerExemption = false
+
+        /** Call immediately before launching a cross-process SAF picker from anywhere in the app. */
+        fun beginExternalPick() { pickerExemption = true }
+    }
+
     val torState = TorManager.state
     val rooms = MatrixRepo.rooms
     val messages = MatrixRepo.messages
@@ -88,7 +102,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      *  flag tells the next foreground pass "you came back from your own picker, don't re-lock",
      *  mirroring how same-process sub-activities (the call UI, the QR scanner) are already exempt.
      *  Consumed in [onEnterForeground]. */
-    @Volatile private var returningFromPicker = false
+    private var returningFromPicker: Boolean
+        get() = pickerExemption
+        set(v) { pickerExemption = v }
     /** Call immediately before launching a cross-process SAF picker. See [returningFromPicker]. */
     fun beginExternalPick() { returningFromPicker = true }
 

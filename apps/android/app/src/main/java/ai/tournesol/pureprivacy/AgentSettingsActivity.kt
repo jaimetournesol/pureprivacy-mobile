@@ -69,6 +69,27 @@ class AgentSettingsActivity : ComponentActivity() {
     private var loadAttempts = 0
     private val maxLoadAttempts = 6
 
+    /**
+     * Pending `<input type="file">` callback for the WebUI's attach button.
+     *
+     * A WebView does NOT open a file chooser on its own: without a [android.webkit.WebChromeClient]
+     * that handles `onShowFileChooser`, tapping a file input does nothing at all — no picker, no
+     * error, no log. That is exactly what attach did here. The callback must be answered exactly
+     * once (with the URIs, or `null` if the user backs out), or the input stays wedged and every
+     * later tap is ignored too.
+     */
+    private var pendingFileCallback: android.webkit.ValueCallback<Array<android.net.Uri>>? = null
+
+    private val fileChooser = registerForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        val cb = pendingFileCallback
+        pendingFileCallback = null
+        cb?.onReceiveValue(
+            android.webkit.WebChromeClient.FileChooserParams.parseResult(result.resultCode, result.data)
+        )
+    }
+
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -104,6 +125,7 @@ class AgentSettingsActivity : ComponentActivity() {
             FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
         root.addView(buildOverlay())
         setContentView(root)
+        insetForSystemBars(root)
 
         with(web.settings) {
             javaScriptEnabled = true
@@ -113,6 +135,34 @@ class AgentSettingsActivity : ComponentActivity() {
             mediaPlaybackRequiresUserGesture = true
         }
         WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG)
+
+        // Attach. The upload itself never leaves the onion: the file is read by the WebView and
+        // POSTed to 127.0.0.1, which is the Tor bridge to the box. The clearnet guard below is
+        // untouched — a picked file cannot become an off-Tor request.
+        web.webChromeClient = object : android.webkit.WebChromeClient() {
+            override fun onShowFileChooser(
+                v: WebView?,
+                callback: android.webkit.ValueCallback<Array<android.net.Uri>>?,
+                params: FileChooserParams?,
+            ): Boolean {
+                // A second chooser would orphan the first callback; answer it before replacing.
+                pendingFileCallback?.onReceiveValue(null)
+                pendingFileCallback = callback
+                return try {
+                    // The picker is DocumentsUI — a different process, so the app "backgrounds"
+                    // and the passcode auto-lock would fire and tear down this activity before
+                    // the file arrived. Same exemption the in-app pickers take.
+                    AppViewModel.beginExternalPick()
+                    fileChooser.launch(params!!.createIntent())
+                    true
+                } catch (e: Exception) {
+                    Log.w(TAG, "no file picker available: ${e.message}")
+                    pendingFileCallback = null
+                    callback?.onReceiveValue(null)
+                    false
+                }
+            }
+        }
 
         web.webViewClient = object : WebViewClient() {
             /**
@@ -149,6 +199,35 @@ class AgentSettingsActivity : ComponentActivity() {
         }
 
         web.loadUrl("http://127.0.0.1:$AGENT_LOCAL/")
+    }
+
+    /**
+     * Keep the WebUI out from under the status bar and the navigation bar.
+     *
+     * targetSdk 35+ makes every window edge-to-edge, and this activity is a bare WebView in a
+     * FrameLayout — nothing insets it. The Hermes WebUI puts its composer toolbar flush with
+     * the bottom of the viewport, so the system nav bar landed directly on top of it: the
+     * three-button bar covered the row, and the leftmost control (attach) sat *under* the
+     * back/home/recents strip, so tapping it hit the nav bar instead of the button. The bug
+     * reads as two separate faults ("the buttons overlap" and "attach doesn't work") but it
+     * is one.
+     *
+     * Padding the root rather than the WebView (or injecting CSS) keeps this independent of
+     * the upstream UI's markup, which we don't control. `ime()` is unioned in so the composer
+     * rides above the keyboard instead of behind it — in edge-to-edge nothing resizes for the
+     * IME on our behalf. The root is painted in the WebUI's own chrome colour so the inset
+     * bands read as part of the page rather than as letterboxing.
+     */
+    private fun insetForSystemBars(root: View) {
+        root.setBackgroundColor(0xFF141425.toInt())   // Hermes WebUI chrome
+        androidx.core.view.ViewCompat.setOnApplyWindowInsetsListener(root) { v, insets ->
+            val bars = insets.getInsets(
+                androidx.core.view.WindowInsetsCompat.Type.systemBars() or
+                    androidx.core.view.WindowInsetsCompat.Type.ime()
+            )
+            v.setPadding(bars.left, bars.top, bars.right, bars.bottom)
+            androidx.core.view.WindowInsetsCompat.CONSUMED
+        }
     }
 
     /**
@@ -230,6 +309,9 @@ class AgentSettingsActivity : ComponentActivity() {
         // Leave the Tor forwarder alone: TorNet keys listeners by port and reuses them, and
         // a call may be running on its own bridges. It's torn down with the rest by
         // TorNet.stopAll() on sign-out.
+        // Never leave a file-input callback unanswered — Chromium holds the native side open.
+        pendingFileCallback?.onReceiveValue(null)
+        pendingFileCallback = null
         runCatching { web.destroy() }
         super.onDestroy()
     }
