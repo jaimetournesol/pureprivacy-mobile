@@ -13,6 +13,20 @@ plugins {
 // the same cert every existing install + past release was signed with, so release APKs update
 // in place. Absent (fresh clone / CI without the secret) -> release stays unsigned; debug
 // builds are unaffected, so the repo still compiles for anyone.
+//
+// The key was generated with keytool's default identity, so it carries alias `androiddebugkey`
+// and DN `C=US, O=Android, CN=Android Debug`. That name is cosmetic and MISLEADING: it is a
+// distinct durable key, not this or any machine's ~/.android/debug.keystore. Verify by
+// FINGERPRINT, never by DN — a correctly signed release APK reports
+//   Signer #1 certificate SHA-256 digest: 96a71aa672046c0153134accc8ff3039d3bd27fbfadf8a407ba30289716de357
+// (apksigner verify --print-certs -v). Every release from 0.1.44 on carries it. Reading the DN
+// alone once caused a good build to be wrongly held back as "debug-signed".
+//
+// Consequence to know before any Play submission: Play REJECTS uploads whose cert bears the
+// Android Debug DN, so this key can never be the upload key. Do not try to fix that by
+// re-issuing this cert — a new cert is a new identity and breaks in-place upgrades for every
+// existing install. Generate a separate upload key instead (see keystore.properties.example)
+// and let Play App Signing hold the real one.
 val keystorePropsFile = rootProject.file("keystore.properties")
 val keystoreProps = Properties().apply {
     if (keystorePropsFile.exists()) FileInputStream(keystorePropsFile).use { load(it) }
