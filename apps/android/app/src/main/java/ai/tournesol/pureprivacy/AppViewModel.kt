@@ -768,6 +768,78 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    // --- Device-code sign-in (Codex) -----------------------------------------------------
+    //
+    // Some providers can't be finished with a key typed here: Codex signs in through the
+    // owner's ChatGPT account. The box runs the blocking half and relays a short code; this
+    // holds the state the wizard renders while that happens.
+    //
+    // Kept OFF agentSetupBusy/Notice on purpose, unlike removeAgent: this one runs INSIDE the
+    // add-agent dialog and has to coexist with it, so sharing that state would have the
+    // wizard's own status line fighting the sign-in's.
+
+    /** Where a device-code sign-in has got to. `challenge` is what the owner has to act on. */
+    data class AuthFlow(
+        val provider: String,
+        val status: String,
+        val challenge: MatrixRepo.AuthChallenge? = null,
+        val done: Boolean = false,
+        val ok: Boolean = false,
+    )
+
+    val authFlow = MutableStateFlow<AuthFlow?>(null)
+    fun clearAuthFlow() { authFlow.value = null }
+
+    /** Begin a device-code sign-in for [provider] and follow it to a verdict.
+     *
+     *  Polls rather than waits: the box publishes the code the moment the provider prints it,
+     *  and the owner cannot start typing until they can see it. */
+    fun startAgentAuth(provider: String) {
+        if (authFlow.value?.done == false) return   // one at a time; a second would race the slot
+        viewModelScope.launch(Dispatchers.IO) {
+            authFlow.value = AuthFlow(provider, "Asking your box to start the sign-in…")
+            val id = runCatching {
+                MatrixRepo.sendBoxCommand("agent_auth", provider = provider)
+            }.getOrNull()
+            if (id == null) {
+                authFlow.value = AuthFlow(provider, "Couldn't reach your box.", done = true)
+                return@launch
+            }
+            var settled = false
+            // 16 minutes: the provider's code expires around 15, and the box gives up at 16
+            // and writes a verdict — so this outlasts the box rather than abandoning a flow
+            // that is about to answer.
+            for (attempt in 1..192) {              // 192 × 5s ≈ 16 minutes
+                kotlinx.coroutines.delay(5_000)
+                val outcome = runCatching { MatrixRepo.readCommandOutcome(id) }.getOrNull()
+                if (outcome != null) {
+                    authFlow.value = AuthFlow(
+                        provider,
+                        outcome.message?.takeIf { it.isNotBlank() }
+                            ?: if (outcome.ok) "Signed in." else "Sign-in didn't complete.",
+                        done = true, ok = outcome.ok,
+                    )
+                    settled = true
+                    break
+                }
+                val challenge = runCatching { MatrixRepo.readAuthChallenge(id) }.getOrNull()
+                val note = runCatching { MatrixRepo.readCommandProgress(id) }.getOrNull()
+                // Keep the last known code: progress messages keep arriving after it, and
+                // dropping it would make the code the owner is mid-way through typing vanish.
+                authFlow.value = AuthFlow(
+                    provider,
+                    note ?: authFlow.value?.status.orEmpty(),
+                    challenge ?: authFlow.value?.challenge,
+                )
+            }
+            if (!settled) {
+                authFlow.value = AuthFlow(
+                    provider, "The sign-in timed out. You can try again.", done = true,
+                )
+            }
+        }
+    }
+
     /** Ask the box to remove an agent: clear its chat, retire its account, forget its profile.
      *
      *  Reuses the agent-setup busy/notice state so the Agents screen shows one status line

@@ -2024,14 +2024,23 @@ private fun AddAgentsScreen(vm: AppViewModel) {
  *  `oauth` is the load-bearing distinction. An API-key provider can be finished here, on
  *  the phone, with one text field. An OAuth one CANNOT: a Codex subscription is
  *  `auth_type = "oauth_external"` in Hermes — it keeps its own OAuth session and there is
- *  no key to type. So we create the agent, say so plainly, and point at Agent settings
- *  rather than showing a field that cannot work. */
+ *  no key to type.
+ *
+ *  `deviceCode` narrows that further. A device-code provider prints a short code and waits,
+ *  which IS completable from a phone — the box runs the blocking half and relays the code, and
+ *  the owner types it into the browser they already have. Anything else OAuth still ends at
+ *  "finish this in Agent settings".
+ *
+ *  Set `deviceCode` only for a provider whose flow has actually been observed to print a code.
+ *  A provider that instead pops a local browser would leave the wizard waiting out the full
+ *  timeout on a code that is never coming. Verified so far: openai-codex. */
 private data class AgentProvider(
     val id: String,
     val label: String,
     val hint: String,
     val oauth: Boolean = false,
     val needsBaseUrl: Boolean = false,
+    val deviceCode: Boolean = false,
 )
 
 // GENERATED from Hermes's own provider catalog — do not hand-edit.
@@ -2046,7 +2055,7 @@ private val AGENT_PROVIDERS = listOf(
     AgentProvider("novita", "NovitaAI", "AI-native cloud for builders and agents"),
     AgentProvider("lmstudio", "LM Studio", "Local desktop app with built-in model server", needsBaseUrl = true),
     AgentProvider("anthropic", "Anthropic", "Claude models via API key or Claude Code"),
-    AgentProvider("openai-codex", "OpenAI Codex", "Codex CLI via ChatGPT subscription or API key", oauth = true),
+    AgentProvider("openai-codex", "OpenAI Codex", "Codex CLI via ChatGPT subscription or API key", oauth = true, deviceCode = true),
     AgentProvider("openai-api", "OpenAI API", "api.openai.com, API key"),
     AgentProvider("alibaba", "Qwen Cloud", "Qwen Cloud / DashScope (Qwen + multi-provider)"),
     AgentProvider("xai-oauth", "xAI Grok OAuth (SuperGrok / Premium+)", "xAI Grok OAuth (SuperGrok / Premium+ subscription)", oauth = true),
@@ -2088,6 +2097,9 @@ private val AGENT_PROVIDERS = listOf(
 @Composable
 private fun AddAgentDialog(
     busy: Boolean,
+    auth: AppViewModel.AuthFlow?,
+    onSignIn: (provider: String) -> Unit,
+    onClearAuth: () -> Unit,
     onDismiss: () -> Unit,
     onAdd: (name: String, provider: String, apiKey: String, baseUrl: String) -> Unit,
 ) {
@@ -2173,7 +2185,13 @@ private fun AddAgentDialog(
                             }
                         }
                     }
-                    else -> if (provider.oauth) {
+                    else -> if (provider.deviceCode) {
+                        DeviceCodeStep(
+                            provider = provider,
+                            auth = auth?.takeIf { it.provider == provider.id },
+                            onSignIn = { onSignIn(provider.id) },
+                        )
+                    } else if (provider.oauth) {
                         // No field, on purpose — see AgentProvider.oauth.
                         Text(
                             "${provider.label} signs in through a browser, so there's no key " +
@@ -2224,11 +2242,123 @@ private fun AddAgentDialog(
             }
         },
         dismissButton = {
-            TextButton(onClick = { if (step == 0) onDismiss() else step-- }) {
+            TextButton(onClick = {
+                // Stepping back off the sign-in screen drops it: the next provider the owner
+                // picks is a different sign-in, and a leftover code belongs to neither.
+                if (step == 2) onClearAuth()
+                if (step == 0) onDismiss() else step--
+            }) {
                 Text(if (step == 0) "Cancel" else "Back", color = PaperDim)
             }
         },
     )
+}
+
+/** The device-code sign-in step: ask, show the code, wait for the owner to use it.
+ *
+ *  The code is the whole screen while it exists. It is short-lived, has to be copied by hand
+ *  into another app, and the owner is reading it off a phone — so it gets size, spacing and a
+ *  copy button, not a line of body text.
+ *
+ *  Signing in is NOT required to leave this step. An agent whose provider isn't signed in yet
+ *  is still a real agent, and trapping the owner in a dialog behind a third party's login —
+ *  one that can fail for reasons neither we nor they control — would be worse than letting
+ *  them finish and sign in from Agent settings later. */
+@Composable
+private fun DeviceCodeStep(
+    provider: AgentProvider,
+    auth: AppViewModel.AuthFlow?,
+    onSignIn: () -> Unit,
+) {
+    val ctx = LocalContext.current
+    val challenge = auth?.challenge
+    val running = auth != null && !auth.done
+
+    Text(
+        "${provider.label} signs in with your existing account, so there's no key to type.",
+        color = Paper, fontSize = 14.sp,
+    )
+    Spacer(Modifier.height(12.dp))
+
+    if (challenge != null) {
+        Text("Enter this code:", color = PaperDim, fontSize = 13.sp)
+        Spacer(Modifier.height(6.dp))
+        Text(
+            challenge.userCode,
+            color = Sunflower, fontSize = 30.sp, fontWeight = FontWeight.Bold,
+            // A sign-in code is read one character at a time; a proportional face makes
+            // 0/O and 1/I a guess.
+            fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+            letterSpacing = 2.sp,
+        )
+        Spacer(Modifier.height(10.dp))
+        Row {
+            TextButton(onClick = {
+                val cm = ctx.getSystemService(android.content.ClipboardManager::class.java)
+                cm?.setPrimaryClip(
+                    android.content.ClipData.newPlainText("sign-in code", challenge.userCode)
+                )
+            }) { Text("Copy code", color = Sunflower) }
+            Spacer(Modifier.width(8.dp))
+            TextButton(onClick = {
+                // Opens in the phone's normal browser, NOT over Tor and not in one of our
+                // WebViews: this is a sign-in to the owner's own provider account, and it
+                // needs their existing session and password manager to work at all.
+                runCatching {
+                    ctx.startActivity(
+                        android.content.Intent(
+                            android.content.Intent.ACTION_VIEW,
+                            android.net.Uri.parse(challenge.verificationUri),
+                        ).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                    )
+                }
+            }) { Text("Open sign-in page", color = Sunflower, fontWeight = FontWeight.Bold) }
+        }
+        Spacer(Modifier.height(6.dp))
+        Text(challenge.verificationUri, color = PaperDim, fontSize = 12.sp)
+        Spacer(Modifier.height(12.dp))
+    }
+
+    when {
+        auth == null -> {
+            Text(
+                "Your box will start the sign-in and show you a code to enter.",
+                color = PaperDim, fontSize = 13.sp,
+            )
+            Spacer(Modifier.height(8.dp))
+            TextButton(onClick = onSignIn) {
+                Text("Sign in to ${provider.label}", color = Sunflower, fontWeight = FontWeight.Bold)
+            }
+        }
+        auth.done && auth.ok -> Text(
+            "Signed in. ${provider.label} is ready for this agent.",
+            color = Sunflower, fontSize = 14.sp, fontWeight = FontWeight.Bold,
+        )
+        auth.done -> {
+            Text(auth.status, color = Sunflower, fontSize = 13.sp)
+            Spacer(Modifier.height(8.dp))
+            TextButton(onClick = onSignIn) { Text("Try again", color = Sunflower) }
+        }
+        else -> Row(verticalAlignment = Alignment.CenterVertically) {
+            CircularProgressIndicator(
+                Modifier.size(16.dp), color = Sunflower, strokeWidth = 2.dp,
+            )
+            Spacer(Modifier.width(10.dp))
+            Text(
+                auth.status.ifBlank { "Waiting for your box…" },
+                color = PaperDim, fontSize = 13.sp,
+            )
+        }
+    }
+
+    if (!running) {
+        Spacer(Modifier.height(12.dp))
+        Text(
+            "You can add the agent without signing in and finish this later from Agent " +
+                "settings — it just won't be able to answer until you do.",
+            color = PaperDim, fontSize = 12.sp,
+        )
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -2271,11 +2401,18 @@ private fun AgentsScreen(vm: AppViewModel) {
         )
     }
 
+    val authFlow by vm.authFlow.collectAsState()
     if (addOpen) AddAgentDialog(
         busy = setupBusy,
-        onDismiss = { addOpen = false },
+        auth = authFlow,
+        onSignIn = { vm.startAgentAuth(it) },
+        onClearAuth = { vm.clearAuthFlow() },
+        // Leaving the wizard drops the sign-in state, so reopening it doesn't show a code
+        // from a flow the box has already abandoned.
+        onDismiss = { addOpen = false; vm.clearAuthFlow() },
         onAdd = { name, provider, apiKey, baseUrl ->
             addOpen = false
+            vm.clearAuthFlow()
             vm.setUpAgents(
                 agentName = name, provider = provider,
                 apiKey = apiKey, baseUrl = baseUrl,

@@ -2947,6 +2947,27 @@ object MatrixRepo {
      * is explicitly reporting an unfinished job, so this can never be mistaken for a
      * verdict on a command that has already completed.
      */
+    /** The code the owner has to type at the provider, while a device-code sign-in is running.
+     *
+     *  Rides the same interim `done:false` result the box already publishes for slow commands,
+     *  with two extra fields — rather than a second account-data key, which would be a second
+     *  thing to keep in sync with a flow that is already keyed by command id.
+     *
+     *  Only ever returned for an UNFINISHED command: once the box writes its verdict there is
+     *  nothing left to type, and showing a stale code then would invite the owner to go and
+     *  enter it. */
+    data class AuthChallenge(val verificationUri: String, val userCode: String)
+
+    suspend fun readAuthChallenge(id: String): AuthChallenge? = runCatching {
+        val raw = client?.accountData(COMMAND_RESULT_TYPE) ?: return@runCatching null
+        val o = org.json.JSONObject(raw)
+        if (o.optString("id") != id) return@runCatching null
+        if (o.optBoolean("done", true)) return@runCatching null
+        val uri = o.optString("verification_uri")
+        val code = o.optString("user_code")
+        if (uri.isBlank() || code.isBlank()) null else AuthChallenge(uri, code)
+    }.getOrNull()
+
     suspend fun readCommandProgress(id: String): String? = runCatching {
         val raw = client?.accountData(COMMAND_RESULT_TYPE) ?: return@runCatching null
         val o = org.json.JSONObject(raw)
