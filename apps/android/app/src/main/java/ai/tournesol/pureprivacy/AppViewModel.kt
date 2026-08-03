@@ -651,6 +651,79 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             if (ungrouped.isEmpty()) named else named + ("Other" to ungrouped)
         }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
+    // --- Conversations within one agent --------------------------------------------------
+    //
+    // Each conversation is its own room, which is what makes it its own history on the box.
+    // The agent row keeps ONE main chat (the room the roster names); everything else the owner
+    // starts is listed here.
+
+    /** One conversation with an agent. [main] is the chat the agent was created with, which
+     *  cannot be deleted on its own — removing the agent is what removes that. */
+    data class SessionRow(
+        val roomId: String,
+        val title: String,
+        val preview: String?,
+        val main: Boolean,
+    )
+
+    /** Every conversation with [agentUser], main chat first. */
+    fun sessionsFor(agentUser: String, mainRoomId: String?): List<SessionRow> {
+        val byId = agentRooms.value.associateBy { it.id }
+        val extra = MatrixRepo.agentSessions.value[agentUser].orEmpty()
+            // The main room can also appear in the box's session list on a box where the
+            // owner started conversations before this shipped. Listing it twice would offer
+            // a delete for a chat that must go with the agent.
+            .filter { it.roomId != mainRoomId }
+            .map { SessionRow(it.roomId, it.title, byId[it.roomId]?.preview, main = false) }
+        val main = mainRoomId?.let {
+            SessionRow(it, "Main chat", byId[it]?.preview, main = true)
+        }
+        return listOfNotNull(main) + extra
+    }
+
+    /** Start another conversation with an agent. */
+    fun newAgentSession(agentUser: String, title: String) =
+        runAgentSessionCommand("Starting a new conversation…") {
+            MatrixRepo.newAgentSession(agentUser, title)
+        }
+
+    /** Delete ONE conversation. The agent and its other chats are untouched. */
+    fun deleteAgentSession(roomId: String) =
+        runAgentSessionCommand("Deleting the conversation…") {
+            MatrixRepo.deleteAgentSession(roomId)
+        }
+
+    /** Shared plumbing for the two session commands: both are quick, both report through the
+     *  Agents screen's one status line, and both must refresh the room split afterwards —
+     *  that split is what decides whether a room shows up as an agent or as a person. */
+    private fun runAgentSessionCommand(opening: String, send: suspend () -> String?) {
+        if (agentSetupBusy.value) return
+        viewModelScope.launch(Dispatchers.IO) {
+            agentSetupBusy.value = true
+            agentSetupNotice.value = opening
+            val id = runCatching { send() }.getOrNull()
+            if (id == null) {
+                agentSetupNotice.value = "Couldn't reach your box."
+                agentSetupBusy.value = false
+                return@launch
+            }
+            var settled = false
+            for (attempt in 1..24) {           // 24 × 5s ≈ 2 minutes
+                kotlinx.coroutines.delay(5_000)
+                val outcome = runCatching { MatrixRepo.readCommandOutcome(id) }.getOrNull()
+                if (outcome != null) {
+                    agentSetupNotice.value = outcome.message?.takeIf { it.isNotBlank() }
+                        ?: if (outcome.ok) "Done." else "Your box couldn't do that."
+                    settled = true
+                    break
+                }
+            }
+            if (!settled) agentSetupNotice.value = "Still working — check back shortly."
+            runCatching { MatrixRepo.refreshAgents() }
+            agentSetupBusy.value = false
+        }
+    }
+
     /** True while the box is provisioning the agent runtime (minutes, not seconds). */
     val agentSetupBusy = MutableStateFlow(false)
     /** Human-readable progress / outcome of the last setup attempt. */

@@ -894,6 +894,12 @@ object MatrixRepo {
         // map: previously it was loaded only when the Agents screen opened, so on every
         // other path the roster was empty and agent rooms rendered in Messaging.
         loadAgents()
+        loadAgentSessions()
+        // room id -> the agent it's a conversation with. Built once per rebuild rather than
+        // per room: the list is small, but this runs for every room the account is in.
+        val sessionAgentIds: Map<String, String> = agentSessions.value
+            .flatMap { (agent, list) -> list.map { it.roomId to agent } }
+            .toMap()
         val handles = synchronized(roomHandles) { roomHandles.values.toList() }
         val all = handles.map { r ->
             val mem = runCatching { r.membership() }.getOrNull()
@@ -920,7 +926,13 @@ object MatrixRepo {
             // room's counterpart. Room id is the reliable half: a freshly provisioned agent
             // is invited but not yet joined, so it isn't a hero and peer-id lookup misses,
             // which would drop its room into Messaging next to real people.
-            val agent = agents.value.values.firstOrNull { it.roomId.isNotBlank() && it.roomId == r.id() }
+            // ...and by the box's session list, which covers EVERY room of an agent rather
+            // than the one the roster names. Without this, the second and later conversations
+            // with an agent are only recognised once it has joined and become a hero — so a
+            // freshly created one renders in Messaging, as a chat with a stranger, for as long
+            // as that takes. Checked first because it is the cheapest and the most certain.
+            val agent = sessionAgentIds[r.id()]?.let { agents.value[it] }
+                ?: agents.value.values.firstOrNull { it.roomId.isNotBlank() && it.roomId == r.id() }
                 ?: peerId(r)?.let { agents.value[it] }
             RoomSummary(
                 r.id(), roomName(r),
@@ -943,14 +955,19 @@ object MatrixRepo {
         // the first invite landed). Show only ONE — deterministically the LOWEST room-id,
         // which both sides pick the same, so they converge on it (and send there); the extra
         // room just goes quiet. Invites / pending-outgoing rows are never deduped.
+        //
+        // AGENTS ARE EXEMPT. Several live rooms with one peer is a fault for a person — but
+        // for an agent it is the feature: each room is a separate conversation with its own
+        // history. Deduping them would silently hide every conversation but the oldest, which
+        // looks exactly like the box losing them.
         val canonical = HashMap<String, String>()
         for (s in all) {
             val p = s.peerId
-            if (s.paired && p != null) { val cur = canonical[p]; if (cur == null || s.id < cur) canonical[p] = s.id }
+            if (s.paired && !s.isAgent && p != null) { val cur = canonical[p]; if (cur == null || s.id < cur) canonical[p] = s.id }
         }
         // Invites first (actionable), then pending outgoing, then most-recently-active.
         val visible = all
-            .filter { s -> val p = s.peerId; !s.paired || p == null || canonical[p] == s.id }
+            .filter { s -> val p = s.peerId; s.isAgent || !s.paired || p == null || canonical[p] == s.id }
             .sortedWith(
                 compareByDescending<RoomSummary> { it.invited }
                     .thenByDescending { it.outgoing }
@@ -2324,8 +2341,57 @@ object MatrixRepo {
     suspend fun refreshAgents() {
         val before = agents.value
         loadAgents()
+        loadAgentSessions()
         if (agents.value != before) rebuildRooms()
     }
+
+    // --- Conversations within one agent -------------------------------------------------
+    //
+    // A session is a room. The box creates it and records it here; we only read. Deriving the
+    // list locally would mean guessing which rooms belong to an agent, and a wrong guess puts
+    // an AI in the Messaging list next to real people.
+
+    private const val AGENT_SESSIONS_TYPE = "ai.tournesol.pureprivacy.agent_sessions"
+
+    data class AgentSession(val roomId: String, val title: String, val createdTs: Long)
+
+    /** Agent user id -> its conversations, oldest first (the order they were created). */
+    val agentSessions = MutableStateFlow<Map<String, List<AgentSession>>>(emptyMap())
+
+    private suspend fun loadAgentSessions() {
+        val raw = runCatching { client?.accountData(AGENT_SESSIONS_TYPE) }.getOrNull()
+        if (raw.isNullOrBlank()) return          // absent = a box with no sessions yet; keep ours
+        val parsed = runCatching {
+            val o = org.json.JSONObject(raw)
+            buildMap<String, List<AgentSession>> {
+                for (agent in o.keys()) {
+                    val arr = o.optJSONArray(agent) ?: continue
+                    val list = (0 until arr.length()).mapNotNull { i ->
+                        val s = arr.optJSONObject(i) ?: return@mapNotNull null
+                        val room = s.optString("room_id")
+                        if (room.isBlank()) null else AgentSession(
+                            room,
+                            s.optString("title").ifBlank { "Conversation" },
+                            s.optLong("created_ts"),
+                        )
+                    }
+                    if (list.isNotEmpty()) put(agent, list.sortedBy { it.createdTs })
+                }
+            }
+        }.getOrNull() ?: return
+        if (parsed != agentSessions.value) {
+            Log.i(TAG, "agents: ${parsed.values.sumOf { it.size }} conversation(s) across ${parsed.size} agent(s)")
+            agentSessions.value = parsed
+        }
+    }
+
+    /** Ask the box to start another conversation with [agentUser]. */
+    suspend fun newAgentSession(agentUser: String, title: String): String? =
+        sendBoxCommand("agent_session_new", agentUser = agentUser, agentName = title)
+
+    /** Ask the box to delete ONE conversation. The agent and its other chats are untouched. */
+    suspend fun deleteAgentSession(roomId: String): String? =
+        sendBoxCommand("agent_session_delete", roomId = roomId)
 
     /** Read the box's published status (health, address, version, pairings). */
     suspend fun readBoxStatus(): BoxStatus? = runCatching {
@@ -2427,6 +2493,7 @@ object MatrixRepo {
         baseUrl: String? = null,
         model: String? = null,
         agentUser: String? = null,
+        roomId: String? = null,
     ): String? = runCatching {
         val c = client ?: return@runCatching null
         val id = java.util.UUID.randomUUID().toString()
@@ -2443,6 +2510,9 @@ object MatrixRepo {
         // Removal targets the exact Matrix id, never a display name: it is destructive and
         // near-irreversible, and the row the owner tapped already carries the id.
         if (!agentUser.isNullOrBlank()) cmd.put("agent_user", agentUser.trim())
+        // Deleting a conversation names the exact room, for the same reason removal names the
+        // exact Matrix id: titles repeat, and this is not undoable.
+        if (!roomId.isNullOrBlank()) cmd.put("room_id", roomId.trim())
         // The wizard's answers. api_key is secret and rides HERE, on the command channel the
         // box clears the moment it reads it — never in the roster or any other account data.
         if (!provider.isNullOrBlank()) cmd.put("provider", provider.trim())

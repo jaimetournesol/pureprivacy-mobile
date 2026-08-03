@@ -2374,7 +2374,27 @@ private fun AgentsScreen(vm: AppViewModel) {
     // The agent the owner is about to remove. Held as state rather than removing on tap:
     // this deletes a Matrix account and a chat history, and there is no undo.
     var removing by remember { mutableStateOf<AppViewModel.AgentRow?>(null) }
+    // The agent whose conversation list is open, and the conversation the owner is about to
+    // delete. Both held as state rather than acted on at the tap: deleting a conversation
+    // destroys a history with no undo.
+    var sessionsFor by remember { mutableStateOf<AppViewModel.AgentRow?>(null) }
+    val sessionCounts by MatrixRepo.agentSessions.collectAsState()
     BackHandler { vm.goHome() }
+
+    sessionsFor?.let { agent ->
+        AgentSessionsDialog(
+            agent = agent,
+            sessions = vm.sessionsFor(agent.userId, agent.roomId),
+            busy = setupBusy,
+            onOpen = { room, title ->
+                sessionsFor = null
+                vm.openAgentRoom(room, if (title == "Main chat") agent.name else title)
+            },
+            onNew = { title -> sessionsFor = null; vm.newAgentSession(agent.userId, title) },
+            onDelete = { room -> sessionsFor = null; vm.deleteAgentSession(room) },
+            onDismiss = { sessionsFor = null },
+        )
+    }
 
     removing?.let { target ->
         AlertDialog(
@@ -2532,11 +2552,138 @@ private fun AgentsScreen(vm: AppViewModel) {
                         r,
                         onClick = { r.roomId?.let { id -> vm.openAgentRoom(id, r.name) } },
                         onRemove = { removing = r }.takeIf { !setupBusy },
+                        onSessions = { sessionsFor = r }.takeIf { r.roomId != null },
+                        // +1 for the main chat, which the box's session list doesn't carry.
+                        sessionCount = (sessionCounts[r.userId]?.size ?: 0) +
+                            if (r.roomId != null) 1 else 0,
                     )
                 }
             }
         }
     }
+}
+
+/** Pick, start or delete one of an agent's conversations.
+ *
+ *  Each conversation is a separate room, which is what makes it a separate memory on the box:
+ *  the agent keys its history off the room, so two rooms are two threads it will not mix up.
+ *  That is worth saying in the UI, because "new conversation" in most apps means a fresh
+ *  scroll, and here it means the agent genuinely doesn't carry the other one over.
+ *
+ *  The main chat cannot be deleted from here. It is the room the agent was created with and
+ *  the one the roster names; removing it would leave an agent with nowhere to talk while still
+ *  listed — the litter state the Agents app exists to avoid. Removing the AGENT removes it. */
+@Composable
+private fun AgentSessionsDialog(
+    agent: AppViewModel.AgentRow,
+    sessions: List<AppViewModel.SessionRow>,
+    busy: Boolean,
+    onOpen: (roomId: String, title: String) -> Unit,
+    onNew: (title: String) -> Unit,
+    onDelete: (roomId: String) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var naming by remember { mutableStateOf(false) }
+    var title by remember { mutableStateOf("") }
+    var confirmDelete by remember { mutableStateOf<AppViewModel.SessionRow?>(null) }
+
+    confirmDelete?.let { target ->
+        AlertDialog(
+            onDismissRequest = { confirmDelete = null },
+            containerColor = InkSoft,
+            title = { Text("Delete \"${target.title}\"?", color = Paper, fontWeight = FontWeight.Bold) },
+            text = {
+                Text(
+                    "This conversation disappears from this phone and its room is closed on " +
+                        "your box. ${agent.name} and its other conversations are untouched. " +
+                        "This can't be undone.",
+                    color = PaperDim, fontSize = 14.sp,
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { val r = target.roomId; confirmDelete = null; onDelete(r) }) {
+                    Text("Delete", color = Sunflower, fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmDelete = null }) { Text("Keep", color = PaperDim) }
+            },
+        )
+        return
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = InkSoft,
+        title = {
+            Text(
+                if (naming) "New conversation" else "${agent.name}'s conversations",
+                color = Paper, fontWeight = FontWeight.Bold,
+            )
+        },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState())) {
+                if (naming) {
+                    Text(
+                        "${agent.name} starts fresh here — it won't carry over what you " +
+                            "talked about in its other conversations.",
+                        color = PaperDim, fontSize = 13.sp,
+                    )
+                    Spacer(Modifier.height(14.dp))
+                    PpField(value = title, onChange = { title = it }, label = "What's it about?")
+                } else {
+                    sessions.forEach { s ->
+                        Row(
+                            Modifier.fillMaxWidth()
+                                .clickable(enabled = !busy) { onOpen(s.roomId, s.title) }
+                                .padding(vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text(s.title, color = Paper, fontSize = 15.sp, maxLines = 1)
+                                Text(
+                                    s.preview ?: if (s.main) "The chat it was created with"
+                                        else "No messages yet",
+                                    color = PaperDim, fontSize = 12.sp, maxLines = 1,
+                                )
+                            }
+                            // No delete on the main chat — see the doc comment.
+                            if (!s.main) {
+                                IconButton(onClick = { confirmDelete = s }, enabled = !busy) {
+                                    Icon(
+                                        Icons.Filled.DeleteOutline, "delete ${s.title}",
+                                        tint = PaperDim, modifier = Modifier.size(20.dp),
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "Each conversation has its own memory on your box, so you can keep " +
+                            "separate topics apart.",
+                        color = PaperDim, fontSize = 12.sp,
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { if (naming) onNew(title.trim()) else { naming = true } },
+                enabled = !busy,
+            ) {
+                Text(
+                    if (naming) "Start" else "New conversation",
+                    color = if (busy) SunflowerDim else Sunflower, fontWeight = FontWeight.Bold,
+                )
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = { if (naming) naming = false else onDismiss() }) {
+                Text(if (naming) "Back" else "Close", color = PaperDim)
+            }
+        },
+    )
 }
 
 /** One agent in the Agents list. Visually distinct from a chat row on purpose. */
@@ -2545,6 +2692,8 @@ private fun AgentRow(
     r: AppViewModel.AgentRow,
     onClick: () -> Unit,
     onRemove: (() -> Unit)? = null,
+    onSessions: (() -> Unit)? = null,
+    sessionCount: Int = 0,
 ) {
     val ready = r.roomId != null
     Row(
@@ -2568,6 +2717,24 @@ private fun AgentRow(
                 ?: if (ready) r.description.ifBlank { "AI agent on your box" }
                 else "Starting up…"
             Text(sub, color = PaperDim, fontSize = 12.sp, maxLines = 1)
+        }
+        // Conversations. Only labelled with a count once there is more than one — an agent
+        // with a single chat has nothing to choose between, and a "1" next to every row is
+        // noise that teaches the owner to ignore the number when it starts to matter.
+        if (onSessions != null) {
+            IconButton(onClick = onSessions) {
+                if (sessionCount > 1) {
+                    Text(
+                        "$sessionCount", color = Sunflower, fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold,
+                    )
+                } else {
+                    Icon(
+                        Icons.AutoMirrored.Filled.Chat, "conversations with ${r.name}",
+                        tint = PaperDim, modifier = Modifier.size(20.dp),
+                    )
+                }
+            }
         }
         // Deliberately a visible control rather than a long-press: removing an agent is the
         // only way to stop a deleted one reappearing as a fake contact in Messaging, and a
