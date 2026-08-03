@@ -31,6 +31,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.automirrored.filled.Logout
+import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.CloudUpload
 import androidx.compose.material.icons.filled.AddCircle
@@ -2033,13 +2034,50 @@ private data class AgentProvider(
     val needsBaseUrl: Boolean = false,
 )
 
+// GENERATED from Hermes's own provider catalog — do not hand-edit.
+// Regenerate with tools/gen-agent-providers.py after every HERMES_AGENT_REF bump; the
+// hand-written list this replaced carried six providers while Hermes shipped ~40.
+// Anything not listed (Mistral, a self-hosted endpoint) goes through "Custom endpoint".
 private val AGENT_PROVIDERS = listOf(
     AgentProvider("", "Same as my other agents", "Copies the setup you already have."),
-    AgentProvider("openai-codex", "OpenAI Codex", "Your ChatGPT/Codex subscription.", oauth = true),
-    AgentProvider("openai-api", "OpenAI API", "Pay-as-you-go API key."),
-    AgentProvider("anthropic", "Anthropic", "Claude, with an API key."),
-    AgentProvider("openrouter", "OpenRouter", "One key, many models."),
-    AgentProvider("custom", "Custom endpoint", "Anything OpenAI-compatible.", needsBaseUrl = true),
+    AgentProvider("nous", "Nous Research", "Hermes model family", oauth = true),
+    AgentProvider("fireworks", "Fireworks AI", "OpenAI-compatible direct model API"),
+    AgentProvider("openrouter", "OpenRouter", "unified API for 200+ models"),
+    AgentProvider("novita", "NovitaAI", "AI-native cloud for builders and agents"),
+    AgentProvider("lmstudio", "LM Studio", "Local desktop app with built-in model server", needsBaseUrl = true),
+    AgentProvider("anthropic", "Anthropic", "Claude models via API key or Claude Code"),
+    AgentProvider("openai-codex", "OpenAI Codex", "Codex CLI via ChatGPT subscription or API key", oauth = true),
+    AgentProvider("openai-api", "OpenAI API", "api.openai.com, API key"),
+    AgentProvider("alibaba", "Qwen Cloud", "Qwen Cloud / DashScope (Qwen + multi-provider)"),
+    AgentProvider("xai-oauth", "xAI Grok OAuth (SuperGrok / Premium+)", "xAI Grok OAuth (SuperGrok / Premium+ subscription)", oauth = true),
+    AgentProvider("xiaomi", "Xiaomi MiMo", "MiMo-V2.5 and V2 models: pro, omni, flash"),
+    AgentProvider("tencent-tokenhub", "Tencent TokenHub", "Hy3 Preview via tokenhub.tencentmaas.com"),
+    AgentProvider("nvidia", "NVIDIA NIM", "accelerated inference"),
+    AgentProvider("copilot", "GitHub Copilot", "Uses GITHUB_TOKEN or gh auth token"),
+    AgentProvider("huggingface", "HuggingFace", "HuggingFace Inference API"),
+    AgentProvider("gemini", "Google AI Studio", "Native Gemini API"),
+    AgentProvider("deepseek", "DeepSeek", "native DeepSeek API"),
+    AgentProvider("xai", "xAI", "xAI Grok (Direct API)"),
+    AgentProvider("zai", "Z.AI (GLM)", "Z.AI / GLM — Zhipu AI models"),
+    AgentProvider("kimi-coding", "Kimi / Kimi Coding Plan", "Kimi Coding Plan (api.kimi.com & Moonshot API)"),
+    AgentProvider("kimi-coding-cn", "Kimi / Moonshot (China)", "Kimi / Moonshot China (Domestic direct API)"),
+    AgentProvider("stepfun", "StepFun Step Plan", "Agent / coding models via Step Plan API"),
+    AgentProvider("minimax", "MiniMax", "Global direct API"),
+    AgentProvider("minimax-oauth", "MiniMax (OAuth)", "MiniMax via OAuth browser flow — no API key required", oauth = true),
+    AgentProvider("minimax-cn", "MiniMax (China)", "MiniMax China (Domestic direct API)"),
+    AgentProvider("ollama-cloud", "Ollama Cloud", "Cloud-hosted open models, ollama.com"),
+    AgentProvider("arcee", "Arcee AI", "Trinity models, direct API"),
+    AgentProvider("gmi", "GMI Cloud", "multi-model direct API (slash-form model IDs)"),
+    AgentProvider("kilocode", "Kilo Code", "Kilo Gateway API"),
+    AgentProvider("opencode-zen", "OpenCode Zen", "Curated models, pay-as-you-go"),
+    AgentProvider("opencode-go", "OpenCode Go", "Open models subscription"),
+    AgentProvider("azure-foundry", "Azure Foundry", "Microsoft Foundry - OpenAI-compatible endpoint (user-supplied base URL)", needsBaseUrl = true),
+    AgentProvider("ai-gateway", "Vercel AI Gateway", "Multi-model aggregator"),
+    AgentProvider("qwen-oauth", "Qwen OAuth (Portal)", "Qwen OAuth (Reuses local Qwen CLI login)", oauth = true),
+    AgentProvider("alibaba-coding-plan", "Alibaba Cloud (Coding Plan)", "Alibaba Cloud Coding Plan (Dedicated coding tier)"),
+    AgentProvider("deepinfra", "DeepInfra", "100+ open models, pay-per-use"),
+    AgentProvider("upstage", "Upstage Solar", "Upstage (Solar API)"),
+    AgentProvider("custom", "Custom endpoint", "Any OpenAI-compatible URL — Mistral, a self-hosted model, anything.", needsBaseUrl = true),
 )
 
 /** Name a new agent, choose what it runs on, and hand over a key if that provider needs one.
@@ -2058,6 +2096,10 @@ private fun AddAgentDialog(
     var provider by remember { mutableStateOf(AGENT_PROVIDERS.first()) }
     var apiKey by remember { mutableStateOf("") }
     var baseUrl by remember { mutableStateOf("") }
+    // The list is generated from Hermes and runs to ~40 entries, which is a lot of
+    // scrolling on a phone to reach "Anthropic". Filter rather than reorder: a stable
+    // order means the provider you picked last time is where you left it.
+    var query by remember { mutableStateOf("") }
 
     val trimmed = name.trim()
     val nameOk = trimmed.any { it.isLetterOrDigit() }
@@ -2098,19 +2140,36 @@ private fun AddAgentDialog(
                             Text("Use at least one letter or number.", color = Sunflower, fontSize = 12.sp)
                         }
                     }
-                    1 -> AGENT_PROVIDERS.forEach { p ->
-                        val on = p.id == provider.id
-                        Row(
-                            Modifier.fillMaxWidth()
-                                .clickable { provider = p }
-                                .padding(vertical = 10.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            RadioButton(selected = on, onClick = { provider = p })
-                            Spacer(Modifier.width(4.dp))
-                            Column {
-                                Text(p.label, color = Paper, fontSize = 15.sp)
-                                Text(p.hint, color = PaperDim, fontSize = 12.sp)
+                    1 -> {
+                        PpField(value = query, onChange = { query = it }, label = "Search")
+                        Spacer(Modifier.height(8.dp))
+                        val shown = AGENT_PROVIDERS.filter { p ->
+                            query.isBlank() ||
+                                p.label.contains(query, ignoreCase = true) ||
+                                p.hint.contains(query, ignoreCase = true) ||
+                                p.id.contains(query, ignoreCase = true)
+                        }
+                        if (shown.isEmpty()) {
+                            Text(
+                                "Nothing matches. Anything OpenAI-compatible works through " +
+                                    "\"Custom endpoint\".",
+                                color = PaperDim, fontSize = 13.sp,
+                            )
+                        }
+                        shown.forEach { p ->
+                            val on = p.id == provider.id
+                            Row(
+                                Modifier.fillMaxWidth()
+                                    .clickable { provider = p }
+                                    .padding(vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                RadioButton(selected = on, onClick = { provider = p })
+                                Spacer(Modifier.width(4.dp))
+                                Column {
+                                    Text(p.label, color = Paper, fontSize = 15.sp)
+                                    Text(p.hint, color = PaperDim, fontSize = 12.sp)
+                                }
                             }
                         }
                     }
@@ -2182,7 +2241,35 @@ private fun AgentsScreen(vm: AppViewModel) {
     val webui by vm.agentWebui.collectAsState()
     val ctx = LocalContext.current
     var addOpen by remember { mutableStateOf(false) }
+    // The agent the owner is about to remove. Held as state rather than removing on tap:
+    // this deletes a Matrix account and a chat history, and there is no undo.
+    var removing by remember { mutableStateOf<AppViewModel.AgentRow?>(null) }
     BackHandler { vm.goHome() }
+
+    removing?.let { target ->
+        AlertDialog(
+            onDismissRequest = { removing = null },
+            containerColor = InkSoft,
+            title = { Text("Remove ${target.name}?", color = Paper, fontWeight = FontWeight.Bold) },
+            text = {
+                Text(
+                    "Its chat disappears from this phone and its account is closed on your " +
+                        "box. Anything it remembers is archived on the box, not deleted — but " +
+                        "the conversation is gone, and this can't be undone.",
+                    color = PaperDim, fontSize = 14.sp,
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    removing = null
+                    vm.removeAgent(target.userId, target.name)
+                }) { Text("Remove", color = Sunflower, fontWeight = FontWeight.Bold) }
+            },
+            dismissButton = {
+                TextButton(onClick = { removing = null }) { Text("Keep", color = PaperDim) }
+            },
+        )
+    }
 
     if (addOpen) AddAgentDialog(
         busy = setupBusy,
@@ -2304,7 +2391,11 @@ private fun AgentsScreen(vm: AppViewModel) {
                     )
                 }
                 items(rows, key = { it.userId }) { r ->
-                    AgentRow(r) { r.roomId?.let { id -> vm.openAgentRoom(id, r.name) } }
+                    AgentRow(
+                        r,
+                        onClick = { r.roomId?.let { id -> vm.openAgentRoom(id, r.name) } },
+                        onRemove = { removing = r }.takeIf { !setupBusy },
+                    )
                 }
             }
         }
@@ -2313,7 +2404,11 @@ private fun AgentsScreen(vm: AppViewModel) {
 
 /** One agent in the Agents list. Visually distinct from a chat row on purpose. */
 @Composable
-private fun AgentRow(r: AppViewModel.AgentRow, onClick: () -> Unit) {
+private fun AgentRow(
+    r: AppViewModel.AgentRow,
+    onClick: () -> Unit,
+    onRemove: (() -> Unit)? = null,
+) {
     val ready = r.roomId != null
     Row(
         Modifier
@@ -2336,6 +2431,17 @@ private fun AgentRow(r: AppViewModel.AgentRow, onClick: () -> Unit) {
                 ?: if (ready) r.description.ifBlank { "AI agent on your box" }
                 else "Starting up…"
             Text(sub, color = PaperDim, fontSize = 12.sp, maxLines = 1)
+        }
+        // Deliberately a visible control rather than a long-press: removing an agent is the
+        // only way to stop a deleted one reappearing as a fake contact in Messaging, and a
+        // gesture nobody discovers would leave owners stuck with litter they can't clear.
+        if (onRemove != null) {
+            IconButton(onClick = onRemove) {
+                Icon(
+                    Icons.Filled.DeleteOutline, "remove ${r.name}",
+                    tint = PaperDim, modifier = Modifier.size(20.dp),
+                )
+            }
         }
     }
 }

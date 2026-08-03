@@ -2426,6 +2426,7 @@ object MatrixRepo {
         apiKey: String? = null,
         baseUrl: String? = null,
         model: String? = null,
+        agentUser: String? = null,
     ): String? = runCatching {
         val c = client ?: return@runCatching null
         val id = java.util.UUID.randomUUID().toString()
@@ -2439,6 +2440,9 @@ object MatrixRepo {
         // Naming an agent is what turns "set agents up" into "add another one". Absent =
         // the first-run one-tap setup, which stays idempotent on a box that already has one.
         if (!agentName.isNullOrBlank()) cmd.put("agent_name", agentName.trim())
+        // Removal targets the exact Matrix id, never a display name: it is destructive and
+        // near-irreversible, and the row the owner tapped already carries the id.
+        if (!agentUser.isNullOrBlank()) cmd.put("agent_user", agentUser.trim())
         // The wizard's answers. api_key is secret and rides HERE, on the command channel the
         // box clears the moment it reads it — never in the roster or any other account data.
         if (!provider.isNullOrBlank()) cmd.put("provider", provider.trim())

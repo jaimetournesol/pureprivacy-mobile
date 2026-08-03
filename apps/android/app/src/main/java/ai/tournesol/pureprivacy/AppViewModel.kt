@@ -752,6 +752,55 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** Ask the box to remove an agent: clear its chat, retire its account, forget its profile.
+     *
+     *  Reuses the agent-setup busy/notice state so the Agents screen shows one status line
+     *  whichever operation is running — they cannot overlap, and a second set of flows would
+     *  only be two things to keep in sync.
+     *
+     *  Targets the Matrix id, never the display name. Two agents may be named the same in the
+     *  roster; deleting the wrong one is not recoverable.
+     */
+    fun removeAgent(userId: String, displayName: String) {
+        if (agentSetupBusy.value) return
+        val target = userId.trim()
+        if (target.isEmpty()) return
+        viewModelScope.launch(Dispatchers.IO) {
+            agentSetupBusy.value = true
+            agentSetupSucceeded.value = false
+            agentSetupNotice.value = "Asking your box to remove $displayName…"
+            val id = runCatching {
+                MatrixRepo.sendBoxCommand("agent_remove", agentUser = target)
+            }.getOrNull()
+            if (id == null) {
+                agentSetupNotice.value = "Couldn't reach your box."
+                agentSetupBusy.value = false
+                return@launch
+            }
+            var settled = false
+            for (attempt in 1..24) {           // 24 × 5s ≈ 2 minutes; removal is quick
+                kotlinx.coroutines.delay(5_000)
+                runCatching { MatrixRepo.readCommandProgress(id) }.getOrNull()
+                    ?.let { agentSetupNotice.value = it }
+                val outcome = runCatching { MatrixRepo.readCommandOutcome(id) }.getOrNull()
+                if (outcome != null) {
+                    agentSetupNotice.value = outcome.message?.takeIf { it.isNotBlank() }
+                        ?: if (outcome.ok) "$displayName is gone." else "Couldn't remove $displayName."
+                    settled = true
+                    break
+                }
+            }
+            if (!settled) {
+                agentSetupNotice.value = "Still working — check back shortly."
+            }
+            // Whatever happened, re-read the roster: it is what drives both the Agents list
+            // and the human/AI split, so a stale copy is what made the removed agent show up
+            // as a person in the first place.
+            runCatching { MatrixRepo.refreshAgents() }
+            agentSetupBusy.value = false
+        }
+    }
+
     // --- Backup Sync app (feature F) ----------------------------------------------------
     val backupFiles = MatrixRepo.backupFiles
     private val _libRoomId = MutableStateFlow<String?>(null)
