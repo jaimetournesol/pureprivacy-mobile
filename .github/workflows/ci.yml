@@ -1,0 +1,66 @@
+# CI — build + lint on every push and PR.
+#
+# 28 releases shipped before this file existed; the checks here are the ones that would
+# have caught real, shipped bugs (silent room-classification regressions, lint-visible
+# permission gaps). Deliberately NO release/signing job: the release keystore stays on the
+# owner's machine, never in GitHub secrets — release builds are local by policy
+# (see apps/android/app/build.gradle.kts, the signing block).
+#
+# assembleDebug needs no secrets by design: without keystore.properties the release
+# variant is simply unsigned and debug is unaffected — the build.gradle.kts was written
+# for exactly this "fresh clone / CI" case.
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: apps/android
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle (with cache)
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build (debug)
+        run: ./gradlew assembleDebug
+
+      # lintDebug, not lint: the release variant needs nothing lint checks differently,
+      # and one variant halves the time. Errors fail the build (0 as of the commit that
+      # added this file); warnings don't — drive them down, don't let them rot into noise.
+      - name: Lint
+        run: ./gradlew lintDebug
+
+      - name: Unit tests
+        run: ./gradlew testDebugUnitTest
+
+      - name: Upload lint report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-report
+          path: apps/android/app/build/reports/lint-results-debug.html
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: pureprivacy-debug-apk
+          path: apps/android/app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 14

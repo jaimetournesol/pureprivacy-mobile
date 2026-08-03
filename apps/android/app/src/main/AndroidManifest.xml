@@ -13,6 +13,11 @@
     <!-- for Element Call (Phase 2b) -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.CAMERA" />
+    <!-- CAMERA is for calls + QR pairing, never required to run — without this line the
+         permission alone implies required hardware and hides the app from camera-less
+         devices (ChromeOS, some tablets). -->
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
     <!-- WebRTC audio routing (select comms device / earpiece-speaker switch). -->
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />

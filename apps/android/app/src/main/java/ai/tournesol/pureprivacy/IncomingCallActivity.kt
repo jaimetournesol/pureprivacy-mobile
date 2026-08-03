@@ -137,6 +137,12 @@ class IncomingCallActivity : ComponentActivity() {
 
     private fun missed(roomId: String, caller: String) {
         cleanup(roomId)
+        // Same POST_NOTIFICATIONS guard as PpSyncService — inline because lint's
+        // MissingPermission detector doesn't follow helper methods.
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) { finish(); return }
         runCatching {
             val n = androidx.core.app.NotificationCompat.Builder(this, PpSyncService.CH_MSG)
                 .setContentTitle("Missed call")

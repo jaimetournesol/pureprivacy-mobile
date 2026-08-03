@@ -128,7 +128,16 @@ class PpSyncService : Service() {
         }
     }
 
+    // On 33+ POST_NOTIFICATIONS is a runtime permission the user can deny; notify() is a
+    // silent no-op (or a SecurityException) without it. The runCatching around each call
+    // already made a denial harmless — the explicit check is what lint can verify, and it
+    // must be INLINE in each caller: the MissingPermission detector doesn't follow helper
+    // methods.
     private fun updateStatus(text: String) {
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) return
         runCatching {
             NotificationManagerCompat.from(this).notify(1, statusNotification(text))
         }
@@ -154,6 +163,10 @@ class PpSyncService : Service() {
 
     private fun post(n: Notif) {
         if (n.isCall) { postCall(n); return }
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) return
         val b = NotificationCompat.Builder(this, CH_MSG)
             .setContentTitle(n.title)
             .setContentText(n.text)
@@ -168,6 +181,10 @@ class PpSyncService : Service() {
      *  full-screen intent wakes the phone over the lock screen (IncomingCallActivity
      *  owns the ringtone); the actions answer/decline without opening the chat. */
     private fun postCall(n: Notif) {
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) return
         val ring = incomingCall(n, null)
         val answer = incomingCall(n, IncomingCallActivity.EXTRA_ANSWER)
         val decline = incomingCall(n, IncomingCallActivity.EXTRA_DECLINE)
