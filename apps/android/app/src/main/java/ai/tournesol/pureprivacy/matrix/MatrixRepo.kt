@@ -922,18 +922,10 @@ object MatrixRepo {
             // automatically the moment the first consent read succeeds.
             val consentReady = consent.lastReadMs != 0L
             val paired = peerIn && (peerOnion == null || !consentReady || peerOnion in consent)
-            // Agent rooms are decided by the registry — by room id first, then by the
-            // room's counterpart. Room id is the reliable half: a freshly provisioned agent
-            // is invited but not yet joined, so it isn't a hero and peer-id lookup misses,
-            // which would drop its room into Messaging next to real people.
-            // ...and by the box's session list, which covers EVERY room of an agent rather
-            // than the one the roster names. Without this, the second and later conversations
-            // with an agent are only recognised once it has joined and become a hero — so a
-            // freshly created one renders in Messaging, as a chat with a stranger, for as long
-            // as that takes. Checked first because it is the cheapest and the most certain.
-            val agent = sessionAgentIds[r.id()]?.let { agents.value[it] }
-                ?: agents.value.values.firstOrNull { it.roomId.isNotBlank() && it.roomId == r.id() }
-                ?: peerId(r)?.let { agents.value[it] }
+            // Which agent (if any) this room belongs to — session list, then registry room
+            // id, then counterpart. The order and its reasons live with the logic in
+            // [RoomLists.agentFor], where unit tests pin them.
+            val agent = RoomLists.agentFor(r.id(), peerId(r), sessionAgentIds, agents.value)
             RoomSummary(
                 r.id(), roomName(r),
                 invited = mem == Membership.INVITED,
@@ -951,37 +943,14 @@ object MatrixRepo {
                 avatarUrl = runCatching { r.avatarUrl() }.getOrNull(),
             )
         }
-        // Dedup DMs: a peer can end up with >1 live room (a create-race, or a re-add before
-        // the first invite landed). Show only ONE — deterministically the LOWEST room-id,
-        // which both sides pick the same, so they converge on it (and send there); the extra
-        // room just goes quiet. Invites / pending-outgoing rows are never deduped.
-        //
-        // AGENTS ARE EXEMPT. Several live rooms with one peer is a fault for a person — but
-        // for an agent it is the feature: each room is a separate conversation with its own
-        // history. Deduping them would silently hide every conversation but the oldest, which
-        // looks exactly like the box losing them.
-        val canonical = HashMap<String, String>()
-        for (s in all) {
-            val p = s.peerId
-            if (s.paired && !s.isAgent && p != null) { val cur = canonical[p]; if (cur == null || s.id < cur) canonical[p] = s.id }
-        }
-        // Invites first (actionable), then pending outgoing, then most-recently-active.
-        val visible = all
-            .filter { s -> val p = s.peerId; s.isAgent || !s.paired || p == null || canonical[p] == s.id }
-            .sortedWith(
-                compareByDescending<RoomSummary> { it.invited }
-                    .thenByDescending { it.outgoing }
-                    .thenByDescending { it.ts }
-            )
-        // THE human/AI split. Messaging shows people; the Agents app shows agents. This
-        // partition is the whole guarantee — if agent rooms ever leak back into `rooms`,
-        // an AI turns up in the chat list next to real contacts, which is exactly what the
-        // Agents app exists to prevent. Keep it as the last thing that touches the list.
-        val (agentSide, humanSide) = visible.partition { it.isAgent }
-        rooms.value = humanSide
-        agentRooms.value = agentSide.sortedWith(
-            compareByDescending<RoomSummary> { it.invited }.thenByDescending { it.ts }
-        )
+        // Dedup + sort + the human/AI split — the pure stage, extracted to [RoomLists]
+        // where its rules (lowest-room-id dedup for humans, agents exempt, partition last)
+        // are documented and unit-tested. This partition is the whole guarantee: if agent
+        // rooms ever leak back into `rooms`, an AI turns up in Messaging next to real
+        // contacts, which is exactly what the Agents app exists to prevent.
+        val split = RoomLists.partition(all)
+        rooms.value = split.chats
+        agentRooms.value = split.agentRooms
         Log.i(TAG, "rebuildRooms: ${rooms.value.size} chats (" +
             "${rooms.value.count { it.paired }} paired, ${rooms.value.count { it.invited }} invited, " +
             "${rooms.value.count { it.outgoing }} pending-outgoing), " +

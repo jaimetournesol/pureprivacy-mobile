@@ -106,6 +106,10 @@ android {
 }
 
 dependencies {
+    // JVM unit tests (src/test) — for the pure logic (room classification/dedup/partition
+    // in RoomLists) that has already regressed silently and now stays pinned in CI.
+    testImplementation("junit:junit:4.13.2")
+
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.6")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.6")
